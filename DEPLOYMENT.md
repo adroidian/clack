@@ -7,7 +7,7 @@ This document is intentionally generic. Replace all example values with your own
 1. Copy `config.example.json` to `config.json`
 2. Fill in:
    - `clackToken`
-   - local gateway URLs/tokens
+   - local control endpoint URLs/credentials
    - route table
 3. Run:
    ```bash
@@ -44,7 +44,7 @@ python3 clack_server.py
 
 ## What this repo does NOT include
 
-- OpenClaw gateway configs
+- product-specific control-plane configs
 - cloud tunnel configs
 - personal DNS names
 - service account credentials

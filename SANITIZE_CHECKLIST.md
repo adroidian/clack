@@ -33,3 +33,4 @@ Before syncing this repo to GitHub, verify all of the following:
 - [ ] README understandable by outsiders
 - [ ] setup can succeed without private infrastructure
 - [ ] examples use placeholders only
+- [ ] protocol assumptions are stated plainly (not hidden in product-specific wording)

@@ -16,18 +16,18 @@ This repository is a sanitized staging export of Clack.
 1. Receive `POST /route`
 2. Validate `X-Clack-Token`
 3. Look up target in route table
-4. If target maps to a named local gateway, call `chat.send` over WebSocket
+4. If target maps to a named local endpoint, send over the configured WebSocket control channel
 5. If target maps to a remote URL, POST to `${gateway}/route`
-6. If local gateway delivery fails, queue for `GET /poll/:agent`
+6. If local delivery fails, queue for `GET /poll/:agent`
 
 ## Python server flow
 1. Receive JSON-RPC `tasks/send`
 2. Normalize message payload
 3. Dedupe and rate-limit
 4. Write JSON file into `CLACK_INBOX_ROOT/<agent>/`
-5. Attempt wake delivery using config from `CLACK_AGENT_GATEWAYS_JSON`
+5. Attempt wake/delivery using config from `CLACK_AGENT_GATEWAYS_JSON`
 6. On repeated failure, store retry metadata in `CLACK_PENDING_QUEUE_PATH`
-7. Background watcher retries failed wakes and wakes agents for newly dropped inbox files
+7. Background watcher retries failed wakes and processes newly dropped inbox files
 
 ## Files written
 - inbox message files under `CLACK_INBOX_ROOT/<agent>/`
