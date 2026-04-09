@@ -1,0 +1,31 @@
+{
+  "routerName": "demo-router-b",
+  "port": 17332,
+  "auth": {
+    "sharedToken": "demo-shared-token"
+  },
+  "adapters": {
+    "local-unreachable": {
+      "type": "ws-rpc",
+      "url": "ws://127.0.0.1:17999",
+      "token": "demo-unused-token",
+      "connect": {
+        "challengeEvent": "connect.challenge",
+        "method": "connect",
+        "scopes": ["operator.write"]
+      },
+      "deliver": {
+        "method": "chat.send",
+        "targetField": "sessionKey",
+        "messageField": "message",
+        "idempotencyField": "idempotencyKey"
+      }
+    }
+  },
+  "routes": {
+    "agent-b": {
+      "adapter": "local-unreachable",
+      "target": "agent:agent-b:main"
+    }
+  }
+}

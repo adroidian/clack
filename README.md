@@ -37,21 +37,21 @@ The core is responsible for:
 Adapters are responsible for speaking a concrete delivery protocol.
 
 Current built-in adapter types:
-- `ws-rpc` — local WebSocket RPC control plane
-- `remote-http` — forward to another Clack router over HTTP
-- `http-wake` — wake/deliver through an HTTP endpoint
-- `queue-http` — enqueue work for a polling consumer
+- `ws-rpc` - local WebSocket RPC control plane
+- `remote-http` - forward to another Clack router over HTTP
+- `http-wake` - wake/deliver through an HTTP endpoint
+- `queue-http` - enqueue work for a polling consumer
 
 That means the bus is no longer tied to one private control protocol at the core level.
 
 ## Repository contents
 
-- `router.js` — HTTP router with adapter-based delivery
-- `clack_server.py` — inbox + wake server with adapter-based delivery
-- `config.example.json` — example router config
-- `DEPLOYMENT.md` — deployment notes
-- `HOW_IT_WORKS.md` — implementation details and boundaries
-- `SANITIZE_CHECKLIST.md` — pre-publication review checklist
+- `router.js` - HTTP router with adapter-based delivery
+- `clack_server.py` - inbox + wake server with adapter-based delivery
+- `config.example.json` - example router config
+- `DEPLOYMENT.md` - deployment notes
+- `HOW_IT_WORKS.md` - implementation details and boundaries
+- `SANITIZE_CHECKLIST.md` - pre-publication review checklist
 
 ## Quick start
 
@@ -71,13 +71,22 @@ export CLACK_ADAPTERS_JSON='{}'
 python3 clack_server.py
 ```
 
+### Minimal local demo
+If you want to see the router work without wiring real infrastructure first:
+
+```bash
+./demo/run-two-router-demo.sh
+```
+
+That launches two local routers, sends one message from router A to router B, and shows the queued result via `GET /poll/agent-b`. See `demo/README.md` for details.
+
 ## Router config model
 
 The router is configured with three main sections:
 
-- `auth` — shared auth used for inbound route requests
-- `adapters` — named delivery integrations
-- `routes` — target agent → adapter + target mapping
+- `auth` - shared auth used for inbound route requests
+- `adapters` - named delivery integrations
+- `routes` - target agent to adapter + target mapping
 
 Example:
 
@@ -146,4 +155,4 @@ The code and docs are intentionally genericized, but still under review before G
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
