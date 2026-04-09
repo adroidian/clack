@@ -5,7 +5,7 @@ Before syncing this repo to GitHub, verify all of the following:
 ## Secrets
 - [ ] no real auth tokens
 - [ ] no bearer tokens
-- [ ] no gateway tokens
+- [ ] no control-plane tokens
 - [ ] no Cloudflare / tunnel tokens
 - [ ] no API keys
 

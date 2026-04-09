@@ -6,9 +6,9 @@ This document is intentionally generic. Replace all example values with your own
 
 1. Copy `config.example.json` to `config.json`
 2. Fill in:
-   - `clackToken`
-   - local control endpoint URLs/credentials
-   - route table
+   - `auth.sharedToken`
+   - adapter definitions under `adapters`
+   - route → adapter mappings under `routes`
 3. Run:
    ```bash
    node router.js
@@ -28,7 +28,8 @@ Required env vars:
 
 Optional env vars:
 - `CLACK_PENDING_QUEUE_PATH`
-- `CLACK_AGENT_GATEWAYS_JSON`
+- `CLACK_ROUTES_JSON`
+- `CLACK_ADAPTERS_JSON`
 
 Run:
 ```bash

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Generic Clack inbox + wake server.
+Generic Clack inbox + delivery server.
 
-- accepts JSON-RPC tasks/send
-- writes messages to per-agent inbox directories
-- attempts wake delivery locally or via queue fallback
-- retries failed wake attempts
+Core responsibilities:
+- accept JSON-RPC tasks/send
+- normalize, dedupe, rate-limit, and write messages to inbox files
+- hand wake/delivery off to configured adapters
+- retry failed deliveries
 
-All sensitive topology is injected by environment variables.
+Adapter responsibilities:
+- speak a specific wake or delivery protocol
+- map route targets into protocol-specific request fields
 """
 
 import json
@@ -29,10 +32,32 @@ PENDING_QUEUE_PATH = Path(os.environ.get("CLACK_PENDING_QUEUE_PATH", "/tmp/clack
 
 # Example shape:
 # {
-#   "agent-a": {"type": "local", "url": "http://127.0.0.1:18789/hooks/agent", "token": "...", "sessionKey": "agent:agent-a:main"},
-#   "agent-b": {"type": "queue", "url": "http://127.0.0.1:7331/queue/agent-b"}
+#   "agent-a": {"adapter": "wake-http", "target": "agent:agent-a:main"},
+#   "agent-b": {"adapter": "queue-http", "target": "agent-b"}
 # }
-AGENT_GATEWAYS = json.loads(os.environ.get("CLACK_AGENT_GATEWAYS_JSON", "{}"))
+ROUTES = json.loads(os.environ.get("CLACK_ROUTES_JSON", "{}"))
+
+# Example shape:
+# {
+#   "wake-http": {
+#     "type": "http-wake",
+#     "url": "http://127.0.0.1:18789/hooks/agent",
+#     "token": "...",
+#     "token_header": "Authorization",
+#     "payload": {
+#       "mode_field": "wakeMode",
+#       "mode_value": "now",
+#       "message_field": "message",
+#       "message_prefix": "[Clack] ",
+#       "target_field": "sessionKey"
+#     }
+#   },
+#   "queue-http": {
+#     "type": "queue-http",
+#     "url_template": "http://127.0.0.1:7331/queue/{target}"
+#   }
+# }
+ADAPTERS = json.loads(os.environ.get("CLACK_ADAPTERS_JSON", "{}"))
 
 DEDUPE_WINDOW = int(os.environ.get("CLACK_DEDUPE_WINDOW", "300"))
 RATE_LIMIT_WINDOW = int(os.environ.get("CLACK_RATE_LIMIT_WINDOW", "60"))
@@ -124,44 +149,66 @@ def _post_json(url: str, payload: dict, headers: dict | None = None, timeout: in
         method="POST",
     )
     with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+        data = resp.read().decode('utf-8')
+        return json.loads(data) if data else {"ok": True}
 
 
-def _wake_via_gateway(agent_name: str, message_summary: str, msg_hash: str) -> bool:
-    gw = AGENT_GATEWAYS.get(agent_name)
-    if not gw:
-        log.warning("No gateway config for %s", agent_name)
+def deliver_via_adapter(agent_name: str, message_summary: str, msg_hash: str) -> bool:
+    route = ROUTES.get(agent_name)
+    if not route:
+        log.warning("No route configured for %s", agent_name)
+        return False
+
+    adapter_name = route.get('adapter')
+    target = route.get('target')
+    adapter = ADAPTERS.get(adapter_name)
+    if not adapter:
+        log.warning("Unknown adapter %s for %s", adapter_name, agent_name)
         return False
 
     try:
-        if gw.get('type') == 'queue':
-            _post_json(gw['url'], {"from": "clack-server", "topic": "wake", "message": message_summary})
+        if adapter.get('type') == 'queue-http':
+            url = adapter['url_template'].format(target=target, agent=agent_name)
+            payload = {
+                'from': adapter.get('from_name', 'clack-server'),
+                'topic': adapter.get('topic', 'wake'),
+                'message': message_summary,
+            }
+            _post_json(url, payload, timeout=adapter.get('timeout', 5))
             return True
 
-        headers = {}
-        if gw.get('token_header') and gw.get('token'):
-            headers[gw['token_header']] = gw['token']
-        elif gw.get('token'):
-            headers['Authorization'] = f"Bearer {gw['token']}"
+        if adapter.get('type') == 'http-wake':
+            headers = {}
+            token = adapter.get('token')
+            token_header = adapter.get('token_header', 'Authorization')
+            if token:
+                headers[token_header] = f"Bearer {token}" if token_header.lower() == 'authorization' else token
 
-        payload = {"wakeMode": "now", "message": f"[Clack] {message_summary}"}
-        if gw.get('sessionKey'):
-            payload['sessionKey'] = gw['sessionKey']
-        if gw.get('channel'):
-            payload['channel'] = gw['channel']
+            payload_cfg = adapter.get('payload', {})
+            payload = {
+                payload_cfg.get('mode_field', 'wakeMode'): payload_cfg.get('mode_value', 'now'),
+                payload_cfg.get('message_field', 'message'): f"{payload_cfg.get('message_prefix', '')}{message_summary}",
+            }
+            target_field = payload_cfg.get('target_field')
+            if target_field and target:
+                payload[target_field] = target
+            if payload_cfg.get('channel_field') and payload_cfg.get('channel_value'):
+                payload[payload_cfg['channel_field']] = payload_cfg['channel_value']
 
-        _post_json(gw['url'], payload, headers=headers)
-        return True
+            _post_json(adapter['url'], payload, headers=headers, timeout=adapter.get('timeout', 5))
+            return True
+
+        log.warning("Unsupported adapter type for %s: %s", agent_name, adapter.get('type'))
     except error.HTTPError as e:
-        log.warning("Wake HTTP error for %s: %s %s", agent_name, e.code, e.reason)
+        log.warning("Delivery HTTP error for %s: %s %s", agent_name, e.code, e.reason)
     except Exception as e:
-        log.warning("Wake failed for %s: %s", agent_name, e)
+        log.warning("Delivery failed for %s: %s", agent_name, e)
     return False
 
 
 def wake_agent(agent_name: str, message_summary: str, msg_hash: str = ""):
     for attempt in range(1, MAX_RETRIES + 1):
-        if _wake_via_gateway(agent_name, message_summary, msg_hash):
+        if deliver_via_adapter(agent_name, message_summary, msg_hash):
             return
         if attempt < MAX_RETRIES:
             time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
@@ -183,7 +230,7 @@ def process_message(params: dict) -> dict:
     topic = metadata.get('topic') or params.get('topic', 'general')
     priority = metadata.get('priority') or params.get('priority', 'normal')
 
-    if not to_agent or to_agent not in AGENT_GATEWAYS:
+    if not to_agent or to_agent not in ROUTES:
         return {"error": {"code": -32001, "message": f"Unknown target agent: {to_agent}"}}
 
     if isinstance(message, str):
@@ -235,7 +282,7 @@ class ClackHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            self._json({"status": "ok", "uptime": time.time(), "agents": list(AGENT_GATEWAYS.keys())})
+            self._json({"status": "ok", "uptime": time.time(), "routes": list(ROUTES.keys()), "adapters": list(ADAPTERS.keys())})
         else:
             self._json({"error": "Not found"}, 404)
 
@@ -276,7 +323,7 @@ class InboxWatcher(threading.Thread):
     def run(self):
         while self.running:
             if INBOX_ROOT.exists():
-                for agent_name in AGENT_GATEWAYS:
+                for agent_name in ROUTES:
                     inbox = INBOX_ROOT / agent_name
                     if not inbox.exists():
                         continue
@@ -293,7 +340,7 @@ class InboxWatcher(threading.Thread):
             if not attempts:
                 continue
             oldest = attempts[0]
-            if _wake_via_gateway(agent_name, oldest.get('message_summary', ''), oldest.get('msg_hash', '')):
+            if deliver_via_adapter(agent_name, oldest.get('message_summary', ''), oldest.get('msg_hash', '')):
                 _remove_pending(agent_name, oldest.get('msg_hash', ''))
 
     def _process_file(self, filepath: Path, agent_name: str):
@@ -326,7 +373,7 @@ def main():
 
     server = ReusableHTTPServer(('0.0.0.0', PORT), ClackHandler)
     log.info('Clack server listening on port %s', PORT)
-    log.info('Serving agents: %s', ', '.join(AGENT_GATEWAYS.keys()) or '(none configured)')
+    log.info('Serving routes: %s', ', '.join(ROUTES.keys()) or '(none configured)')
 
     def shutdown(sig, frame):
         watcher.stop()

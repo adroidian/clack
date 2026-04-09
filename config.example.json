@@ -1,29 +1,47 @@
 {
-  "agent": "router-host-name",
+  "routerName": "router-host-name",
   "port": 7331,
-  "clackToken": "replace-with-shared-secret",
-  "gateway": {
-    "url": "ws://127.0.0.1:18789",
-    "token": "replace-with-local-gateway-token"
+  "auth": {
+    "sharedToken": "replace-with-shared-secret"
+  },
+  "adapters": {
+    "local-control": {
+      "type": "ws-rpc",
+      "url": "ws://127.0.0.1:18789",
+      "token": "replace-with-local-control-token",
+      "connect": {
+        "challengeEvent": "connect.challenge",
+        "method": "connect",
+        "scopes": ["operator.write"],
+        "minProtocol": 3,
+        "maxProtocol": 3
+      },
+      "deliver": {
+        "method": "chat.send",
+        "targetField": "sessionKey",
+        "messageField": "message",
+        "idempotencyField": "idempotencyKey"
+      }
+    },
+    "remote-router": {
+      "type": "remote-http",
+      "baseUrl": "https://remote-router.example.com",
+      "path": "/route",
+      "authHeader": "X-Clack-Token"
+    }
   },
   "routes": {
     "agent-a": {
-      "gateway": "local",
-      "sessionKey": "agent:agent-a:main"
+      "adapter": "local-control",
+      "target": "agent:agent-a:main"
     },
     "agent-b": {
-      "gateway": "local-secondary",
-      "sessionKey": "agent:agent-b:main"
+      "adapter": "local-control",
+      "target": "agent:agent-b:main"
     },
     "remote-agent": {
-      "gateway": "https://remote-router.example.com",
-      "sessionKey": "agent:remote-agent:main"
-    }
-  },
-  "gateways": {
-    "local-secondary": {
-      "url": "ws://127.0.0.1:19789",
-      "token": "replace-with-secondary-gateway-token"
+      "adapter": "remote-router",
+      "target": "agent:remote-agent:main"
     }
   }
 }

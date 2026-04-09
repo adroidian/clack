@@ -3,9 +3,9 @@
 This repository is a sanitized staging export of Clack.
 
 ## What is structural
-- `router.js` is the HTTP/WebSocket router
-- `clack_server.py` is the inbox + wake server
-- `config.example.json` shows required router config shape
+- `router.js` is the routing core plus delivery adapter implementations
+- `clack_server.py` is the inbox core plus wake adapter implementations
+- `config.example.json` shows the route/adapters config shape
 
 ## What is advisory
 - the README and deployment notes are examples
@@ -16,18 +16,19 @@ This repository is a sanitized staging export of Clack.
 1. Receive `POST /route`
 2. Validate `X-Clack-Token`
 3. Look up target in route table
-4. If target maps to a named local endpoint, send over the configured WebSocket control channel
-5. If target maps to a remote URL, POST to `${gateway}/route`
-6. If local delivery fails, queue for `GET /poll/:agent`
+4. Resolve the route's adapter
+5. Hand delivery to that adapter
+6. If adapter delivery fails, queue for `GET /poll/:agent`
 
 ## Python server flow
 1. Receive JSON-RPC `tasks/send`
 2. Normalize message payload
 3. Dedupe and rate-limit
 4. Write JSON file into `CLACK_INBOX_ROOT/<agent>/`
-5. Attempt wake/delivery using config from `CLACK_AGENT_GATEWAYS_JSON`
-6. On repeated failure, store retry metadata in `CLACK_PENDING_QUEUE_PATH`
-7. Background watcher retries failed wakes and processes newly dropped inbox files
+5. Resolve the target route's adapter
+6. Hand wake/delivery to that adapter
+7. On repeated failure, store retry metadata in `CLACK_PENDING_QUEUE_PATH`
+8. Background watcher retries failed wakes and processes newly dropped inbox files
 
 ## Files written
 - inbox message files under `CLACK_INBOX_ROOT/<agent>/`
@@ -38,4 +39,5 @@ This repository is a sanitized staging export of Clack.
 - no built-in encryption at rest
 - no packaged systemd/Docker manifests yet
 - no turnkey public deployment example yet
+- adapters are configurable but still shipped inline, not as separate plugin modules
 - public release still requires human review of naming and examples
