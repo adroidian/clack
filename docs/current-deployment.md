@@ -29,6 +29,10 @@ Do not claim runtime wake until a target-specific wake path is verified.
 - Current limitation: the EX Hermes endpoint registered as `hermes-ex` still points
   at the agent-browser UI port, not a verified A2A/wake receiver. Keep Zari's
   live Python Clack route inbox-first until the Hermes wake/A2A adapter is real.
+- Hermes is the primary forward path for more than Zari. The adapter should be
+  implemented as a reusable Hermes receiver for any EX/local Hermes profile, with
+  Zari as the first smoke-test route and Alf/other Hermes agents following the
+  same contract.
 
 ## Rollout Gates
 
