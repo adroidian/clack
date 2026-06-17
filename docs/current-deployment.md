@@ -22,10 +22,17 @@ the gateway repo prepares the next centralized registry/control-plane shape.
 Delivery mode is currently inbox-first/store-only for newly reintroduced agents.
 Do not claim runtime wake until a target-specific wake path is verified.
 
+## Trust Classes
+
+- Zari is a core-private operator, not a customer/public edge agent.
+- Zari is cleared for full Clack membership and cross-host operational use.
+- Current limitation: the EX Hermes endpoint registered as `hermes-ex` still points
+  at the agent-browser UI port, not a verified A2A/wake receiver. Keep Zari's
+  live Python Clack route inbox-first until the Hermes wake/A2A adapter is real.
+
 ## Rollout Gates
 
 1. Gitea SOT updated first.
 2. GitHub mirror/PR updated second.
 3. Runtime rollout only after repo state matches intended topology.
 4. Public/customer agents stay out of peer Clack unless explicitly promoted.
-

@@ -32,6 +32,7 @@ auth:
     - vera
     - nora
     - alf
+    # Zari is a trusted core-private DevOps/network operator on EX.
     - zari
     - loom
     - rosie
