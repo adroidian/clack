@@ -30,9 +30,21 @@ auth:
     - daisy
     - arch
     - vera
-    # teseract agents — add when ready (Tailscale hostname: teseract, 100.118.158.58):
-    # - loom
-    # - hermes-teseract
+    - nora
+    - alf
+    - zari
+    - loom
+    - rosie
+    # Vanta kinlets on omni
+    - voca
+    - ignition
+    - lens
+    - signal
+    - essence
+    - scout
+    - aura
+    - bond
+    - magneto
 
   # Remote agents (not on omni) must supply a per-agent token on registration.
   # Token hashes stored in Infisical under /clack/agent-tokens/<agentId>.
