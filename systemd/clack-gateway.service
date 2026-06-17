@@ -1,0 +1,28 @@
+[Unit]
+Description=Clack Gateway — A2A mesh router for Chitin
+Documentation=https://git.kasnet.us/chitin/clack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=clack
+Group=clack
+WorkingDirectory=/opt/clack-gateway/app
+ExecStart=/usr/bin/node /opt/clack-gateway/app/index.js
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clack-gateway
+EnvironmentFile=/opt/clack-gateway/config/env
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/clack-gateway/data /opt/clack-gateway/logs
+
+[Install]
+WantedBy=multi-user.target

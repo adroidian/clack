@@ -1,0 +1,79 @@
+# Clack Gateway configuration
+# Copy to /opt/clack-gateway/config/gateway.yml and edit before starting.
+# No secrets belong in this file. All secret values come from the env file only.
+
+server:
+  # Bind to localhost only during staging and initial rollout.
+  # Change to the Tailscale interface IP (100.x.x.x) only when remote agents
+  # need direct registry lookup access over the mesh.
+  host: 127.0.0.1
+  port: 15200
+  staging_hostname: clack-next.kasnet.us
+  prod_hostname: clack.kasnet.us
+
+auth:
+  # Bootstrap secret is read from CLACK_BOOTSTRAP_SECRET env var only.
+  # Never put the secret value here — set it in /opt/clack-gateway/config/env (chmod 600).
+
+  # strict = only agentIds in allowed_agents can self-register (required for prod)
+  # open   = any agent with a valid bootstrap token can register (staging only)
+  allowlist_policy: strict
+
+  allowed_agents:
+    - pax
+    - sable
+    - vesper
+    - static
+    - ember
+    - blaze
+    - kas
+    - daisy
+    - arch
+    - vera
+    - nora
+    - alf
+    - zari
+    - loom
+    - rosie
+    # Vanta kinlets on omni
+    - voca
+    - ignition
+    - lens
+    - signal
+    - essence
+    - scout
+    - aura
+    - bond
+    - magneto
+
+  # Remote agents (not on omni) must supply a per-agent token on registration.
+  # Token hashes stored in Infisical under /clack/agent-tokens/<agentId>.
+  # Never put token values in this file.
+  remote_auth_required: true
+
+  # mDNS-discovered agents on omni are trusted by host proximity — skip per-agent token.
+  local_mdns_trusted: true
+
+registry:
+  ttl_default: 120           # seconds; agents must heartbeat before expiry or be marked stale
+  ttl_local_bonus: 60        # extra grace for omni-local (mDNS-discovered) agents
+  stale_check_interval: 30   # seconds between expiry sweeps
+
+  # Seed from kin-net on first boot only. Gateway becomes source of truth after first run.
+  # Set to empty string to skip seeding.
+  bootstrap_seed: /opt/clack-gateway/config/bootstrap-registry.json
+
+routing:
+  prefer_tailscale: true     # use tailscaleUrl when agent has both internal and public URLs
+  fallback_to_public: true   # fall back to publicUrl if Tailscale endpoint unreachable
+  delivery_timeout: 10       # seconds before a delivery attempt times out
+  max_retries: 3
+  retry_backoff_ms: 1000
+
+observability:
+  health_endpoint:     /health
+  registry_endpoint:   /registry
+  routes_endpoint:     /routes
+  deliveries_endpoint: /deliveries/recent
+  deliveries_retention: 500  # keep last N delivery records in memory
+  log_dir: /opt/clack-gateway/logs

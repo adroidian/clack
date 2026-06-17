@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ClackAgentRecord",
+  "description": "A single agent's registration record in the Clack gateway registry.",
+  "type": "object",
+  "required": ["agentId", "hostId", "tailscaleUrl", "wakeUrl", "harnessType", "transport", "capabilities", "ttl"],
+  "additionalProperties": false,
+  "properties": {
+    "agentId": {
+      "type": "string",
+      "description": "Unique agent identifier across the pack. Lowercase, no spaces. e.g. 'sable', 'vesper'."
+    },
+    "hostId": {
+      "type": "string",
+      "description": "Host the agent runs on. e.g. 'omni', 'desk', 'teseract'. Must match the Tailscale hostname."
+    },
+    "tailscaleUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "A2A endpoint over Tailscale (100.x.x.x). Used for all internal traffic."
+    },
+    "publicUrl": {
+      "type": ["string", "null"],
+      "format": "uri",
+      "description": "A2A endpoint via CF tunnel. Null if agent is not externally reachable."
+    },
+    "wakeUrl": {
+      "type": "string",
+      "format": "uri",
+      "description": "Harness wake endpoint. Called by the gateway after routing a message. Format depends on harnessType."
+    },
+    "harnessType": {
+      "type": "string",
+      "enum": ["openclaw", "hermes", "cloudrun", "custom"],
+      "description": "Harness the agent runs under. Determines which wake adapter the gateway uses."
+    },
+    "transport": {
+      "type": "string",
+      "enum": ["http-wake", "openclaw-task", "webhook", "queue"],
+      "description": "Message delivery mechanism for this agent."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Skill/topic tags this agent handles. Used for capability-based routing. e.g. ['devops', 'git', 'deploy']."
+    },
+    "registeredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of last registration or re-registration."
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp after which this record is considered stale. Refreshed on heartbeat."
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 30,
+      "description": "Heartbeat TTL in seconds. Agent must POST /heartbeat within this window. Default: 120."
+    },
+    "bootstrapTokenHash": {
+      "type": ["string", "null"],
+      "description": "Bcrypt hash of the per-agent bootstrap token. Plain-text token lives in Infisical only. Null for local mDNS-trusted agents."
+    }
+  }
+}
