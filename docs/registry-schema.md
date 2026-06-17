@@ -15,7 +15,7 @@ bootstrap token before accepting the record.
 | `tailscaleUrl` | URI | A2A endpoint over Tailscale. Used for all internal pack traffic. |
 | `wakeUrl` | URI | Harness wake endpoint. Gateway calls this after routing a message. |
 | `harnessType` | enum | One of: `openclaw`, `hermes`, `cloudrun`, `custom` |
-| `transport` | enum | One of: `http-wake`, `openclaw-task`, `webhook`, `queue` |
+| `transport` | enum | One of: `http-wake`, `openclaw-task`, `hermes-wake`, `hermes-a2a`, `webhook`, `queue` |
 | `capabilities` | string[] | Skill/topic tags. Used for capability-based routing. |
 | `ttl` | integer | Heartbeat TTL in seconds (min 30). Agent must re-register before expiry. |
 
@@ -33,7 +33,7 @@ bootstrap token before accepting the record.
 | `harnessType` | Wake URL format | What the gateway does |
 |---|---|---|
 | `openclaw` | `http://<host>:18789/hooks/agent` | POST `{ agent: agentId }` |
-| `hermes` | `http://<host>:<port>/wake` | POST `{ agentId, taskId }` |
+| `hermes` | `http://<host>:<port>/wake` | `hermes-wake` / `hermes-a2a`; POST the Clack delivery envelope to a Hermes receiver |
 | `cloudrun` | `https://<service>.run.app/wake` | POST with Bearer token |
 | `custom` | Any HTTP endpoint | POST `{ agentId, taskId, message }` |
 
@@ -67,3 +67,29 @@ are marked `stale` and excluded from routing until the agent re-registers.
   "bootstrapTokenHash": null
 }
 ```
+
+## Hermes Delivery Envelope
+
+Hermes is a fleet-level transport, not a Zari-specific route. Any Hermes agent
+registers with `harnessType: "hermes"` and either `transport: "hermes-wake"` or
+`transport: "hermes-a2a"`.
+
+The gateway POSTs this body to `wakeUrl`:
+
+```json
+{
+  "from": "vesper",
+  "to": "zari",
+  "topic": "ops",
+  "message": "status check",
+  "priority": "high",
+  "idempotencyKey": "msg-123",
+  "taskId": "task-123",
+  "contextId": "ctx-123",
+  "metadata": {}
+}
+```
+
+The Hermes receiver resolves `to` to the local profile/session, starts or resumes
+that profile when needed, and returns `delivered`, `queued`, `retrying`,
+`failed`, or `dead-lettered` with enough detail for `/deliveries/recent`.
