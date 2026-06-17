@@ -33,6 +33,9 @@ Do not claim runtime wake until a target-specific wake path is verified.
   implemented as a reusable Hermes receiver for any EX/local Hermes profile, with
   Zari as the first smoke-test route and Alf/other Hermes agents following the
   same contract.
+- EX now runs `clack-hermes-receiver.service` on `100.99.159.110:15300`.
+  `hermes-ex` registers with `transport: hermes-wake`, and the live EX Python
+  Clack server routes `alf` and `zari` through that receiver.
 
 ## Rollout Gates
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=Clack Hermes wake receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/home/aaron/clack-gateway/adapters/hermes-receiver.env
+ExecStart=/usr/bin/python3 /home/aaron/clack-gateway/adapters/hermes-receiver.py
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/home/aaron/clack-gateway
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clack-hermes-receiver
+
+[Install]
+WantedBy=default.target
