@@ -1,0 +1,10 @@
+{
+  "clackVersion": "2.0-draft",
+  "id": "bad-1",
+  "from": "zari",
+  "to": "Mercy",
+  "topic": "wake",
+  "priority": "extreme",
+  "ttlSeconds": 0,
+  "capabilityRequested": "godmode"
+}

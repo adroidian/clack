@@ -1,0 +1,23 @@
+{
+  "receiptVersion": "1.0-draft",
+  "receiptId": "rcpt-018ff2d2-routed",
+  "messageId": "018ff2d2-3f31-7f1a-9a4d-6d78f7d4c001",
+  "from": "agent://zari.example",
+  "to": "agent://vesper.example",
+  "stage": "routed",
+  "route": {
+    "kind": "clack-http",
+    "target": "http://example.invalid/a2a",
+    "via": "cns-route-record"
+  },
+  "ok": true,
+  "reason": null,
+  "at": "2026-06-23T07:01:00Z",
+  "proof": {
+    "httpStatus": 202,
+    "routeTier": "direct-send",
+    "inboxPath": null,
+    "wakeLog": null,
+    "responseId": null
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "routeRecordVersion": "1.0-draft",
+  "routeId": "route-zari-clack-http-20260623",
+  "agentId": "agent://zari.example",
+  "kind": "clack-http",
+  "status": "active",
+  "priority": 10,
+  "endpoint": "http://example.invalid:15100/a2a",
+  "createdAt": "2026-06-23T07:00:00Z",
+  "expiresAt": "2026-06-23T08:30:00Z",
+  "updatedAt": "2026-06-23T07:00:00Z",
+  "proofAt": "2026-06-23T07:00:00Z",
+  "proofKind": "delivery",
+  "proofId": "rcpt-018ff2d2-3f31-7f1a-9a4d-6d78f7d4c001-routed",
+  "ttlSeconds": 5400,
+  "metadata": {}
+}

@@ -1,0 +1,19 @@
+{
+  "clackVersion": "2.0-draft",
+  "id": "018ff2d2-3f31-7f1a-9a4d-6d78f7d4c001",
+  "from": "agent://zari.example",
+  "to": "agent://vesper.example",
+  "topic": "mesh.plan",
+  "priority": "normal",
+  "createdAt": "2026-06-23T07:00:00Z",
+  "ttlSeconds": 3600,
+  "capabilityRequested": "direct-send",
+  "idempotencyKey": "zari-vesper-mesh-plan-20260623T070000Z",
+  "replyTo": null,
+  "trace": [],
+  "payload": {
+    "type": "agent-task",
+    "contentType": "text/markdown",
+    "body": "Summarize route matrix deltas."
+  }
+}

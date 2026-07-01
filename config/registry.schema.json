@@ -61,7 +61,7 @@
     },
     "bootstrapTokenHash": {
       "type": ["string", "null"],
-      "description": "Bcrypt hash of the per-agent bootstrap token. Plain-text token lives in Infisical only. Null for local mDNS-trusted agents."
+      "description": "Bcrypt hash of the per-agent bootstrap token. Plain-text token lives in a secret manager only. Null for local mDNS-trusted agents."
     }
   }
 }

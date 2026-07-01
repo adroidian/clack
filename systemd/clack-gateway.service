@@ -1,6 +1,6 @@
 [Unit]
 Description=Clack Gateway — A2A mesh router for Chitin
-Documentation=https://git.kasnet.us/chitin/clack
+Documentation=https://github.com/adroidian/clack
 After=network-online.target
 Wants=network-online.target
 

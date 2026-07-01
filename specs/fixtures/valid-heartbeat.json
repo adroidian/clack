@@ -1,0 +1,11 @@
+{
+  "heartbeatVersion": "1.0-draft",
+  "agentId": "agent://zari.example",
+  "routeId": "route-zari-clack-http-20260623",
+  "proofKind": "heartbeat",
+  "proofAt": "2026-06-23T07:05:00Z",
+  "ttlSeconds": 300,
+  "metadata": {
+    "status": "active"
+  }
+}
