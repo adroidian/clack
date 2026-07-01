@@ -1,1 +1,25 @@
-IyBMaXZlIGNvbmZpZyDigJQgbmV2ZXIgY29tbWl0IHJlYWwgdmFsdWVzCmNvbmZpZy9lbnYKY29uZmlnL2dhdGV3YXkueW1sCmNvbmZpZy9ib290c3RyYXAtcmVnaXN0cnkuanNvbgoKIyBSdW50aW1lIGRhdGEKZGF0YS8KbG9ncy8KCiMgTm9kZQphcHAvbm9kZV9tb2R1bGVzLwphcHAvLmVudgphcHAvKi5sb2cKCiMgQmFja3VwIGFydGlmYWN0cyBmcm9tIHVwZGF0ZS9yb2xsYmFjawphcHAucHJldi8KYXBwLmJhZC8KCiMgU2VjcmV0cwoqLnNlY3JldAoqLmtleQoqLnBlbQo=
+# Live config — never commit real values
+config/env
+config/gateway.yml
+config/bootstrap-registry.json
+
+# Runtime data
+data/
+logs/
+
+# Build outputs
+bin/
+
+# Node
+app/node_modules/
+app/.env
+app/*.log
+
+# Backup artifacts from update/rollback
+app.prev/
+app.bad/
+
+# Secrets
+*.secret
+*.key
+*.pem
