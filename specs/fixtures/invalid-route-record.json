@@ -1,0 +1,10 @@
+{
+  "routeRecordVersion": "1.0-draft",
+  "routeId": "bad-route",
+  "agentId": "zari",
+  "kind": "teleport",
+  "status": "maybe",
+  "priority": -5,
+  "createdAt": "2026-06-23T07:00:00Z",
+  "expiresAt": "2026-01-01T00:00:00Z"
+}

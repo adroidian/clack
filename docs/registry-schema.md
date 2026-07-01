@@ -33,15 +33,15 @@ bootstrap token before accepting the record.
 | `harnessType` | Wake URL format | What the gateway does |
 |---|---|---|
 | `openclaw` | `http://<host>:18789/hooks/agent` | POST `{ agent: agentId }` |
-| `hermes` | `http://<host>:<port>/wake` | `hermes-wake` / `hermes-a2a`; POST the Clack delivery envelope to a Hermes receiver |
-| `cloudrun` | `https://<service>.run.app/wake` | POST with Bearer token |
+| `hermes` | `http://127.0.0.1:15300/wake` | `hermes-wake` / `hermes-a2a`; POST the Clack delivery envelope to a local Hermes receiver |
+| `cloudrun` | `https://example.invalid/wake` | POST with bearer auth in deployments that choose this adapter |
 | `custom` | Any HTTP endpoint | POST `{ agentId, taskId, message }` |
 
 ## Registration auth
 
 - **Local agents (mDNS-discovered on omni):** trusted by host proximity. No per-agent token required.
 - **Remote agents (other Tailscale hosts):** must supply `X-Clack-Token` header matching the
-  bcrypt hash stored in Infisical at `/clack/agent-tokens/<agentId>`.
+  bcrypt hash stored in a secret manager at `secret-manager://example/clack/agent-tokens/<agentId>`.
 - **Remote agents cannot overwrite local agents.** If an incoming registration for a locally-registered
   agentId arrives from a different hostId, it is rejected with 403.
 

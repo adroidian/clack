@@ -8,7 +8,7 @@ SERVICE_NAME="clack-gateway"
 # chitin/clack-core — our fork of win4r/openclaw-a2a-gateway.
 # Contains Chitin shims (/routes, /deliveries/recent) + harness-agnostic transport layer.
 # Primary: Gitea (internal). Mirror: github.com/adroidian/clack-core (public).
-UPSTREAM="https://git.kasnet.us/chitin/clack-core.git"
+UPSTREAM="https://github.com/adroidian/clack.git"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> Clack Gateway install"
@@ -46,7 +46,7 @@ if [ ! -f "$INSTALL_DIR/config/gateway.yml" ]; then
   sudo chmod 600 "$INSTALL_DIR/config/env"
   echo ""
   echo "  !! Edit $INSTALL_DIR/config/gateway.yml before starting."
-  echo "  !! Inject CLACK_BOOTSTRAP_SECRET from Infisical into $INSTALL_DIR/config/env."
+  echo "  !! Inject CLACK_BOOTSTRAP_SECRET from a secret manager into $INSTALL_DIR/config/env."
   echo ""
 else
   echo "--> Config already exists, skipping."
@@ -61,7 +61,7 @@ sudo systemctl enable "$SERVICE_NAME"
 echo ""
 echo "==> Install complete."
 echo "    1. Fill in $INSTALL_DIR/config/gateway.yml (copy allowed_agents from kin-net registry)"
-echo "    2. Inject secrets: CLACK_BOOTSTRAP_SECRET from Infisical"
+echo "    2. Inject secrets: CLACK_BOOTSTRAP_SECRET from a secret manager"
 echo "    3. Optionally seed: cp <kin-net-export> $INSTALL_DIR/config/bootstrap-registry.json"
 echo "    4. Start: sudo systemctl start $SERVICE_NAME"
 echo "    5. Check: sudo systemctl status $SERVICE_NAME"

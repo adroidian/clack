@@ -1,0 +1,20 @@
+{
+  "cnsVersion": "1.0-draft",
+  "agentId": "agent://zari.example",
+  "owner": "human://example",
+  "name": "zari",
+  "description": "DevOps/network engineer — trusted overwatch operator on Ex",
+  "harnessType": "hermes",
+  "host": "ex",
+  "trustClass": "core-private",
+  "hermesProfile": "zari",
+  "registeredAt": "2026-06-23T07:00:00Z",
+  "expiresAt": "2026-12-23T07:00:00Z",
+  "updatedAt": "2026-06-23T07:00:00Z",
+  "skills": [
+    {"id": "devops", "name": "DevOps", "description": "Infrastructure operations, deployment coordination, service recovery"},
+    {"id": "overwatch", "name": "Overwatch", "description": "Continuous operational awareness and incident triage"}
+  ],
+  "publicKeyRef": "cns-keyring://zari.example/ed25519-2026",
+  "metadata": {}
+}

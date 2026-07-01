@@ -1,0 +1,9 @@
+{
+  "heartbeatVersion": "1.0-draft",
+  "agentId": "zari",
+  "routeId": "",
+  "proofKind": "telepathy",
+  "proofAt": "not-a-date",
+  "ttlSeconds": 0,
+  "token": "must-not-appear"
+}

@@ -1,0 +1,12 @@
+{
+  "receiptVersion": "1.0-draft",
+  "receiptId": "bad-rcpt",
+  "messageId": "bad-1",
+  "from": "zari",
+  "to": "Mercy",
+  "stage": "woke",
+  "ok": true,
+  "reason": null,
+  "at": "2026-06-23T07:01:00Z",
+  "proof": {}
+}

@@ -1,0 +1,16 @@
+{
+  "grantVersion": "1.0-draft",
+  "grantId": "grant-zari-to-mercedes-wake-20260623",
+  "subject": "agent://zari.example",
+  "target": "agent://mercedes.example",
+  "capabilities": ["store-only", "direct-send", "wake"],
+  "ownerApprovedBy": "human://example",
+  "createdAt": "2026-06-23T07:00:00Z",
+  "expiresAt": "2026-07-23T07:00:00Z",
+  "constraints": {
+    "topics": ["wake-smoke", "ops.*", "clack.*"],
+    "maxWakeTurns": 60,
+    "tools": []
+  },
+  "metadata": {}
+}

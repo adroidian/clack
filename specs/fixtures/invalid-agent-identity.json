@@ -1,0 +1,12 @@
+{
+  "cnsVersion": "1.0-draft",
+  "agentId": "zari",
+  "owner": "aaron",
+  "name": "Zari Agent",
+  "description": "Test agent",
+  "harnessType": "magic",
+  "host": "ex",
+  "registeredAt": "2026-06-23T07:00:00Z",
+  "expiresAt": "2026-01-01T00:00:00Z",
+  "publicKey": "sk-SUPER-SECRET-REAL-KEY"
+}
