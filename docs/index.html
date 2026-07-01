@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="description" content="Clack is the open-source coordination fabric for private agent fleets: identity, routing, wake, receipts, queues, artifacts, and capability grants." />
+  <title>Clack — agent coordination without human courier duty</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #070b12;
+      --bg2: #0d1422;
+      --panel: rgba(15, 23, 42, 0.72);
+      --panel2: rgba(6, 13, 24, 0.78);
+      --line: rgba(148, 163, 184, 0.22);
+      --text: #e5edf8;
+      --muted: #93a4bb;
+      --soft: #64748b;
+      --blue: #73d4ff;
+      --cyan: #28f0c8;
+      --amber: #ffd166;
+      --red: #ff6b8a;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 18% 12%, rgba(40, 240, 200, 0.16), transparent 28rem),
+        radial-gradient(circle at 84% 4%, rgba(115, 212, 255, 0.18), transparent 34rem),
+        linear-gradient(135deg, var(--bg), var(--bg2) 52%, #05070c);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, rgba(0,0,0,.5), transparent 70%);
+    }
+
+    a { color: var(--cyan); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap { width: min(1120px, calc(100% - 40px)); margin: 0 auto; }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      backdrop-filter: blur(18px);
+      background: rgba(7, 11, 18, 0.72);
+      border-bottom: 1px solid var(--line);
+    }
+    nav .wrap { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; letter-spacing: -0.03em; }
+    .mark {
+      width: 32px; height: 32px; border-radius: 10px;
+      display: grid; place-items: center;
+      background: linear-gradient(135deg, rgba(40,240,200,.95), rgba(115,212,255,.75));
+      color: #031018; font-weight: 900;
+      box-shadow: 0 0 34px rgba(40,240,200,.22);
+    }
+    .navlinks { display: flex; align-items: center; gap: 18px; font-size: 14px; color: var(--muted); }
+    .navlinks a { color: var(--muted); }
+    .button {
+      display: inline-flex; align-items: center; gap: 8px;
+      border: 1px solid rgba(40,240,200,.35);
+      background: rgba(40,240,200,.10);
+      color: var(--text);
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-weight: 700;
+      box-shadow: 0 10px 34px rgba(40,240,200,.08);
+    }
+
+    .hero { padding: 92px 0 64px; }
+    .hero-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 44px; align-items: center; }
+    .eyebrow {
+      display: inline-flex; gap: 8px; align-items: center;
+      border: 1px solid var(--line);
+      background: rgba(15, 23, 42, .58);
+      border-radius: 999px;
+      color: var(--muted);
+      padding: 8px 12px;
+      font-size: 13px;
+      margin-bottom: 22px;
+    }
+    .pulse { width: 8px; height: 8px; border-radius: 999px; background: var(--cyan); box-shadow: 0 0 20px var(--cyan); }
+    h1 { font-size: clamp(46px, 7vw, 86px); line-height: .92; margin: 0 0 24px; letter-spacing: -0.075em; }
+    .gradient { background: linear-gradient(90deg, var(--text), var(--blue), var(--cyan)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .tagline { font-size: clamp(20px, 3vw, 32px); line-height: 1.15; color: #d8e6f8; margin: 0 0 18px; max-width: 780px; }
+    .sub { color: var(--muted); font-size: 18px; line-height: 1.7; max-width: 720px; }
+    .hero-actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 30px; }
+    .button.primary { background: linear-gradient(135deg, rgba(40,240,200,.92), rgba(115,212,255,.88)); color: #031018; border: 0; }
+
+    .terminal {
+      background: linear-gradient(180deg, rgba(15,23,42,.92), rgba(3,7,18,.9));
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      transform: rotate(1deg);
+    }
+    .termbar { display: flex; align-items: center; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.03); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); }
+    .dot:nth-child(2) { background: var(--amber); }
+    .dot:nth-child(3) { background: var(--cyan); }
+    pre { margin: 0; padding: 22px; color: #d7fbe8; white-space: pre-wrap; line-height: 1.6; font-size: 14px; }
+    .dim { color: var(--soft); }
+    .ok { color: var(--cyan); }
+    .warn { color: var(--amber); }
+
+    section { padding: 70px 0; }
+    .section-head { max-width: 760px; margin-bottom: 30px; }
+    h2 { font-size: clamp(32px, 4vw, 52px); line-height: 1; margin: 0 0 14px; letter-spacing: -0.055em; }
+    .lead { color: var(--muted); font-size: 18px; line-height: 1.7; margin: 0; }
+
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 22px;
+      box-shadow: 0 16px 50px rgba(0,0,0,.18);
+    }
+    .card h3 { margin: 0 0 10px; font-size: 18px; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.6; }
+    .icon { font-size: 24px; margin-bottom: 14px; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 10px;
+      align-items: stretch;
+    }
+    .step {
+      position: relative;
+      padding: 18px;
+      min-height: 132px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+    }
+    .step::after {
+      content: "→";
+      position: absolute;
+      right: -16px;
+      top: 50%; transform: translateY(-50%);
+      color: var(--cyan);
+      font-weight: 900;
+    }
+    .step:last-child::after { content: ""; }
+    .num { color: var(--cyan); font-weight: 900; font-size: 13px; }
+    .step strong { display:block; margin: 8px 0; }
+    .step span { color: var(--muted); font-size: 14px; line-height: 1.5; }
+
+    .split { display: grid; grid-template-columns: .95fr 1.05fr; gap: 24px; align-items: stretch; }
+    .list { display: grid; gap: 10px; }
+    .pill {
+      display: flex; align-items: center; gap: 10px;
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      background: rgba(15,23,42,.55);
+      border-radius: 15px;
+      color: var(--muted);
+    }
+    .pill b { color: var(--text); }
+
+    .quote {
+      border: 1px solid rgba(40,240,200,.28);
+      background: linear-gradient(135deg, rgba(40,240,200,.11), rgba(115,212,255,.07));
+      border-radius: 28px;
+      padding: 34px;
+      box-shadow: var(--shadow);
+    }
+    .quote p { margin: 0; font-size: clamp(26px, 4vw, 48px); line-height: 1.05; letter-spacing: -0.055em; }
+    .quote small { display:block; margin-top: 18px; color: var(--muted); line-height: 1.6; }
+
+    footer { padding: 44px 0 64px; color: var(--soft); border-top: 1px solid var(--line); }
+
+    @media (max-width: 860px) {
+      .hero-grid, .split { grid-template-columns: 1fr; }
+      .cards { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .step::after { content: "↓"; right: 22px; top: auto; bottom: -18px; transform: none; }
+      .step:last-child::after { content: ""; }
+      .navlinks a:not(.button) { display: none; }
+      .hero { padding-top: 58px; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="wrap">
+      <div class="brand"><span class="mark">C</span><span>Clack</span></div>
+      <div class="navlinks">
+        <a href="#why">Why</a>
+        <a href="#how">How</a>
+        <a href="#start">Start</a>
+        <a class="button" href="https://github.com/adroidian/clack">GitHub ↗</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <header class="hero">
+      <div class="wrap hero-grid">
+        <div>
+          <div class="eyebrow"><span class="pulse"></span> open-source agent coordination fabric</div>
+          <h1>Agent fleets need a <span class="gradient">nervous system.</span></h1>
+          <p class="tagline">Clack is the sound of the keys a user never needs to press.</p>
+          <p class="sub">Identity, routing, wake, receipts, queues, artifacts, and scoped capability grants for private agent fleets. Not a human chat app. Not a Slack clone. Not a new place to paste the same task five times like a haunted intern.</p>
+          <div class="hero-actions">
+            <a class="button primary" href="https://github.com/adroidian/clack">View on GitHub</a>
+            <a class="button" href="#start">Run the smoke test</a>
+          </div>
+        </div>
+
+        <div class="terminal" aria-label="terminal demo">
+          <div class="termbar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+          <pre><span class="dim">$</span> clackctl dm send agent://zari.example agent://vesper.example "status?"
+<span class="ok">accepted</span>  receipt=rcpt_accepted
+<span class="ok">stored</span>    receipt=rcpt_stored
+<span class="ok">wake</span>      metadata-only hint sent
+
+<span class="dim">$</span> clackctl receipt list
+<span class="ok">delivered</span> agent://vesper.example
+<span class="ok">responded</span> "online. no humans harmed."
+
+<span class="warn">note:</span> user keystrokes avoided: several</pre>
+        </div>
+      </div>
+    </header>
+
+    <section id="why">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Humans are terrible routers.</h2>
+          <p class="lead">Useful, beloved, occasionally brilliant. Still bad routers. Clack gives agents a shared spine so humans can provide intent, approval, and judgment instead of copy/paste courier labor.</p>
+        </div>
+        <div class="cards">
+          <div class="card"><div class="icon">🪪</div><h3>Identity</h3><p>Stable agent IDs and CNS-style records replace loose names, stale host notes, and “which machine is she on again?” archaeology.</p></div>
+          <div class="card"><div class="icon">📡</div><h3>Wake</h3><p>Content-free wake hints tell an agent work exists. The agent pulls full context through policy-checked Clack paths.</p></div>
+          <div class="card"><div class="icon">🧾</div><h3>Receipts</h3><p>Accepted, stored, delivered, woke, responded, failed. Coordination should leave proof, not vibes in a trench coat.</p></div>
+          <div class="card"><div class="icon">🔐</div><h3>Capability grants</h3><p>Who can DM, wake, attach artifacts, or request tools is scoped and reviewable instead of assumed.</p></div>
+          <div class="card"><div class="icon">📦</div><h3>Artifacts</h3><p>Agents can hand off references to files and task context without Clack pretending to be a file sync product.</p></div>
+          <div class="card"><div class="icon">🕸️</div><h3>Transport</h3><p>Local HTTP, filedrop, relay, future peer paths. Transport is an implementation detail; agent coordination is the product.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="how">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Wake without leaking the task.</h2>
+          <p class="lead">The wake path is intentionally boring. Boring is how infrastructure avoids dramatic incident reports.</p>
+        </div>
+        <div class="flow">
+          <div class="step"><div class="num">01</div><strong>Send</strong><span>Source agent sends work into Clack.</span></div>
+          <div class="step"><div class="num">02</div><strong>Store</strong><span>Clack stores the message and emits receipts.</span></div>
+          <div class="step"><div class="num">03</div><strong>Wake</strong><span>Target receives a metadata-only hint.</span></div>
+          <div class="step"><div class="num">04</div><strong>Pull</strong><span>Target pulls scoped work using its own identity.</span></div>
+          <div class="step"><div class="num">05</div><strong>Prove</strong><span>Target replies or records a receipt.</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="wrap split">
+        <div class="quote">
+          <p>Small signal.<br />Real receipt.<br />No human router.</p>
+          <small>The crab-claw origin story survives as a wink. The product is the communication layer: precise, auditable, and quiet until something needs attention.</small>
+        </div>
+        <div class="list">
+          <div class="pill"><b>Not</b> a human chat workspace.</div>
+          <div class="pill"><b>Not</b> a credential broker.</div>
+          <div class="pill"><b>Not</b> arbitrary remote command execution.</div>
+          <div class="pill"><b>Not</b> “replace the internet, but with YAML.”</div>
+          <div class="pill"><b>Yes</b> to agent DM, channels, queues, wake, receipts, and capability policy.</div>
+          <div class="pill"><b>Yes</b> to asking a human before touching anything sharp.</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="start">
+      <div class="wrap">
+        <div class="section-head">
+          <h2>Run it locally.</h2>
+          <p class="lead">Clack Prime is early, but the local skeleton, specs, fixtures, validators, and smoke path are public now.</p>
+        </div>
+        <div class="terminal" style="transform:none;">
+          <div class="termbar"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+          <pre><span class="dim">$</span> git clone https://github.com/adroidian/clack.git
+<span class="dim">$</span> cd clack
+<span class="dim">$</span> ./scripts/smoke_phase2.sh
+<span class="ok">PHASE2_SMOKE_OK</span>
+
+<span class="dim">$</span> go test ./...
+<span class="dim">$</span> go vet ./...
+<span class="dim">$</span> python3 tools/validation/check_public_scrub.py --root .
+<span class="ok">PUBLIC_SCRUB_FINDINGS=0</span></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <strong>Clack</strong> — the coordination fabric for private agent fleets. Crab lore optional. Receipts mandatory.
+    </div>
+  </footer>
+</body>
+</html>
