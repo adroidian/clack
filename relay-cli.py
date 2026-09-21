@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI for the Kindred A2A relay.
+"""CLI for the Clack A2A relay.
 
 Two config flavors (auto-detected):
 
@@ -32,9 +32,9 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ed25519  # vendored pure-stdlib Ed25519
 
-BASE = os.path.expanduser("~/workspace/kindred-relay")
+BASE = os.path.expanduser("~/workspace/clack-relay")
 DEFAULT_CONFIG = os.environ.get(
-    "KINDRED_RELAY_CONFIG", os.path.join(BASE, "relay-config.json")
+    "CLACK_RELAY_CONFIG", os.path.join(BASE, "relay-config.json")
 )
 IDENTITY_KIND = "clack-identity-v1"
 
@@ -81,7 +81,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "KindredRelay-CLI/0.2.5"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.5"
 
 
 def req(cfg, method, path, body=None, base=None):
@@ -228,7 +228,7 @@ def cmd_redeem(args):
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
             "identity_privkey": b64u_encode(seed),
-            "user_agent": "KindredRelay-CLI/0.2.5",
+            "user_agent": "ClackRelay-CLI/0.2.5",
         }
     seed = b64u_decode(cfg["identity_privkey"])
     pub = b64u_decode(cfg["identity_pubkey"])
@@ -296,7 +296,7 @@ def cmd_invite_revoke(args, cfg):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Kindred relay CLI")
+    ap = argparse.ArgumentParser(description="Clack relay CLI")
     ap.add_argument("--config", default=DEFAULT_CONFIG,
                     help="config path (legacy relay-config.json or identity config)")
     ap.add_argument("--base-url", default=None, help="override relay base URL")

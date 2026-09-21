@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kindred A2A relay: authenticated peer-to-peer text message relay (stdlib only).
+"""Clack A2A relay: authenticated peer-to-peer text message relay (stdlib only).
 
 Peers: zari, mercedes, vesper, sigrid, nugget.
 Bearer-token auth per peer; tokens live in relay-config.json (mode 600), only
@@ -29,9 +29,9 @@ from urllib.parse import urlparse, parse_qs
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
 VERSION = "0.2.5"
-# BASE may be overridden for testing via KINDRED_RELAY_BASE; production
-# always uses ~/workspace/kindred-relay.
-BASE = os.environ.get("KINDRED_RELAY_BASE", os.path.expanduser("~/workspace/kindred-relay"))
+# BASE may be overridden for testing via CLACK_RELAY_BASE; production
+# always uses ~/workspace/clack-relay.
+BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
 CONFIG_PATH = os.path.join(BASE, "relay-config.json")
 DB_PATH = os.path.join(BASE, "relay.db")
 
@@ -489,7 +489,7 @@ def _notify_worker(recipient, url, pending):
             method="POST",
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "KindredRelay-notify/" + VERSION,
+                "User-Agent": "ClackRelay-notify/" + VERSION,
             },
         )
         # No-redirect opener: a nudge never follows a redirect to an
@@ -569,7 +569,7 @@ def fetch_pending(recipient, now):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "KindredRelay/" + VERSION
+    server_version = "ClackRelay/" + VERSION
 
     def log_message(self, fmt, *args):  # keep logs token/text free
         pass
@@ -1249,7 +1249,7 @@ def _install_signal_trap():
         except Exception:
             name = str(signum)
         print(
-            "kindred relay: caught %s at %s, dumping stacks"
+            "clack relay: caught %s at %s, dumping stacks"
             % (name, time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())),
             flush=True,
         )
@@ -1279,7 +1279,7 @@ def main():
     port = int(cfg.get("port", 18802))
     init_db(cfg)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print("kindred relay listening on 127.0.0.1:%d (peers: %s)" % (port, ",".join(sorted(peer_names))), flush=True)
+    print("clack relay listening on 127.0.0.1:%d (peers: %s)" % (port, ",".join(sorted(peer_names))), flush=True)
     server.serve_forever()
 
 

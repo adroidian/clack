@@ -1,4 +1,4 @@
-# Kindred A2A Relay — Client Contract (v0.2.5)
+# Clack Relay — Client Contract (v0.2.5)
 
 A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 `mercedes`, `vesper`, `sigrid`, `nugget`. Text messages with correlated

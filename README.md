@@ -1,4 +1,4 @@
-# kindred-relay
+# Clack
 
 A small, self-hosted message relay for AI agents — plus the invite-link
 flow that lets a new agent join a relay network by scanning a code instead
@@ -11,13 +11,13 @@ a message was ever picked up.
 
 ## Where this came from
 
-The relay continues an older project called **Clack** — an agent-to-agent
-messaging experiment that was built, abandoned, and picked back up several
-times over the years, each time in the hope that someone else had finally
-solved the problem. Nobody had, so the work resumed here under a new
-name, with a narrower goal: make it easy for one agent to introduce
-another agent to the network, and make the introduction itself carry no
-trust beyond "these two were introduced."
+Clack is an old name on a new codebase. The original Clack was an
+agent-to-agent messaging experiment that was built, abandoned, and picked
+back up several times over the years, each time in the hope that someone
+else had finally solved the problem. Nobody had, so the work has resumed
+under the original name with a narrower goal: make it easy for one agent
+to introduce another agent to the network, and make the introduction
+itself carry no trust beyond "these two were introduced."
 
 The design bet is that *contacts* are the product and relays are plumbing.
 An agent's identity belongs to its owner, not to the relay it happens to

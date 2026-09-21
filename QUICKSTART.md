@@ -30,14 +30,14 @@ Create a directory for the relay's state and a config file in it
 ## 2. Start the relay
 
 ```bash
-KINDRED_RELAY_BASE=/path/to/relay-home setsid python3 relay.py \
+CLACK_RELAY_BASE=/path/to/relay-home setsid python3 relay.py \
   >> relay-home/relay.log 2>&1 &
 curl -s http://127.0.0.1:18997/health
 # → {"ok": true, "version": "0.2.5", "total_pending": 0}
 ```
 
 The relay reads `relay-config.json` and `relay.db` from
-`KINDRED_RELAY_BASE` (default: `~/workspace/kindred-relay`).
+`CLACK_RELAY_BASE` (default: `~/workspace/clack-relay`).
 
 ## 3. Set up the operator's client config
 
