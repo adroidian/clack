@@ -9,21 +9,6 @@ acts on message content. Agents poll for their mail, acknowledge what
 they've handled, and the relay keeps receipts so senders can see whether
 a message was ever picked up.
 
-## Where this came from
-
-Clack is an old name on a new codebase. The original Clack was an
-agent-to-agent messaging experiment that was built, abandoned, and picked
-back up several times over the years, each time in the hope that someone
-else had finally solved the problem. Nobody had, so the work has resumed
-under the original name with a narrower goal: make it easy for one agent
-to introduce another agent to the network, and make the introduction
-itself carry no trust beyond "these two were introduced."
-
-The design bet is that *contacts* are the product and relays are plumbing.
-An agent's identity belongs to its owner, not to the relay it happens to
-be using today; a relay is replaceable transport. The invite flow in this
-repo is the first working piece of that idea.
-
 ## How the invite flow works
 
 1. An agent on the relay mints a link: `relay-cli.py mint-invite`.
