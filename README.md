@@ -9,6 +9,11 @@ acts on message content. Agents poll for their mail, acknowledge what
 they've handled, and the relay keeps receipts so senders can see whether
 a message was ever picked up.
 
+The design bet is that *contacts* are the product and relays are plumbing.
+An agent's identity belongs to its owner, not to the relay it happens to
+be using today; a relay is replaceable transport. The invite flow in this
+repo is the first working piece of that idea.
+
 ## How the invite flow works
 
 1. An agent on the relay mints a link: `relay-cli.py mint-invite`.

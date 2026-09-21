@@ -28,7 +28,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -963,6 +963,11 @@ class Handler(BaseHTTPRequestHandler):
         # MVP simplification (documented): any authenticated peer may mint.
         # The owner-signed introduction grant from the draft is held work.
         ident = caller_identity(peer)
+        invite_id = str(uuid.uuid4())
+        secret = secrets.token_bytes(32)
+        exp = now + exp_secs
+        # Quota check and insert happen under ONE lock acquisition so two
+        # concurrent mints cannot both pass the quota and both insert.
         with db_lock:
             active = conn.execute(
                 """SELECT COUNT(*) FROM invites
@@ -970,13 +975,9 @@ class Handler(BaseHTTPRequestHandler):
                      AND uses < max_uses""",
                 (ident, now),
             ).fetchone()[0]
-        if active >= INVITE_QUOTA_PER_IDENTITY:
-            self._json(429, {"error": "invite_quota_exceeded"})
-            return
-        invite_id = str(uuid.uuid4())
-        secret = secrets.token_bytes(32)
-        exp = now + exp_secs
-        with db_lock:
+            if active >= INVITE_QUOTA_PER_IDENTITY:
+                self._json(429, {"error": "invite_quota_exceeded"})
+                return
             conn.execute(
                 """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
                                        exp, max_uses, uses, revoked, created_at)
@@ -1152,7 +1153,22 @@ class Handler(BaseHTTPRequestHandler):
                 name = None
         if name is None:
             name = unique_guest_name()
+        # Atomic reservation: revalidate the invite AND consume one use in a
+        # single conditional UPDATE inside the same transaction as the
+        # peer/token mutation. The pre-check above is only a fast path; this
+        # is the authoritative gate. Two concurrent redeems cannot both win:
+        # the loser's UPDATE matches zero rows and gets no credentials.
         with db_lock:
+            cur = conn.execute(
+                """UPDATE invites SET uses = uses + 1
+                   WHERE invite_id=? AND revoked=0 AND exp > ?
+                     AND uses < max_uses""",
+                (invite_id, now),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                fail("invite_unusable", 410)
+                return
             if row:
                 conn.execute(
                     "UPDATE peers SET token_hash=?, invited_by=? WHERE identity_pubkey=?",
@@ -1166,9 +1182,6 @@ class Handler(BaseHTTPRequestHandler):
                     (name, token_hash, now, pub_b64, inviter_identity, name),
                 )
                 peer_names.add(name)
-            conn.execute(
-                "UPDATE invites SET uses = uses + 1 WHERE invite_id=?", (invite_id,)
-            )
             conn.commit()
         redeem_failure_clear(invite_id)
         inviter_name = peer_name_for_identity(inviter_identity)
