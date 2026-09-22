@@ -16,6 +16,13 @@ Invite-link onboarding (v0.2.5 MVP):
                              sign -> redeem -> save config -> send hello
   invite-list / invite-revoke  manage your outstanding invites
 
+Agent self-enrollment (v0.2.9):
+  enroll                     no link needed: confirm -> keygen -> challenge ->
+                             (solve PoW) -> sign -> enroll -> save config.
+                             Uses the relay's enabled enrollment gate
+                             (invite/pow/open); --invite-id/--secret select
+                             the invite gate explicitly.
+
 Never print a token or private key.
 """
 import argparse
@@ -259,7 +266,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.8"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.9"
 
 
 def req(cfg, method, path, body=None, base=None):
@@ -406,7 +413,7 @@ def cmd_redeem(args):
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
             "identity_privkey": b64u_encode(seed),
-            "user_agent": "ClackRelay-CLI/0.2.8",
+            "user_agent": "ClackRelay-CLI/0.2.9",
         }
     seed = b64u_decode(cfg["identity_privkey"])
     pub = b64u_decode(cfg["identity_pubkey"])
@@ -456,6 +463,178 @@ def cmd_redeem(args):
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
     else:
         print("note: inviter has no messageable peer name; skipping hello")
+    print("config saved: %s" % args.config)
+    return 0
+
+
+def _pow_lead_zero(digest):
+    """Count leading zero bits of a SHA-256 digest (PoW check)."""
+    n = 0
+    for byte in digest:
+        if byte == 0:
+            n += 8
+        else:
+            n += 8 - byte.bit_length()
+            break
+    return n
+
+
+def cmd_enroll(args):
+    # Resolve the relay URL: explicit --relay wins; otherwise reuse the
+    # existing identity config's relay_url (same machine, new enrollment).
+    relay_url = args.relay
+    if not relay_url and os.path.exists(args.config):
+        try:
+            cfg0 = load_config(args.config)
+            if is_identity_cfg(cfg0):
+                relay_url = cfg0.get("relay_url")
+        except Exception:
+            pass
+    if not relay_url:
+        print("no relay URL: pass --relay <url> "
+              "(or keep a relay_url in %s)" % args.config, file=sys.stderr)
+        return 1
+    relay_url = relay_url.rstrip("/")
+    invite_id = args.invite_id
+    if invite_id and not args.secret:
+        print("--invite-id needs --secret", file=sys.stderr)
+        return 1
+
+    # Fetch the relay's identity key BEFORE enrolling (TOFU: the human sees
+    # the fingerprint at the confirmation tap), mirroring redeem.
+    import hashlib as _hashlib
+    nonce = os.urandom(32).hex()
+    relay_fp = None
+    try:
+        with urllib.request.urlopen(
+            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
+        ) as resp:
+            ident = json.loads(resp.read().decode("utf-8"))
+        relay_fp = "sha256:" + _hashlib.sha256(
+            base64.b64decode(ident["signature"])
+        ).hexdigest()[:16]
+    except urllib.error.HTTPError as e:
+        if e.code != 503:
+            print("could not verify relay identity: HTTP Error %d" % e.code,
+                  file=sys.stderr)
+            return 1
+    except Exception as e:
+        print("could not reach relay identity endpoint: %s" % e, file=sys.stderr)
+        return 1
+
+    print("You are about to enroll a new agent identity on a relay:")
+    print("  relay:            %s" % relay_url)
+    if relay_fp:
+        print("  relay key (TOFU): %s  <- shown for first-use confirmation" % relay_fp)
+    else:
+        print("  relay key (TOFU): UNAVAILABLE (relay has no identity key) --")
+        print("                    continuing without relay authentication")
+    if invite_id:
+        print("  invite gate:      %s" % invite_id)
+    if args.name:
+        print("  desired name:     %s" % args.name)
+    print()
+    print("This creates YOUR OWN identity keypair on this machine. The relay")
+    print("never sees your private key.")
+    ans = None
+    if args.yes:
+        pass  # non-interactive agent use: the caller already decided
+    elif not sys.stdin.isatty():
+        print("not a terminal: re-run with --yes to enroll non-interactively",
+              file=sys.stderr)
+        return 1
+    else:
+        ans = input("Type YES to enroll: ").strip()
+    if ans is not None and ans != "YES":
+        print("aborted.")
+        return 1
+
+    # Load or create the identity at --config (existing config = existing
+    # user path: the same identity is reused, never duplicated).
+    if os.path.exists(args.config):
+        cfg = load_config(args.config)
+        if not is_identity_cfg(cfg):
+            print("%s exists but is not an identity config" % args.config,
+                  file=sys.stderr)
+            return 1
+        if cfg.get("relay_url", "").rstrip("/") != relay_url:
+            print("warning: config targets %s, enrolling on %s"
+                  % (cfg.get("relay_url"), relay_url), file=sys.stderr)
+    else:
+        seed, pub = keygen()
+        cfg = {
+            "kind": IDENTITY_KIND,
+            "relay_url": relay_url,
+            "identity_pubkey": b64u_encode(pub),
+            "identity_privkey": b64u_encode(seed),
+            "user_agent": "ClackRelay-CLI/0.2.9",
+        }
+    seed = b64u_decode(cfg["identity_privkey"])
+    pub = b64u_decode(cfg["identity_pubkey"])
+
+    # Challenge -> (solve PoW when the gate is pow) -> sign -> enroll.
+    ch_body = {"invite_id": invite_id} if invite_id else {}
+    code, ch = req(cfg, "POST", "/v1/enroll/challenge", ch_body, base=relay_url)
+    if not (200 <= code < 300):
+        print("challenge failed: %s" % json.dumps(ch), file=sys.stderr)
+        return 1
+    gate = ch.get("gate")
+    chal_raw = b64u_decode(ch["challenge"] if gate == "pow" else ch["nonce"])
+    body = {"identity_pubkey": b64u_encode(pub)}
+    if args.name:
+        body["name"] = args.name
+    if gate == "pow":
+        difficulty = int(ch.get("difficulty", 20))
+        pow_nonce = None
+        while pow_nonce is None:
+            cand = os.urandom(16)
+            if _pow_lead_zero(hashlib.sha256(chal_raw + cand).digest()) >= difficulty:
+                pow_nonce = cand
+        body["pow_nonce"] = b64u_encode(pow_nonce)
+        sig = sign(seed, chal_raw + pow_nonce + pub)
+    elif gate == "invite":
+        body["invite_id"] = invite_id
+        body["secret"] = args.secret
+        sig = sign(seed, chal_raw + invite_id.encode("utf-8") + pub)
+    elif gate == "open":
+        sig = sign(seed, chal_raw + pub)
+    else:
+        print("unknown enrollment gate: %r" % gate, file=sys.stderr)
+        return 1
+    body["proof"] = {"nonce": b64u_encode(chal_raw),
+                     "signature": b64u_encode(sig)}
+    code, out = req(cfg, "POST", "/v1/enroll", body, base=relay_url)
+    if not (200 <= code < 300):
+        print("enroll failed: %s" % json.dumps(out), file=sys.stderr)
+        return 1
+
+    # Same config-save path as redeem: same file, same mode 600.
+    cfg["relay_url"] = relay_url
+    cfg["service_token"] = out["service_token"]
+    cfg["peer_name"] = out["peer_name"]
+    cfg["display_name"] = out["display_name"]
+    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    print("enrolled as %s (identity %s..., via %s gate)"
+          % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
+
+    # Greeting exchange, mirroring redeem: hello to the inviter when the
+    # invite gate names one.
+    inviter = out.get("inviter_name")
+    if inviter:
+        hello_id = str(uuid.uuid4())
+        code, sent = req(cfg, "POST", "/v1/send", {
+            "id": hello_id,
+            "to": inviter,
+            "topic": "introductions",
+            "text": "hello %s -- self-enrolled on the relay (Clack agent onboarding)" % inviter,
+        }, base=relay_url)
+        if 200 <= code < 300:
+            print("hello sent to %s (id %s)" % (inviter, hello_id))
+        else:
+            print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
     print("config saved: %s" % args.config)
     return 0
 
@@ -520,6 +699,15 @@ def main():
     rd = sub.add_parser("redeem", help="redeem an invite link (full join flow)")
     rd.add_argument("link", help="the invite link (or its #fragment payload)")
 
+    e = sub.add_parser("enroll", help="self-enroll a new agent identity (v0.2.9)")
+    e.add_argument("--name", default=None, help="desired peer name (optional)")
+    e.add_argument("--invite-id", default=None, help="invite id (invite gate)")
+    e.add_argument("--secret", default=None, help="invite claim secret (invite gate)")
+    e.add_argument("--relay", default=None,
+                   help="relay base URL, e.g. http://127.0.0.1:18998")
+    e.add_argument("--yes", action="store_true",
+                   help="skip the confirmation prompt (non-interactive/agent use)")
+
     sub.add_parser("invite-list", help="list your outstanding invites")
     rv = sub.add_parser("invite-revoke", help="revoke one of your invites")
     rv.add_argument("invite_id")
@@ -528,11 +716,13 @@ def main():
     global _selected_peer
     _selected_peer = args.peer
 
-    if args.cmd in ("keygen", "redeem"):
+    if args.cmd in ("keygen", "redeem", "enroll"):
         # These manage the identity config file itself; no prior config needed.
         if args.cmd == "keygen":
             return cmd_keygen(args)
-        return cmd_redeem(args)
+        if args.cmd == "redeem":
+            return cmd_redeem(args)
+        return cmd_enroll(args)
 
     cfg = load_config(args.config)
     token = auth_token(cfg)

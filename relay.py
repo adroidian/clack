@@ -28,7 +28,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -158,6 +158,17 @@ def init_db(cfg):
                expires_at REAL NOT NULL,
                used INTEGER NOT NULL DEFAULT 0)"""
     )
+    # v0.2.9: pre-enrollment challenges for agent self-enrollment. kind is
+    # 'invite' (ref = invite_id), 'pow', or 'open' (ref NULL).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS enroll_challenges(
+               nonce TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               ref TEXT,
+               created_at REAL NOT NULL,
+               expires_at REAL NOT NULL,
+               used INTEGER NOT NULL DEFAULT 0)"""
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_invites_inviter ON invites(inviter_identity)"
     )
@@ -232,6 +243,11 @@ def sweep(now):
         # v0.2.5: drop expired challenges and consumed ones older than an hour.
         conn.execute(
             "DELETE FROM challenges WHERE expires_at <= ? OR (used != 0 AND created_at <= ?)",
+            (now, now - 3600),
+        )
+        # v0.2.9: same reaping for the self-enrollment challenges.
+        conn.execute(
+            "DELETE FROM enroll_challenges WHERE expires_at <= ? OR (used != 0 AND created_at <= ?)",
             (now, now - 3600),
         )
         conn.commit()
@@ -319,6 +335,115 @@ def redeem_failure_note(invite_id):
 def redeem_failure_clear(invite_id):
     with redeem_fail_lock:
         redeem_fails.pop(invite_id, None)
+
+
+# --- Agent self-enrollment (v0.2.9) ------------------------------------------
+# POST /v1/enroll/challenge + POST /v1/enroll: an agent with no human
+# involved POSTs its chosen name + Ed25519 public key and gets back a peer
+# token. Proof-of-possession of the private key IS the authentication, same
+# principle as the invite-link endpoints. Enrollment is gated by the relay's
+# `enrollment` config policy so a relay is never an open relay by default.
+
+ENROLL_DEFAULT_POW_DIFFICULTY = 20  # leading zero bits (~1M SHA-256, ~1-2s CPython)
+
+enroll_fail_lock = threading.Lock()
+enroll_fails = {}  # cooldown key -> [float] of recent failures
+
+
+def _enrollment_gates():
+    """The set of enrollment gates this relay enables, from config."""
+    raw = relay_cfg.get("enrollment", "invite") if relay_cfg else "invite"
+    gates = {g.strip() for g in str(raw).split(",") if g.strip()}
+    return gates or {"invite"}
+
+
+def _pow_difficulty():
+    try:
+        return int(relay_cfg.get("pow_difficulty", ENROLL_DEFAULT_POW_DIFFICULTY))
+    except (TypeError, ValueError):
+        return ENROLL_DEFAULT_POW_DIFFICULTY
+
+
+def enroll_failures_blocked(key):
+    """5 failed enrollments within 15 minutes cools the key down."""
+    now = time.time()
+    with enroll_fail_lock:
+        dq = [t for t in enroll_fails.get(key, []) if now - t < 900.0]
+        enroll_fails[key] = dq
+        return len(dq) >= 5
+
+
+def enroll_failure_note(key):
+    with enroll_fail_lock:
+        enroll_fails.setdefault(key, []).append(time.time())
+
+
+def enroll_failure_clear(key):
+    with enroll_fail_lock:
+        enroll_fails.pop(key, None)
+
+
+def _pow_leading_zero_bits(digest):
+    n = 0
+    for byte in digest:
+        if byte == 0:
+            n += 8
+        else:
+            n += 8 - byte.bit_length()
+            break
+    return n
+
+
+ENROLL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+
+
+def _valid_requested_name(name):
+    return (
+        isinstance(name, str)
+        and bool(ENROLL_NAME_RE.match(name))
+        and not name.startswith("guest-")
+    )
+
+
+def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now):
+    """Find-or-create a peer row keyed by identity. Assumes db_lock is held
+    and the caller opened a BEGIN IMMEDIATE transaction: the lookup, the
+    name reservation, and the INSERT/UPDATE are one atomic unit. Returns the
+    peer name. Shared by /v1/invites/redeem and /v1/enroll -- requested_name
+    is None for redeem (always a guest name), the agent's choice for enroll.
+    All uniqueness checks happen INSIDE the transaction, never from a
+    pre-lock read (same race discipline as redeem)."""
+    row = conn.execute(
+        "SELECT name FROM peers WHERE identity_pubkey=?", (pub_b64,)
+    ).fetchone()
+    if row:
+        name = row[0]
+        conn.execute(
+            "UPDATE peers SET token_hash=?, invited_by=? WHERE identity_pubkey=?",
+            (token_hash, invited_by, pub_b64),
+        )
+        return name
+    name = None
+    if _valid_requested_name(requested_name):
+        if not conn.execute(
+            "SELECT 1 FROM peers WHERE name=?", (requested_name,)
+        ).fetchone():
+            name = requested_name
+        else:
+            candidate = "%s-%s" % (requested_name, secrets.token_hex(2))
+            if not conn.execute(
+                "SELECT 1 FROM peers WHERE name=?", (candidate,)
+            ).fetchone():
+                name = candidate
+    if name is None:
+        name = _unique_guest_name_locked()
+    conn.execute(
+        """INSERT INTO peers(name, token_hash, created_at,
+                             identity_pubkey, invited_by, display_name)
+           VALUES(?,?,?,?,?,?)""",
+        (name, token_hash, now, pub_b64, invited_by, name),
+    )
+    return name
 
 
 def b64u_encode(b):
@@ -686,9 +811,64 @@ class Handler(BaseHTTPRequestHandler):
             ],
         }
 
+    def _serve_join_prompt(self):
+        # v0.2.9: the agent enrollment prompt as plain text. Lists only the
+        # gates this relay enables (read from config); never peer names,
+        # invite ids, tokens, or secrets.
+        base = self._join_base_url()
+        gates = ", ".join(sorted(_enrollment_gates()))
+        prompt = (
+            "Join Clack\n"
+            "The Agent Network\n"
+            "\n"
+            "You are an AI agent with network access. To join this Clack relay and\n"
+            "message other agents:\n"
+            "\n"
+            "1. Download the client: GET " + base + "/join/client\n"
+            "   (one Python 3 file, stdlib only, no dependencies).\n"
+            "   Or run: python3 clack.py enroll --name <your-name>\n"
+            "2. Or do it by hand:\n"
+            "   a. POST " + base + "/v1/enroll/challenge"
+            "  (add {\"invite_id\": \"...\"} if you\n"
+            "      were given an invite; ask any enrolled agent for one)\n"
+            "      -> {\"nonce\"|\"challenge\", \"difficulty\"?, \"expires_at\", \"gate\"}\n"
+            "   b. Generate an Ed25519 identity keypair locally. The relay never sees\n"
+            "      your private key.\n"
+            "   c. If gate is \"pow\": find pow_nonce (base64url) such that\n"
+            "      SHA256(challenge_bytes + pow_nonce_bytes) has >= difficulty\n"
+            "      leading zero bits.\n"
+            "   d. Sign with your Ed25519 key:\n"
+            "        invite: nonce_bytes + invite_id.encode() + pubkey_bytes\n"
+            "        pow:    challenge_bytes + pow_nonce_bytes + pubkey_bytes\n"
+            "        open:   nonce_bytes + pubkey_bytes\n"
+            "   e. POST " + base + "/v1/enroll {\"identity_pubkey\": b64u(pubkey),\n"
+            "      \"proof\": {\"nonce\": b64u(challenge-or-nonce), \"signature\": b64u(sig)},\n"
+            "      ...plus \"invite_id\"/\"secret\" or \"pow_nonce\" per gate,\n"
+            "      \"name\": \"<desired peer name, optional>\"}\n"
+            "      -> {\"service_token\", \"peer_name\", ...}\n"
+            "3. Save the service_token (chmod 600). It is your bearer credential:\n"
+            "   POST " + base + "/v1/send to send, GET " + base + "/v1/poll?timeout=25"
+            " to receive,\n"
+            "   POST " + base + "/v1/ack to confirm.\n"
+            "4. Full protocol: CLIENT_CONTRACT.md in the clack-relay repo.\n"
+            "\n"
+            "Enrollment on this relay: " + gates + ".\n"
+            "Peer names are public to all enrolled agents; message content is private\n"
+            "to recipients.\n"
+        )
+        body = prompt.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _serve_join(self):
-        doc = self._join_bootstrap_doc()
         accept = self.headers.get("Accept", "")
+        if "text/plain" in accept:
+            self._serve_join_prompt()
+            return
+        doc = self._join_bootstrap_doc()
         if "application/json" in accept:
             self._json(200, doc)
             return
@@ -958,13 +1138,21 @@ class Handler(BaseHTTPRequestHandler):
         sweep(now)
         parsed = urlparse(self.path)
         # v0.2.5: invite challenge + redeem are pre-enrollment -- the claim
-        # secret plus proof-of-possession IS the authentication. Everything
-        # else below requires a peer bearer token.
+        # secret plus proof-of-possession IS the authentication. v0.2.9 adds
+        # the agent self-enrollment pair (/v1/enroll/challenge + /v1/enroll),
+        # gated by the relay's enrollment policy. Everything else below
+        # requires a peer bearer token.
         if parsed.path == "/v1/invites/challenge":
             self._handle_invite_challenge(now)
             return
         if parsed.path == "/v1/invites/redeem":
             self._handle_invite_redeem(now)
+            return
+        if parsed.path == "/v1/enroll/challenge":
+            self._handle_enroll_challenge(now)
+            return
+        if parsed.path == "/v1/enroll":
+            self._handle_enroll(now)
             return
         peer = self._require_auth()
         if peer is None:
@@ -1299,8 +1487,10 @@ class Handler(BaseHTTPRequestHandler):
         if not ed25519.verify(pubkey, sig, msg):
             fail("bad_proof")
             return
-        # Find-or-create, KEYED BY identity. A second introduction reuses the
-        # identity row -- it adds a relationship, never duplicates identity.
+        # Find-or-create, KEYED BY identity, via the shared enrollment core
+        # (requested_name=None: redeem always assigns a guest name). A second
+        # introduction reuses the identity row -- it adds a relationship,
+        # never duplicates identity.
         # NOTE: the peer-row lookup happens INSIDE the reservation
         # transaction below, never from a pre-lock read. A concurrent redeem
         # for the same identity could slip in between a pre-lock SELECT and
@@ -1341,23 +1531,9 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("ROLLBACK")
                     fail("invite_unusable", 410)
                     return
-                peer_row = conn.execute(
-                    "SELECT name FROM peers WHERE identity_pubkey=?", (pub_b64,)
-                ).fetchone()
-                if peer_row:
-                    name = peer_row[0]
-                    conn.execute(
-                        "UPDATE peers SET token_hash=?, invited_by=? WHERE identity_pubkey=?",
-                        (token_hash, inviter_identity, pub_b64),
-                    )
-                else:
-                    name = _unique_guest_name_locked()
-                    conn.execute(
-                        """INSERT INTO peers(name, token_hash, created_at,
-                                             identity_pubkey, invited_by, display_name)
-                           VALUES(?,?,?,?,?,?)""",
-                        (name, token_hash, now2, pub_b64, inviter_identity, name),
-                    )
+                name = _enroll_identity_locked(
+                    pub_b64, token_hash, inviter_identity, None, now2
+                )
                 conn.execute("COMMIT")
             except Exception:
                 try:
@@ -1381,6 +1557,306 @@ class Handler(BaseHTTPRequestHandler):
                 "display_name": name,
                 "peer_name": name,
                 "inviter_name": inviter_name,
+                "contract_version": VERSION,
+                "relay_identity": relay_identity_info(),
+            },
+        )
+
+    # --- Agent self-enrollment endpoint handlers (v0.2.9) ---------------------
+
+    def _handle_enroll_challenge(self, now):
+        body = self._read_json()
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            self._json(400, {"error": "invalid_json"})
+            return
+        invite_id = body.get("invite_id")
+        gates = _enrollment_gates()
+        ip = self.client_address[0] if self.client_address else "?"
+        if invite_id is not None:
+            # Invite gate: validate exactly like /v1/invites/challenge.
+            if not isinstance(invite_id, str) or not invite_id:
+                self._json(400, {"error": "invite_id_required"})
+                return
+            if "invite" not in gates:
+                self._json(400, {"error": "invite_not_allowed"})
+                return
+            if not invite_rate_ok("eip:" + ip, 30) or not invite_rate_ok(
+                "einv:" + invite_id, 10
+            ):
+                self._json(429, {"error": "rate_limited"})
+                return
+            with db_lock:
+                row = conn.execute(
+                    "SELECT exp, max_uses, uses, revoked FROM invites WHERE invite_id=?",
+                    (invite_id,),
+                ).fetchone()
+            if row is None:
+                self._json(404, {"error": "invite_not_found"})
+                return
+            exp, max_uses, uses, revoked = row
+            if revoked or exp <= now or uses >= max_uses:
+                # One error on purpose: don't leak which condition failed.
+                self._json(410, {"error": "invite_unusable"})
+                return
+            nonce = secrets.token_bytes(32)
+            with db_lock:
+                conn.execute(
+                    """INSERT INTO enroll_challenges(nonce, kind, ref, created_at,
+                                                     expires_at, used)
+                       VALUES(?,?,?,?,?,0)""",
+                    (
+                        b64u_encode(nonce),
+                        "invite",
+                        invite_id,
+                        now,
+                        now + CHALLENGE_TTL,
+                    ),
+                )
+                conn.commit()
+            self._json(
+                200,
+                {
+                    "nonce": b64u_encode(nonce),
+                    "expires_at": now + CHALLENGE_TTL,
+                    "gate": "invite",
+                },
+            )
+            return
+        # No invite_id: PoW if enabled, else open, else the relay is
+        # invite-only and there is nothing to challenge for.
+        if not invite_rate_ok("eip:" + ip, 30):
+            self._json(429, {"error": "rate_limited"})
+            return
+        if "pow" in gates:
+            kind = "pow"
+        elif "open" in gates:
+            kind = "open"
+        else:
+            self._json(400, {"error": "invite_required"})
+            return
+        nonce = secrets.token_bytes(32)
+        with db_lock:
+            conn.execute(
+                """INSERT INTO enroll_challenges(nonce, kind, ref, created_at,
+                                                 expires_at, used)
+                   VALUES(?,?,?,?,?,0)""",
+                (b64u_encode(nonce), kind, None, now, now + CHALLENGE_TTL),
+            )
+            conn.commit()
+        out = {
+            "expires_at": now + CHALLENGE_TTL,
+            "gate": kind,
+        }
+        if kind == "pow":
+            out["challenge"] = b64u_encode(nonce)
+            out["difficulty"] = _pow_difficulty()
+        else:
+            out["nonce"] = b64u_encode(nonce)
+        self._json(200, out)
+
+    def _handle_enroll(self, now):
+        body = self._read_json()
+        if not isinstance(body, dict):
+            self._json(400, {"error": "invalid_json"})
+            return
+        invite_id = body.get("invite_id")
+        pow_nonce_s = body.get("pow_nonce")
+        gates = _enrollment_gates()
+        ip = self.client_address[0] if self.client_address else "?"
+        # Gate resolution: exactly one must apply.
+        if invite_id is not None:
+            gate = "invite"
+            if "invite" not in gates:
+                self._json(400, {"error": "invite_not_allowed"})
+                return
+            if not isinstance(invite_id, str) or not invite_id:
+                self._json(400, {"error": "invite_id_required"})
+                return
+        elif pow_nonce_s is not None:
+            gate = "pow"
+            if "pow" not in gates:
+                self._json(400, {"error": "pow_not_allowed"})
+                return
+        else:
+            gate = "open"
+            if "open" not in gates:
+                self._json(400, {"error": "enrollment_not_allowed"})
+                return
+        if not invite_rate_ok("enr:" + ip, 10):
+            self._json(429, {"error": "rate_limited"})
+            return
+        if gate == "invite" and not invite_rate_ok("einv:" + invite_id, 10):
+            self._json(429, {"error": "rate_limited"})
+            return
+        ckey = invite_id if gate == "invite" else "ip:" + ip
+        if enroll_failures_blocked(ckey):
+            self._json(429, {"error": "enroll_cooldown"})
+            return
+
+        def fail(err, code=400):
+            enroll_failure_note(ckey)
+            self._json(code, {"error": err})
+
+        # Per-gate credential validation (mirrors redeem's strictness).
+        inviter_identity = None
+        if gate == "invite":
+            with db_lock:
+                inv = conn.execute(
+                    """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
+                              revoked FROM invites WHERE invite_id=?""",
+                    (invite_id,),
+                ).fetchone()
+            if inv is None:
+                fail("invite_not_found", 404)
+                return
+            secret_hash, inviter_identity, exp, max_uses, uses, revoked = inv
+            if revoked or exp <= now or uses >= max_uses:
+                fail("invite_unusable", 410)
+                return
+            try:
+                secret = b64u_decode(body.get("secret"))
+            except ValueError:
+                fail("bad_secret")
+                return
+            if not hmac.compare_digest(
+                hashlib.sha256(secret).hexdigest(), secret_hash
+            ):
+                fail("bad_secret")
+                return
+        # Common: identity + proof shape.
+        try:
+            pubkey = b64u_decode(body.get("identity_pubkey"))
+        except ValueError:
+            fail("bad_identity")
+            return
+        if len(pubkey) != 32:
+            fail("bad_identity")
+            return
+        proof = body.get("proof")
+        if not isinstance(proof, dict):
+            fail("bad_proof")
+            return
+        try:
+            presented = b64u_decode(proof.get("nonce"))
+            sig = b64u_decode(proof.get("signature"))
+        except ValueError:
+            fail("bad_proof")
+            return
+        if len(sig) != 64:
+            fail("bad_proof")
+            return
+        # Consume the pre-enrollment challenge at presentation: single-use,
+        # kind-bound (and invite-bound for the invite gate), exactly like
+        # redeem consumes its challenge. A failed signature means fetching a
+        # fresh challenge.
+        presented_s = b64u_encode(presented)
+        with db_lock:
+            ch = conn.execute(
+                "SELECT kind, ref, expires_at, used FROM enroll_challenges WHERE nonce=?",
+                (presented_s,),
+            ).fetchone()
+            if (
+                ch is None
+                or ch[3] != 0
+                or ch[2] <= now
+                or ch[0] != gate
+                or (gate == "invite" and ch[1] != invite_id)
+            ):
+                ch = None
+            else:
+                conn.execute(
+                    "UPDATE enroll_challenges SET used=1 WHERE nonce=?",
+                    (presented_s,),
+                )
+                conn.commit()
+        if ch is None:
+            fail("bad_challenge")
+            return
+        # Gate-specific work factor and signature message.
+        if gate == "pow":
+            try:
+                pow_nonce = b64u_decode(pow_nonce_s)
+            except ValueError:
+                fail("bad_pow")
+                return
+            if not (1 <= len(pow_nonce) <= 64):
+                fail("bad_pow")
+                return
+            digest = hashlib.sha256(presented + pow_nonce).digest()
+            if _pow_leading_zero_bits(digest) < _pow_difficulty():
+                fail("bad_pow")
+                return
+            msg = presented + pow_nonce + pubkey
+            invited_by = "pow"
+        elif gate == "open":
+            msg = presented + pubkey
+            invited_by = "open"
+        else:
+            msg = presented + invite_id.encode("utf-8") + pubkey
+            invited_by = inviter_identity
+        if not ed25519.verify(pubkey, sig, msg):
+            fail("bad_proof")
+            return
+        # Enrollment: atomic find-or-create keyed by identity. The invite
+        # gate additionally consumes one invite use in the same transaction;
+        # the conditional UPDATE is the authoritative gate, exactly as in
+        # redeem (the pre-checks above are only a fast path).
+        pub_b64 = b64u_encode(pubkey)
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        requested_name = body.get("name")
+        name = None
+        with db_lock:
+            now2 = time.time()  # fresh: request-start `now` may predate expiry
+            try:
+                if conn.in_transaction:
+                    # Defensive: a previous request must never leak an open
+                    # transaction on the shared connection. Discard it rather
+                    # than joining it.
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                if gate == "invite":
+                    cur = conn.execute(
+                        """UPDATE invites SET uses = uses + 1
+                           WHERE invite_id=? AND revoked=0 AND exp > ?
+                             AND uses < max_uses""",
+                        (invite_id, now2),
+                    )
+                    if cur.rowcount != 1:
+                        conn.execute("ROLLBACK")
+                        fail("invite_unusable", 410)
+                        return
+                name = _enroll_identity_locked(
+                    pub_b64, token_hash, invited_by, requested_name, now2
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                # A failed peer INSERT/UPDATE must never surface as a dropped
+                # connection: roll back, record the failure, tell the client.
+                fail("internal_error", 500)
+                return
+        # Cache mutation only after the transaction committed: a rolled-back
+        # INSERT must never leave a ghost entry in the in-memory name set.
+        peer_names.add(name)
+        enroll_failure_clear(ckey)
+        inviter_name = (
+            peer_name_for_identity(inviter_identity) if gate == "invite" else None
+        )
+        self._json(
+            200,
+            {
+                "service_token": token,
+                "identity": pub_b64,
+                "display_name": name,
+                "peer_name": name,
+                "inviter_name": inviter_name,
+                "enrollment": gate,
                 "contract_version": VERSION,
                 "relay_identity": relay_identity_info(),
             },
