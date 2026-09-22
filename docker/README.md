@@ -52,8 +52,11 @@ reaches the relay at `http://127.0.0.1:18802` with no extra config.
 > whole network. Keep the private bind and use a supported connector
 > path instead — host networking for the connector, or a deliberately
 > scoped shared-container network between the connector and the relay.
-> Verify with `curl http://127.0.0.1:18802/health` **from inside the
-> connector's own namespace** before adding the route.
+> Verify reachability **from inside the connector's own namespace**
+> before adding the route, and make the probe topology-specific: on the
+> host-network path, `curl http://127.0.0.1:18802/health`; on a scoped
+> shared-container network, probe the relay's service DNS name and
+> container port instead (e.g. `curl http://relay:18802/health`).
 >
 > **Existing volumes keep their keys.** If a `/data` volume already holds
 > a config, first boot does not touch it — check the *public* modulus
