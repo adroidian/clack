@@ -290,6 +290,99 @@ def req(cfg, method, path, body=None, base=None):
         return e.code, payload
 
 
+# --- Relay identity (TOFU, v0.2.10) -------------------------------------------
+# The relay exposes its STABLE identity public key at GET /v1/identity. The
+# fingerprint is computed over that key -- never over the per-nonce
+# signature, which varies every run and is unconfirmable theater. The
+# construction is: sha256("clack-relay-identity-v1" || ":" || n_be || ":"
+# || e_be), displayed as "sha256:<first 16 hex chars>", where n_be / e_be
+# are the minimal big-endian encodings of the "n" / "e" hex fields.
+
+_IDENTITY_FP_DOMAIN = b"clack-relay-identity-v1"
+
+
+def relay_identity_fingerprint(pubkey):
+    """Stable fingerprint of a relay identity public key {"n": hex, "e": hex}."""
+    n = int(pubkey["n"], 16)
+    e = int(pubkey["e"], 16)
+    n_be = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    e_be = e.to_bytes((e.bit_length() + 7) // 8, "big")
+    digest = hashlib.sha256(_IDENTITY_FP_DOMAIN + b":" + n_be + b":" + e_be).hexdigest()
+    return "sha256:" + digest[:16]
+
+
+_SHA256_DINFO_HEAD = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def relay_identity_verify(pubkey, nonce_hex, signature_b64):
+    """Verify the relay's /v1/identity nonce signature. Pure stdlib RSA."""
+    n = int(pubkey["n"], 16)
+    e = int(pubkey["e"], 16)
+    nonce = bytes.fromhex(nonce_hex)
+    sig = base64.b64decode(signature_b64)
+    k = (n.bit_length() + 7) // 8
+    if len(sig) != k:
+        return False
+    t = _SHA256_DINFO_HEAD + hashlib.sha256(nonce).digest()
+    em = pow(int.from_bytes(sig, "big"), e, n).to_bytes(k, "big")
+    expect = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+    return em == expect
+
+
+def fetch_relay_identity(relay_url):
+    """Fetch and verify the relay's identity.
+
+    Returns (fingerprint, pubkey). Raises on transport/HTTP errors other
+    than 503 (relay has no identity key), in which case returns (None, None)
+    and the caller must warn loudly.
+    """
+    nonce = os.urandom(32).hex()
+    try:
+        with urllib.request.urlopen(
+            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
+        ) as resp:
+            ident = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 503:
+            return None, None
+        raise
+    pubkey = ident.get("public_key")
+    if not pubkey or "n" not in pubkey or "e" not in pubkey:
+        raise ValueError("relay identity response has no public_key")
+    if not relay_identity_verify(pubkey, ident["nonce"], ident["signature"]):
+        raise ValueError("relay identity signature verification failed")
+    return relay_identity_fingerprint(pubkey), pubkey
+
+
+def check_relay_identity(relay_url, cfg):
+    """TOFU for the identity-establishing flows (redeem, enroll).
+
+    Fetches the relay's stable identity key, verifies the nonce signature
+    against it, and enforces the pinned fingerprint when the config already
+    has one. Returns the fingerprint (or None when the relay has no
+    identity key). Aborts the process on pin mismatch -- a changed relay
+    key is never silently accepted.
+    """
+    try:
+        fingerprint, _pubkey = fetch_relay_identity(relay_url)
+    except urllib.error.HTTPError as e:
+        print("could not verify relay identity: HTTP Error %d" % e.code,
+              file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print("could not verify relay identity: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    if fingerprint is None:
+        return None
+    pinned = (cfg or {}).get("relay_identity_fingerprint")
+    if pinned and pinned != fingerprint:
+        print("RELAY IDENTITY CHANGED: pinned %s but relay now presents %s"
+              % (pinned, fingerprint), file=sys.stderr)
+        print("aborting: verify out-of-band before proceeding", file=sys.stderr)
+        sys.exit(1)
+    return fingerprint
+
+
 def cmd_keygen(args):
     if os.path.exists(args.config) and not args.force:
         print("refusing to overwrite existing %s (use --force)" % args.config,
@@ -352,35 +445,18 @@ def cmd_redeem(args):
     relay_url = b64u_decode(f["r"]).decode("utf-8")
     exp_human = datetime.datetime.fromtimestamp(int(f["exp"])).strftime("%Y-%m-%d %H:%M:%S")
 
-    # Fetch the relay's identity key BEFORE sending the secret anywhere
-    # (TOFU: the human sees the fingerprint at the confirmation tap).
-    # If the relay has no identity key (503), warn loudly and continue --
-    # a fresh relay shouldn't brick onboarding, but the human must know
-    # the relay is unauthenticated.
-    import hashlib as _hashlib
-    nonce = os.urandom(32).hex()
-    relay_fp = None
-    try:
-        with urllib.request.urlopen(
-            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
-        ) as resp:
-            ident = json.loads(resp.read().decode("utf-8"))
-        relay_fp = "sha256:" + _hashlib.sha256(
-            base64.b64decode(ident["signature"])
-        ).hexdigest()[:16]
-    except urllib.error.HTTPError as e:
-        if e.code != 503:
-            print("could not verify relay identity: HTTP Error %d" % e.code,
-                  file=sys.stderr)
-            return 1
-    except Exception as e:
-        print("could not reach relay identity endpoint: %s" % e, file=sys.stderr)
-        return 1
+    # Fetch the relay's stable identity key BEFORE sending the secret
+    # anywhere (TOFU: the human sees the fingerprint at the confirmation
+    # tap, and it is pinned in the saved config). If the relay has no
+    # identity key, warn loudly and continue -- a fresh relay shouldn't
+    # brick onboarding, but the human must know the relay is unauthenticated.
+    existing_cfg = load_config(args.config) if os.path.exists(args.config) else None
+    relay_fp = check_relay_identity(relay_url, existing_cfg)
 
     print("You are about to join a relay:")
     print("  relay:            %s" % relay_url)
     if relay_fp:
-        print("  relay key (TOFU): %s  <- shown for first-use confirmation" % relay_fp)
+        print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
     else:
         print("  relay key (TOFU): UNAVAILABLE (relay has no identity key) --")
         print("                    continuing without relay authentication")
@@ -439,6 +515,8 @@ def cmd_redeem(args):
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
+    if relay_fp:
+        cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
     fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
@@ -500,32 +578,16 @@ def cmd_enroll(args):
         print("--invite-id needs --secret", file=sys.stderr)
         return 1
 
-    # Fetch the relay's identity key BEFORE enrolling (TOFU: the human sees
-    # the fingerprint at the confirmation tap), mirroring redeem.
-    import hashlib as _hashlib
-    nonce = os.urandom(32).hex()
-    relay_fp = None
-    try:
-        with urllib.request.urlopen(
-            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
-        ) as resp:
-            ident = json.loads(resp.read().decode("utf-8"))
-        relay_fp = "sha256:" + _hashlib.sha256(
-            base64.b64decode(ident["signature"])
-        ).hexdigest()[:16]
-    except urllib.error.HTTPError as e:
-        if e.code != 503:
-            print("could not verify relay identity: HTTP Error %d" % e.code,
-                  file=sys.stderr)
-            return 1
-    except Exception as e:
-        print("could not reach relay identity endpoint: %s" % e, file=sys.stderr)
-        return 1
+    # Fetch the relay's stable identity key BEFORE enrolling (TOFU: the human
+    # sees the fingerprint at the confirmation tap, and it is pinned in the
+    # saved config), mirroring redeem.
+    existing_cfg = load_config(args.config) if os.path.exists(args.config) else None
+    relay_fp = check_relay_identity(relay_url, existing_cfg)
 
     print("You are about to enroll a new agent identity on a relay:")
     print("  relay:            %s" % relay_url)
     if relay_fp:
-        print("  relay key (TOFU): %s  <- shown for first-use confirmation" % relay_fp)
+        print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
     else:
         print("  relay key (TOFU): UNAVAILABLE (relay has no identity key) --")
         print("                    continuing without relay authentication")
@@ -613,6 +675,8 @@ def cmd_enroll(args):
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
+    if relay_fp:
+        cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
     fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
