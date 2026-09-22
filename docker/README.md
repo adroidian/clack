@@ -39,13 +39,20 @@ Mac/Windows, and Unraid alike, and the existing host `cloudflared` still
 reaches the relay at `http://127.0.0.1:18802` with no extra config.
 
 > **Connector network namespace matters.** The `127.0.0.1:18802` origin
-> works only when `cloudflared` shares the host's network namespace (host
-> install, host-networked container, or same-pod sidecar). If the
-> connector itself runs in a bridge-networked container, its `127.0.0.1`
-> is *itself*, not the host — point the ingress rule at the host's LAN
+> works only when `cloudflared` itself can reach the host loopback — i.e.
+> the connector runs on the host or with host networking. A same-pod
+> sidecar shares the *pod* namespace, not necessarily the host's, so it
+> helps only when the connector pod is itself host-networked. If the
+> connector runs in a bridge-networked container, its `127.0.0.1` is
+> *itself*, not the host — point the ingress rule at the host's LAN
 > IP (or run the connector with host networking) instead. Verify with
 > `curl http://127.0.0.1:18802/health` **from inside the connector's own
 > namespace** before adding the route.
+>
+> **Existing volumes keep their keys.** If a `/data` volume already holds
+> a config, first boot does not touch it — check the *public* modulus
+> size via `/v1/identity` and never silently rotate a TOFU identity to
+> "fix" key strength.
 
 Notes:
 

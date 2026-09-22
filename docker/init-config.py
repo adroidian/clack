@@ -81,9 +81,9 @@ def main():
         print("usage: init-config.py /path/to/relay-config.json", file=sys.stderr)
         return 2
     out = sys.argv[1]
-    if os.path.exists(out):
-        print("init-config: %s exists, refusing to overwrite" % out, file=sys.stderr)
-        return 1
+    # Private key material is written below: lock the umask first so the
+    # mode on exclusive creation is exactly 0600 regardless of environment.
+    os.umask(0o077)
 
     reserved = {}
     greeter = os.environ.get("GREETER_PUBKEY", "").strip()
@@ -110,10 +110,25 @@ def main():
         "reserved_names": reserved,
         "identity_key": gen_rsa_key(),
     }
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=1)
-        f.write("\n")
-    os.chmod(out, 0o600)
+    # Exclusive creation: refuses to overwrite an existing identity (no
+    # silent rotation) and avoids the exists-then-open race. Partial
+    # writes are unlinked so a failed first boot never leaves a
+    # half-written config behind.
+    try:
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        print("init-config: %s exists, refusing to overwrite" % out, file=sys.stderr)
+        return 1
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=1)
+            f.write("\n")
+    except BaseException:
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        raise
     print("init-config: wrote %s (mode 600)" % out)
     return 0
 
