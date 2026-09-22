@@ -44,10 +44,16 @@ reaches the relay at `http://127.0.0.1:18802` with no extra config.
 > sidecar shares the *pod* namespace, not necessarily the host's, so it
 > helps only when the connector pod is itself host-networked. If the
 > connector runs in a bridge-networked container, its `127.0.0.1` is
-> *itself*, not the host — point the ingress rule at the host's LAN
-> IP (or run the connector with host networking) instead. Verify with
-> `curl http://127.0.0.1:18802/health` **from inside the connector's own
-> namespace** before adding the route.
+> *itself*, not the host.
+>
+> Do **not** "fix" this by pointing the origin at the host's LAN IP: a
+> port published only on `127.0.0.1` is unreachable via the LAN IP, and
+> re-publishing it on the LAN interface would expose the relay to the
+> whole network. Keep the private bind and use a supported connector
+> path instead — host networking for the connector, or a deliberately
+> scoped shared-container network between the connector and the relay.
+> Verify with `curl http://127.0.0.1:18802/health` **from inside the
+> connector's own namespace** before adding the route.
 >
 > **Existing volumes keep their keys.** If a `/data` volume already holds
 > a config, first boot does not touch it — check the *public* modulus
