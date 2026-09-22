@@ -28,7 +28,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.9"
+VERSION = "0.2.10"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -177,6 +177,14 @@ def init_db(cfg):
         ("identity_pubkey", "TEXT"),
         ("invited_by", "TEXT"),
         ("display_name", "TEXT"),
+        # v0.2.10: enrollment telemetry for abuse detection. enroll_gate is
+        # 'invite' | 'pow' | 'open' | 'config'; enroll_ip is the source IP at
+        # enrollment; last_poll_at / last_send_at track activity (NULL =
+        # never). Operator-visible via the DB; not exposed over the API.
+        ("enroll_gate", "TEXT"),
+        ("enroll_ip", "TEXT"),
+        ("last_poll_at", "REAL"),
+        ("last_send_at", "REAL"),
     ):
         if _col not in peer_cols:
             conn.execute("ALTER TABLE peers ADD COLUMN %s %s" % (_col, _ddl))
@@ -193,9 +201,9 @@ def init_db(cfg):
     with conn:
         conn.execute("DELETE FROM peers WHERE identity_pubkey IS NULL")
         conn.executemany(
-            "INSERT OR IGNORE INTO peers(name, token_hash, created_at) VALUES(?,?,?)",
+            "INSERT OR IGNORE INTO peers(name, token_hash, created_at, enroll_gate) VALUES(?,?,?,?)",
             [
-                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now)
+                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now, "config")
                 for name, token in cfg.get("peers", {}).items()
             ],
         )
@@ -364,6 +372,53 @@ def _pow_difficulty():
         return ENROLL_DEFAULT_POW_DIFFICULTY
 
 
+class _ReservedNameRejected(Exception):
+    """Raised inside the enrollment transaction when a non-pinned key
+    requests a reserved name. The handler rolls back and answers 403."""
+
+
+_RESERVED_NAMES = {}
+
+
+def _parse_reserved_names(cfg):
+    """Strictly validate relay-config.json "reserved_names".
+
+    Returns {name: identity_pubkey_b64u} with keys in canonical form.
+    Any malformed entry -- a non-dict section, an invalid name, an
+    undecodable key, or a key of the wrong length -- raises ValueError.
+    A typo'd reservation must fail loudly at startup, never silently drop:
+    an ignored reservation looks exactly like a working one until the
+    squatter arrives.
+    """
+    raw = cfg.get("reserved_names", {}) if cfg else {}
+    if not isinstance(raw, dict):
+        raise ValueError("reserved_names must be an object, got %s"
+                         % type(raw).__name__)
+    out = {}
+    for name, key_b64 in raw.items():
+        if not _valid_requested_name(name):
+            raise ValueError("reserved name %r is not a valid peer name"
+                             % (name,))
+        try:
+            key = b64u_decode(key_b64)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("reserved name %r has a malformed identity key"
+                             % (name,))
+        if len(key) != 32:
+            raise ValueError("reserved name %r key is %d bytes, want 32"
+                             % (name, len(key)))
+        out[name] = b64u_encode(key)  # canonical form for comparison
+    return out
+
+
+def _init_reserved_names(cfg):
+    global _RESERVED_NAMES
+    try:
+        _RESERVED_NAMES = _parse_reserved_names(cfg)
+    except ValueError as e:
+        raise SystemExit("clack-relay: invalid reserved_names: %s" % e)
+
+
 def enroll_failures_blocked(key):
     """5 failed enrollments within 15 minutes cools the key down."""
     now = time.time()
@@ -405,14 +460,20 @@ def _valid_requested_name(name):
     )
 
 
-def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now):
+def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now,
+                          enroll_gate=None, enroll_ip=None):
     """Find-or-create a peer row keyed by identity. Assumes db_lock is held
     and the caller opened a BEGIN IMMEDIATE transaction: the lookup, the
     name reservation, and the INSERT/UPDATE are one atomic unit. Returns the
     peer name. Shared by /v1/invites/redeem and /v1/enroll -- requested_name
     is None for redeem (always a guest name), the agent's choice for enroll.
     All uniqueness checks happen INSIDE the transaction, never from a
-    pre-lock read (same race discipline as redeem)."""
+    pre-lock read (same race discipline as redeem). Reserved-name
+    enforcement also happens here, inside the transaction: a non-pinned key
+    requesting a reserved name raises _ReservedNameRejected. Re-enrollments
+    return before this point, so an already-enrolled identity keeps its
+    name even if the name is later reserved to a different key
+    (grandfathered); only new enrollments are gated."""
     row = conn.execute(
         "SELECT name FROM peers WHERE identity_pubkey=?", (pub_b64,)
     ).fetchone()
@@ -425,6 +486,14 @@ def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now
         return name
     name = None
     if _valid_requested_name(requested_name):
+        pinned = _RESERVED_NAMES.get(requested_name)
+        if pinned is not None and pinned != pub_b64:
+            # Reserved for a different identity key: reject outright, inside
+            # the same transaction as the name assignment, so the check and
+            # the insert are atomic. Never hand out a suffixed fallback,
+            # which would confuse the legitimate owner. The pinned key
+            # itself falls through to the normal first-come path below.
+            raise _ReservedNameRejected(requested_name)
         if not conn.execute(
             "SELECT 1 FROM peers WHERE name=?", (requested_name,)
         ).fetchone():
@@ -439,9 +508,10 @@ def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now
         name = _unique_guest_name_locked()
     conn.execute(
         """INSERT INTO peers(name, token_hash, created_at,
-                             identity_pubkey, invited_by, display_name)
-           VALUES(?,?,?,?,?,?)""",
-        (name, token_hash, now, pub_b64, invited_by, name),
+                             identity_pubkey, invited_by, display_name,
+                             enroll_gate, enroll_ip)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (name, token_hash, now, pub_b64, invited_by, name, enroll_gate, enroll_ip),
     )
     return name
 
@@ -955,6 +1025,11 @@ class Handler(BaseHTTPRequestHandler):
                     "nonce": nonce_hex.lower(),
                     "algorithm": "rsassa-pkcs1-v1_5-sha256",
                     "signature": base64.b64encode(sig).decode("ascii"),
+                    # v0.2.10: the relay's STABLE identity public key. Clients
+                    # fingerprint THIS (not the per-nonce signature) for TOFU:
+                    # fetch once, verify the signature below against it, pin
+                    # the fingerprint, and compare on every later run.
+                    "public_key": relay_identity_info(),
                 },
             )
             return
@@ -1028,6 +1103,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     conn.commit()
             self._json(200, {"messages": msgs})
+            # v0.2.10 telemetry: last poll activity per peer (NULL = never).
+            with db_lock:
+                conn.execute(
+                    "UPDATE peers SET last_poll_at=? WHERE name=?",
+                    (time.time(), peer),
+                )
+                conn.commit()
             return
         if parsed.path == "/v1/fetch":
             qs = parse_qs(parsed.query)
@@ -1264,6 +1346,13 @@ class Handler(BaseHTTPRequestHandler):
             # v0.2.4: wake the recipient if they registered a nudge webhook.
             # Runs after commit, outside the db lock; best-effort only.
             maybe_notify(to)
+            # v0.2.10 telemetry: last send activity per peer (NULL = never).
+            with db_lock:
+                conn.execute(
+                    "UPDATE peers SET last_send_at=? WHERE name=?",
+                    (time.time(), peer),
+                )
+                conn.commit()
             self._json(200, {"accepted": True, "id": mid, "expires_at": expires_at})
             return
         self._json(404, {"error": "not_found"})
@@ -1532,7 +1621,8 @@ class Handler(BaseHTTPRequestHandler):
                     fail("invite_unusable", 410)
                     return
                 name = _enroll_identity_locked(
-                    pub_b64, token_hash, inviter_identity, None, now2
+                    pub_b64, token_hash, inviter_identity, None, now2,
+                    enroll_gate="invite", enroll_ip=ip,
                 )
                 conn.execute("COMMIT")
             except Exception:
@@ -1807,6 +1897,10 @@ class Handler(BaseHTTPRequestHandler):
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         requested_name = body.get("name")
+        # Reserved-name enforcement lives inside _enroll_identity_locked,
+        # in the same transaction as the name assignment (atomic check and
+        # insert). Invite-redeem never requests a name (requested_name is
+        # always None there), so no counterpart is needed.
         name = None
         with db_lock:
             now2 = time.time()  # fresh: request-start `now` may predate expiry
@@ -1829,9 +1923,20 @@ class Handler(BaseHTTPRequestHandler):
                         fail("invite_unusable", 410)
                         return
                 name = _enroll_identity_locked(
-                    pub_b64, token_hash, invited_by, requested_name, now2
+                    pub_b64, token_hash, invited_by, requested_name, now2,
+                    enroll_gate=gate, enroll_ip=ip,
                 )
                 conn.execute("COMMIT")
+            except _ReservedNameRejected:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                # Rejected before any peer row was written. The ROLLBACK
+                # also undoes the invite-use consume above, so the invite
+                # stays usable for a retry with a different name.
+                fail("reserved_name", 403)
+                return
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
@@ -1951,6 +2056,7 @@ def main():
     global relay_cfg
     cfg = load_config()
     relay_cfg = cfg
+    _init_reserved_names(cfg)  # strict: malformed entries refuse startup
     load_identity_key(cfg)
     _install_signal_trap()
     port = int(cfg.get("port", 18802))
