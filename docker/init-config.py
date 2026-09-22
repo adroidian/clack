@@ -60,8 +60,13 @@ def _gen_prime(bits):
             return p
 
 
-def gen_rsa_key(bits=1024):
-    """Same shape as the relay's own test harness: RSA (n, e, d), e=65537."""
+def gen_rsa_key(bits=2048):
+    """Same shape as the relay's own test harness: RSA (n, e, d), e=65537.
+
+    2048 bits minimum for any public deployment. Pure-Python prime search
+    takes ~10-20s; this runs once at first boot only (init-config refuses
+    to overwrite an existing config, so identities are never rotated).
+    """
     while True:
         p, q = _gen_prime(bits // 2), _gen_prime(bits // 2)
         if p != q and (p * q).bit_length() == bits and \

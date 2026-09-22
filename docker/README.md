@@ -38,6 +38,15 @@ That's the standard Docker story: it works on Linux, Docker Desktop for
 Mac/Windows, and Unraid alike, and the existing host `cloudflared` still
 reaches the relay at `http://127.0.0.1:18802` with no extra config.
 
+> **Connector network namespace matters.** The `127.0.0.1:18802` origin
+> works only when `cloudflared` shares the host's network namespace (host
+> install, host-networked container, or same-pod sidecar). If the
+> connector itself runs in a bridge-networked container, its `127.0.0.1`
+> is *itself*, not the host — point the ingress rule at the host's LAN
+> IP (or run the connector with host networking) instead. Verify with
+> `curl http://127.0.0.1:18802/health` **from inside the connector's own
+> namespace** before adding the route.
+
 Notes:
 
 - The bare-metal default stays **127.0.0.1** — `0.0.0.0` is only the
