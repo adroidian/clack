@@ -28,10 +28,15 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.6"
+VERSION = "0.2.8"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
+# Code lives with this script; state lives in BASE. The two coincide in the
+# dev layout but differ in the documented deployment layout, so anything
+# served from the code tree (e.g. the join client download) must resolve
+# against the script's own directory, never BASE.
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "relay-config.json")
 DB_PATH = os.path.join(BASE, "relay.db")
 
@@ -376,15 +381,20 @@ def build_invite_link(base_url, invite_id, secret, inviter_identity, exp):
     return base_url.rstrip("/") + "/join#" + frag
 
 
+def _unique_guest_name_locked():
+    """Mint a fresh guest name. Assumes db_lock is already held."""
+    for _ in range(100):
+        name = "guest-" + secrets.token_hex(4)
+        if not conn.execute(
+            "SELECT 1 FROM peers WHERE name=?", (name,)
+        ).fetchone():
+            return name
+    raise RuntimeError("guest name space exhausted")
+
+
 def unique_guest_name():
     with db_lock:
-        for _ in range(100):
-            name = "guest-" + secrets.token_hex(4)
-            if not conn.execute(
-                "SELECT 1 FROM peers WHERE name=?", (name,)
-            ).fetchone():
-                return name
-    raise RuntimeError("guest name space exhausted")
+        return _unique_guest_name_locked()
 
 
 # --- Wake nudges ("you have mail") -------------------------------------------
@@ -605,6 +615,130 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return peer
 
+    # --- Self-contained onboarding (v0.2.8) --------------------------------
+    # GET /join and GET /join/client are PUBLIC (no auth). They serve only
+    # generic bootstrap material: the relay's own URL, where to fetch the
+    # single-file client, and the invite-link format plus redeem steps. They
+    # MUST NOT leak peer names, invite ids, tokens, secrets, or any
+    # per-invite data. An invite link's #fragment never reaches the server
+    # (fragments are client-side by HTTP spec); the claim secret inside it
+    # is only ever transmitted inside the POST /v1/invites/redeem body.
+    def _join_scheme(self):
+        xfwd = self.headers.get("X-Forwarded-Proto", "")
+        if xfwd:
+            return xfwd.split(",")[0].strip().lower() or "http"
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower().strip("[]")
+        if host in ("localhost", "127.0.0.1", "::1") or host.startswith("127."):
+            return "http"
+        return "https"
+
+    def _join_base_url(self):
+        host = (self.headers.get("Host") or "").strip() or "127.0.0.1"
+        return "%s://%s" % (self._join_scheme(), host)
+
+    def _join_bootstrap_doc(self):
+        base = self._join_base_url()
+        return {
+            "relay_url": base,
+            "client_url": base + "/join/client",
+            "protocol_version": VERSION,
+            "link_version": LINK_VERSION,
+            "link_format": "https://<relay>/join#v=3&r=<base64url relay url>&i=<invite id>&k=<claim secret>&by=<inviter>&exp=<expiry epoch>",
+            "fragment_params": ["r", "i", "k", "v", "by", "exp"],
+            "fragment_note": "The URL fragment (after #) is never sent to the server. Parse it locally. The claim secret (k) travels only inside the POST /v1/invites/redeem body.",
+            "security_note": "Recommended before redeeming: GET /v1/identity?nonce=<16-64 random bytes as hex> and confirm the relay's signature fingerprint out-of-band (TOFU).",
+            "steps": [
+                {
+                    "n": 1,
+                    "title": "Parse the invite link fragment locally",
+                    "detail": "Split the link on '#'; parse the fragment as query parameters. r = base64url relay URL, i = invite id, k = base64url claim secret, v = link version, by = inviter name, exp = expiry unix epoch.",
+                },
+                {
+                    "n": 2,
+                    "title": "Get the single-file client",
+                    "detail": "Download client_url (one Python 3 file, stdlib only, no dependencies) and run: python3 clack.py redeem \"<full invite link>\". It performs steps 3-7, showing the relay fingerprint for human confirmation first.",
+                },
+                {
+                    "n": 3,
+                    "title": "Generate an Ed25519 identity keypair locally",
+                    "detail": "Keep the 32-byte seed private on your own machine. The relay never sees it.",
+                },
+                {
+                    "n": 4,
+                    "title": "Fetch a challenge nonce",
+                    "detail": "POST /v1/invites/challenge with {\"invite_id\": i} returns {\"nonce\"} (base64url, single-use, 5-minute expiry, bound to the invite).",
+                },
+                {
+                    "n": 5,
+                    "title": "Sign the proof",
+                    "detail": "signature = Ed25519_sign(seed, nonce_bytes || invite_id.encode(\"utf-8\") || public_key_bytes).",
+                },
+                {
+                    "n": 6,
+                    "title": "Redeem the invite",
+                    "detail": "POST /v1/invites/redeem with {\"invite_id\": i, \"secret\": k, \"identity_pubkey\": base64url(public_key), \"proof\": {\"nonce\": nonce, \"signature\": base64url(signature)}} returns {\"service_token\", \"peer_name\", ...}. The invite is consumed atomically (single-use).",
+                },
+                {
+                    "n": 7,
+                    "title": "Talk",
+                    "detail": "Use the service_token as a Bearer token: POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack to confirm handling.",
+                },
+            ],
+        }
+
+    def _serve_join(self):
+        doc = self._join_bootstrap_doc()
+        accept = self.headers.get("Accept", "")
+        if "application/json" in accept:
+            self._json(200, doc)
+            return
+        payload = json.dumps(doc).replace("</", "<\\/")
+        html = (
+            "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n"
+            "<title>Join this Clack relay</title>\n</head>\n<body>\n"
+            "<h1>Join this Clack relay</h1>\n"
+            "<p>This relay speaks the Clack agent-to-agent protocol. "
+            "All you need is an invite link.</p>\n"
+            "<ol>\n"
+            "<li>Download the client: "
+            "<a href=\"/join/client\">clack.py</a> "
+            "(one file, Python 3, stdlib only, no dependencies).</li>\n"
+            "<li>Run: <code>python3 clack.py redeem \"&lt;your invite link&gt;\"</code></li>\n"
+            "<li>Check the relay fingerprint, type <code>YES</code>, and you are enrolled.</li>\n"
+            "</ol>\n"
+            "<p>The invite link's <code>#fragment</code> carries your claim secret and "
+            "never leaves your machine except inside the redeem request itself. "
+            "Doing it by hand instead of with the client? The machine-readable "
+            "bootstrap document is embedded below.</p>\n"
+            "<script type=\"application/json\" id=\"clack-bootstrap\">\n"
+            + payload
+            + "\n</script>\n</body>\n</html>\n"
+        )
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_join_client(self):
+        # Fixed filename under the relay's own directory: no user input in
+        # the path, so no traversal risk. Read at request time so the served
+        # bytes always match the relay's client file.
+        path = os.path.join(CODE_DIR, "relay-cli.py")
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            self._json(500, {"error": "client_unavailable"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/x-python")
+        self.send_header("Content-Disposition", 'attachment; filename="clack.py"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         now = time.time()
         sweep(now)
@@ -643,6 +777,14 @@ class Handler(BaseHTTPRequestHandler):
                     "signature": base64.b64encode(sig).decode("ascii"),
                 },
             )
+            return
+        # Public bootstrap endpoints for self-contained onboarding (v0.2.8).
+        # These come before auth on purpose: an invitee has no credentials yet.
+        if parsed.path in ("/join", "/join/"):
+            self._serve_join()
+            return
+        if parsed.path == "/join/client":
+            self._serve_join_client()
             return
         peer = self._require_auth()
         if peer is None:
@@ -966,32 +1108,51 @@ class Handler(BaseHTTPRequestHandler):
         invite_id = str(uuid.uuid4())
         secret = secrets.token_bytes(32)
         exp = now + exp_secs
-        # Quota check and insert happen under ONE lock acquisition so two
-        # concurrent mints cannot both pass the quota and both insert.
+        # Quota check and insert happen inside ONE explicit transaction
+        # (BEGIN IMMEDIATE) under one lock acquisition, so two concurrent
+        # mints cannot both pass the quota and both insert. The write lock is
+        # taken by SQLite itself at BEGIN, not just by the Python lock, so the
+        # check-and-insert is atomic even if a second process ever opens this
+        # database.
         with db_lock:
-            active = conn.execute(
-                """SELECT COUNT(*) FROM invites
-                   WHERE inviter_identity=? AND revoked=0 AND exp > ?
-                     AND uses < max_uses""",
-                (ident, now),
-            ).fetchone()[0]
-            if active >= INVITE_QUOTA_PER_IDENTITY:
-                self._json(429, {"error": "invite_quota_exceeded"})
-                return
-            conn.execute(
-                """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
-                                       exp, max_uses, uses, revoked, created_at)
-                   VALUES(?,?,?,?,?,0,0,?)""",
-                (
-                    invite_id,
-                    hashlib.sha256(secret).hexdigest(),
-                    ident,
-                    exp,
-                    max_uses,
-                    now,
-                ),
-            )
-            conn.commit()
+            now2 = time.time()  # fresh: request-start `now` may be stale
+            try:
+                if conn.in_transaction:
+                    # Defensive: a previous request must never leak an open
+                    # transaction on the shared connection. Discard it rather
+                    # than joining it.
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                active = conn.execute(
+                    """SELECT COUNT(*) FROM invites
+                       WHERE inviter_identity=? AND revoked=0 AND exp > ?
+                         AND uses < max_uses""",
+                    (ident, now2),
+                ).fetchone()[0]
+                if active >= INVITE_QUOTA_PER_IDENTITY:
+                    conn.execute("ROLLBACK")
+                    self._json(429, {"error": "invite_quota_exceeded"})
+                    return
+                conn.execute(
+                    """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
+                                           exp, max_uses, uses, revoked, created_at)
+                       VALUES(?,?,?,?,?,0,0,?)""",
+                    (
+                        invite_id,
+                        hashlib.sha256(secret).hexdigest(),
+                        ident,
+                        exp,
+                        max_uses,
+                        now2,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         link = build_invite_link(
             relay_base_url(relay_cfg), invite_id, secret, ident, exp
         )
@@ -1140,49 +1301,76 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Find-or-create, KEYED BY identity. A second introduction reuses the
         # identity row -- it adds a relationship, never duplicates identity.
+        # NOTE: the peer-row lookup happens INSIDE the reservation
+        # transaction below, never from a pre-lock read. A concurrent redeem
+        # for the same identity could slip in between a pre-lock SELECT and
+        # the INSERT and turn it into an IntegrityError.
         pub_b64 = b64u_encode(pubkey)
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        with db_lock:
-            row = conn.execute(
-                "SELECT name FROM peers WHERE identity_pubkey=?", (pub_b64,)
-            ).fetchone()
-            if row:
-                name = row[0]
-            else:
-                name = None
-        if name is None:
-            name = unique_guest_name()
         # Atomic reservation: revalidate the invite AND consume one use in a
-        # single conditional UPDATE inside the same transaction as the
-        # peer/token mutation. The pre-check above is only a fast path; this
-        # is the authoritative gate. Two concurrent redeems cannot both win:
-        # the loser's UPDATE matches zero rows and gets no credentials.
+        # single conditional UPDATE inside an explicit BEGIN IMMEDIATE
+        # transaction that also carries the peer/token mutation. The pre-check
+        # above is only a fast path; this is the authoritative gate. Two
+        # concurrent redeems cannot both win: the loser's UPDATE matches zero
+        # rows and gets no credentials.
+        #
+        # Why BEGIN IMMEDIATE and not just db_lock: the Python lock only
+        # serializes threads of this process. The write lock taken by BEGIN
+        # IMMEDIATE is enforced by SQLite itself, so the reservation and the
+        # credential mutation are atomic even if a second process ever opens
+        # this database. Either both land or neither does -- a failed peer
+        # INSERT can never leave a consumed use behind.
+        name = None
         with db_lock:
-            cur = conn.execute(
-                """UPDATE invites SET uses = uses + 1
-                   WHERE invite_id=? AND revoked=0 AND exp > ?
-                     AND uses < max_uses""",
-                (invite_id, now),
-            )
-            if cur.rowcount != 1:
-                conn.rollback()
-                fail("invite_unusable", 410)
+            now2 = time.time()  # fresh: request-start `now` may predate expiry
+            try:
+                if conn.in_transaction:
+                    # Defensive: a previous request must never leak an open
+                    # transaction on the shared connection. Discard it rather
+                    # than joining it.
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    """UPDATE invites SET uses = uses + 1
+                       WHERE invite_id=? AND revoked=0 AND exp > ?
+                         AND uses < max_uses""",
+                    (invite_id, now2),
+                )
+                if cur.rowcount != 1:
+                    conn.execute("ROLLBACK")
+                    fail("invite_unusable", 410)
+                    return
+                peer_row = conn.execute(
+                    "SELECT name FROM peers WHERE identity_pubkey=?", (pub_b64,)
+                ).fetchone()
+                if peer_row:
+                    name = peer_row[0]
+                    conn.execute(
+                        "UPDATE peers SET token_hash=?, invited_by=? WHERE identity_pubkey=?",
+                        (token_hash, inviter_identity, pub_b64),
+                    )
+                else:
+                    name = _unique_guest_name_locked()
+                    conn.execute(
+                        """INSERT INTO peers(name, token_hash, created_at,
+                                             identity_pubkey, invited_by, display_name)
+                           VALUES(?,?,?,?,?,?)""",
+                        (name, token_hash, now2, pub_b64, inviter_identity, name),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                # A failed peer INSERT/UPDATE must never surface as a dropped
+                # connection: roll back, record the failure, tell the client.
+                fail("internal_error", 500)
                 return
-            if row:
-                conn.execute(
-                    "UPDATE peers SET token_hash=?, invited_by=? WHERE identity_pubkey=?",
-                    (token_hash, inviter_identity, pub_b64),
-                )
-            else:
-                conn.execute(
-                    """INSERT INTO peers(name, token_hash, created_at,
-                                         identity_pubkey, invited_by, display_name)
-                       VALUES(?,?,?,?,?,?)""",
-                    (name, token_hash, now, pub_b64, inviter_identity, name),
-                )
-                peer_names.add(name)
-            conn.commit()
+        # Cache mutation only after the transaction committed: a rolled-back
+        # INSERT must never leave a ghost entry in the in-memory name set.
+        peer_names.add(name)
         redeem_failure_clear(invite_id)
         inviter_name = peer_name_for_identity(inviter_identity)
         self._json(

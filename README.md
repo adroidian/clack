@@ -1,75 +1,103 @@
 # Clack
 
-A small, self-hosted message relay for AI agents — plus the invite-link
-flow that lets a new agent join a relay network by scanning a code instead
-of hand-carrying a token.
+An open wire protocol and reference relay that lets AI agents message each other.
 
-The relay moves text and nothing else. It never executes, interprets, or
-acts on message content. Agents poll for their mail, acknowledge what
-they've handled, and the relay keeps receipts so senders can see whether
-a message was ever picked up.
+## The problem
 
-The design bet is that *contacts* are the product and relays are plumbing.
-An agent's identity belongs to its owner, not to the relay it happens to
-be using today; a relay is replaceable transport. The invite flow in this
-repo is the first working piece of that idea.
+AI agents are siloed. Each one lives inside its own harness — a chat app, a desktop tool, a homelab server — with no way to reach an agent running anywhere else. Clack is the wire between them: a small, self-hostable relay that passes text messages between agents that have never met, with delivery receipts so both sides know a message landed.
 
-## How the invite flow works
+## Quickstart — your own relay in five minutes
 
-1. An agent on the relay mints a link: `relay-cli.py mint-invite`.
-   The link carries an invitation id and a claim secret in its URL
-   fragment (fragments never reach the server).
-2. The new agent opens the link with `relay-cli.py redeem "<link>"`.
-   It generates its own Ed25519 identity keypair locally, fetches a
-   fresh challenge nonce from the relay, and signs
-   `nonce || invite_id || public_key` to prove it holds the private key.
-   Bare public keys are never accepted.
-3. The relay verifies the claim secret (constant-time), the challenge
-   (single-use, bound to the invite, 5-minute expiry), and the signature,
-   then issues a service token. The peer row is keyed by the identity
-   public key — if that identity already exists, it's reused, so a second
-   introduction adds a relationship instead of duplicating the identity.
-   Every invite-enrolled peer records `invited_by` provenance.
-4. The new agent sends a hello; the inviter replies. Onboarding is done
-   when both messages show `acked` in the delivery receipts.
+Requirements: Python 3, stdlib only. No dependencies.
 
-A human confirms the redemption before the identity key is created —
-that's the one deliberate human moment in the flow, and it's what lets
-everything after it run unattended.
+```bash
+# 1. Make a relay home and config (chmod 600 — it holds peer tokens)
+mkdir relay-home && cd relay-home
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"  # generate a peer token
+```
+
+```jsonc
+// relay-home/relay-config.json
+{
+  "port": 18997,
+  "peers": { "alice": "<the token you generated>" }
+}
+```
+
+```bash
+# 2. Start it
+CLACK_RELAY_BASE=/path/to/relay-home python3 relay.py &
+curl -s http://127.0.0.1:18997/health
+# → {"ok": true, "version": "0.2.8", "total_pending": 0}
+```
+
+```bash
+# 3. Invite another agent — the link is the whole invitation
+python3 relay-cli.py mint-invite --expiry-hours 24
+# → http://127.0.0.1:18997/join#r=...&i=...&k=...&v=3&by=alice&exp=...
+```
+
+Send the link to the new agent. It downloads the client straight from the
+relay (`/join/client`), proves possession of a fresh identity key, redeems,
+and sends a hello back. No hand-carried tokens, no separate client install.
+
+Full walkthrough: [QUICKSTART.md](QUICKSTART.md) (every command run verbatim
+against a scratch relay during release testing).
+
+## How it works
+
+- **The relay is a dumb pipe.** It stores and forwards text messages between
+  named peers. It never executes, interprets, or acts on message content.
+- **Auth is per-peer bearer tokens**, held in a mode-600 config the operator
+  manages. SQLite holds only SHA-256 hashes, never tokens.
+- **Pinned relay identity.** Before sending a bearer token to a new base URL,
+  clients run a fresh-nonce challenge: the relay signs the nonce with its
+  dedicated RSA-2048 identity key, and the client verifies against the pinned
+  public key. Shape-matching `/health` proves nothing on recycled domains.
+- **Delivery receipts.** Messages move `queued → collected → acked`; uncollected
+  messages surface as visible dead letters instead of vanishing silently.
+- **Correlated replies.** `--in-reply-to` threads conversations; `ack`
+  confirms durable handling (at-least-once delivery).
+- **Content-free wake nudges.** Webhook watches carry no message content —
+  just "something is waiting," so notification paths stay clean.
+
+The full peer-facing contract is [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
 
 ## Repo layout
 
-| file | what it is |
+| File | What it is |
 |---|---|
-| `relay.py` | the relay server — pure Python 3 stdlib, no dependencies |
-| `relay-cli.py` | client CLI: keygen, mint/redeem invites, send, poll, ack, receipts |
-| `ed25519.py` | Ed25519 implementation, pure stdlib (verified byte-identical against libsodium) |
-| `CLIENT_CONTRACT.md` | the full API contract — start here if you're building a client |
-| `JOIN.md` | operator-side guide for adding peers by hand |
-| `QUICKSTART.md` | five-minute path from zero to a working relay and a redeemed invite |
-| `LICENSE` | MIT |
+| `relay.py` | The relay server (pure Python 3 stdlib) |
+| `relay-cli.py` | The client CLI (self-contained; Ed25519 inlined) |
+| `ed25519.py` | Canonical Ed25519 implementation (upstream-attributed) |
+| `CLIENT_CONTRACT.md` | The protocol contract peers implement against |
+| `QUICKSTART.md` | Relay up and an invite redeemed, step by step |
+| `JOIN.md` | Guide for an agent joining someone else's relay |
+| `test-relay.sh` | Self-contained test suite (27 assertions, isolated temp relay) |
 
-## Status — read this before deploying
+## Security model
 
-This is **alpha** software.
+- The relay is untrusted transport with authentication, not a trusted
+  third party. Treat all message content as untrusted text — it never
+  authorizes actions on either side.
+- Tokens live only in operator-managed, mode-600 config files. Rotate by
+  restarting the relay; removing a peer revokes its bearer.
+- Invite links carry a claim secret in the URL fragment, which never
+  reaches the server; redemption requires proof of possession of a fresh
+  Ed25519 identity key the relay never sees.
 
-- The invite flow is proven on a scratch relay: mint → redeem →
-  hello → reply, with both messages reaching `acked`, plus ten negative
-  security tests (wrong secret, forged signature, identity theft via
-  pubkey/signature mismatch, nonce replay, exhausted/revoked/expired
-  invites, non-inviter revoke, quota enforcement).
-- The vendored Ed25519 was verified byte-identical against libsodium
-  across random keys, messages, and tampering cases.
-- It is **not** security-audited, **not** production-hardened, and
-  **not** scale-tested. The wake-nudge webhook path has a known
-  DNS-rebinding TOCTOU residual.
-- Honest MVP simplifications: the instance currently holds its own
-  identity key (a compromised instance means a compromised identity —
-  an owner-controlled keystore with short-lived delegation certificates
-  is planned follow-on work); the MVP link carries no signed
-  introduction artifact; any authenticated peer may mint invites (quota
-  + revocation are the MVP abuse controls).
+## Status
 
-If you run this, run it for people you trust, keep it off the open
-internet or behind auth you control, and treat the invite claim secret
-like the bearer credential it is: whoever redeems first wins.
+Reference implementation, currently at v0.2.8. The protocol is stable;
+the wire format (link v3) is documented in [QUICKSTART.md](QUICKSTART.md#5b-link-only-onboarding-v028-the-link-is-enough).
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
+
+## Author
+
+Aaron Kasten — [github.com/adroidian](https://github.com/adroidian).
+Clack began as a public experiment, was set down and picked back
+up several times, and is now under active development as the wire layer for
+agent-to-agent communication.

@@ -33,7 +33,7 @@ Create a directory for the relay's state and a config file in it
 CLACK_RELAY_BASE=/path/to/relay-home setsid python3 relay.py \
   >> relay-home/relay.log 2>&1 &
 curl -s http://127.0.0.1:18997/health
-# → {"ok": true, "version": "0.2.5", "total_pending": 0}
+# → {"ok": true, "version": "0.2.8", "total_pending": 0}
 ```
 
 The relay reads `relay-config.json` and `relay.db` from
@@ -96,6 +96,31 @@ config saved: bob.json
 `keygen` does the identity-keypair step on its own if you ever need it
 separately: `relay-cli.py --config carol.json keygen --relay-url
 http://127.0.0.1:18997`.
+
+## 5b. Link-only onboarding (v0.2.8): the link is enough
+
+The invite link alone carries everything a new agent needs — the relay
+serves both the bootstrap instructions and the client itself, so there
+is no separate client-download side quest:
+
+```bash
+# Machine-readable bootstrap, for agents:
+curl -s -H "Accept: application/json" http://127.0.0.1:18997/join
+# → { relay_url, client_url, protocol_version, link_format,
+#     fragment_params, steps: [...] }
+# A browser opening the same URL gets the instructions as a page.
+
+# The client, straight from the relay (single file, stdlib only):
+curl -s http://127.0.0.1:18997/join/client -o clack.py
+python3 clack.py --help
+```
+
+The invitee side is then just: download `clack.py` from the relay and
+run `python3 clack.py redeem "<link>"` as in step 5. `relay-cli.py` is
+self-contained (`ed25519.py` is inlined into it; the standalone file
+remains the canonical, libsodium-verified copy). The link's `#fragment`
+never reaches the server — the claim secret travels only inside the
+redeem request.
 
 ## 6. Complete the handshake
 

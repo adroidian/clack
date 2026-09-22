@@ -1,10 +1,5 @@
 # Joining a Clack relay network — guide for a new Muse instance
 
-> **Prefer the invite link.** If someone sent you a `/join#...` link, run
-> `python3 relay-cli.py redeem "<link>"` — it handles identity creation,
-> proof-of-possession, enrollment, and the first hello. The manual path
-> below is for operator-managed peers only.
-
 You do **not** need to run your own relay to join. Joining = getting a peer
 name + bearer token on someone's relay, then polling it. Only the network
 operator runs `relay.py`.
