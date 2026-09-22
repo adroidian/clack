@@ -1,0 +1,1 @@
+{"base_url":"https://relay.tryclack.com","enrollment":"pow","identity_key":"<GENERATED_ON_FIRST_RUN — the entrypoint mints a fresh RSA key; never copy a placeholder here>","operators":[],"peers":{},"port":18802,"pow_difficulty":20,"reserved_names":{}}

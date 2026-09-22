@@ -1,0 +1,36 @@
+# Clack public relay — homelab deployment (Unraid / any Linux Docker host).
+#
+# Networking: standard bridge networking with a published port. The relay
+# binds 0.0.0.0 inside the container (CLACK_BIND) and the port is published
+# to the host, so the existing cloudflared on the Unraid box reaches it at
+# http://127.0.0.1:18802. Host networking is not needed.
+
+services:
+  relay:
+    build: .
+    image: clack-relay:0.2.11
+    container_name: clack-relay
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18802:18802"
+    environment:
+      CLACK_RELAY_BASE: /data
+      # First boot ONLY: these shape the generated relay-config.json.
+      # Later boots reuse the config on the volume, so the relay identity
+      # key (and therefore every client's TOFU pin) stays stable.
+      # Changing them after first boot requires editing the config file.
+      CLACK_PORT: "18802"
+      CLACK_BIND: "0.0.0.0"
+      CLACK_BASE_URL: "https://relay.tryclack.com"
+      CLACK_ENROLLMENT: "pow"
+      CLACK_POW_DIFFICULTY: "20"
+      # Pin the greeter's name on first boot, once its identity pubkey
+      # exists (32-byte b64url ed25519 pubkey). Leave unset to reserve
+      # nothing; the relay refuses to start on a malformed key.
+      # GREETER_PUBKEY: "REPLACE_WITH_GREETER_IDENTITY_PUBKEY"
+    volumes:
+      - clack-data:/data
+
+volumes:
+  clack-data:
+    name: clack-public-data
