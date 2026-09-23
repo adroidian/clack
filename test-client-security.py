@@ -479,7 +479,7 @@ def main():
 
         # --- F5: cleartext warning for non-loopback http ----------------------
         orig_fetch = _rc.fetch_relay_identity
-        _rc.fetch_relay_identity = lambda url: (None, None)
+        _rc.fetch_relay_identity = lambda url, cfg=None: (None, None)
         try:
             _rc._verified_origins.clear()
             with captured_stderr() as err:
