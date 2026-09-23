@@ -438,8 +438,128 @@ def _save_identity_config(path, cfg, seed, key_path=None):
         f.write("\n")
 
 
+# --- Fail-closed transport (v0.2.12, Flint review F1/F2/F5) -------------------
+# F2: the CLI never follows redirects. urllib's default opener would resend
+# the bearer token and X-Clack-* signing headers to the redirect target,
+# crossing the configured origin boundary -- so a 3xx on an authenticated
+# or identity request is a failure, not a detour.
+# F1: the relay's identity is verified BEFORE any bearer token, secret, or
+# message body is transmitted, on every origin, including --base-url
+# overrides. The check lives in req(), the single choke point for all
+# API traffic, not just in the enrollment flows.
+# F5: TLS is the primary server-authentication boundary. The pinned relay
+# key is a second layer (catches key changes, stops unsophisticated
+# impersonators); it does not by itself prove the connection is direct --
+# a determined intermediary that can reach the genuine relay can proxy the
+# challenge and return a valid proof. The CLI enforces the pin and refuses
+# redirects; it does not claim the challenge authenticates the channel.
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "refusing redirect (%s -> %s): the Clack CLI never follows "
+            "redirects with credentials" % (req.full_url, newurl),
+            headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req, timeout):
+    """urlopen through the no-redirect opener. A 3xx raises HTTPError."""
+    return _opener.open(req, timeout=timeout)
+
+
+_verified_origins = set()  # origins whose relay identity passed this process
+_config_path = None         # set by main(); TOFU pin persistence target
+
+
+def _is_loopback_url(url):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _persist_tofu_pin(cfg, fingerprint):
+    """Persist a first-contact TOFU pin so later runs enforce it (F1). The
+    private key is untouched (it lives in its own mode-600 key file); only
+    the JSON config gains relay_identity_fingerprint."""
+    cfg["relay_identity_fingerprint"] = fingerprint
+    path = _config_path
+    if not path:
+        return
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        # O_CREAT mode applies only on create; the config holds bearer
+        # tokens, so enforce 0600 on rewrite too.
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print("warning: could not save relay identity pin to %s: %s"
+              % (path, e), file=sys.stderr)
+
+
+def _ensure_origin_verified(origin, cfg):
+    """Verify the relay identity for `origin` before any secret crosses it.
+
+    Fail-closed: pin mismatch, unavailable identity service with an
+    existing pin, transport errors, and bad proofs all abort the process
+    instead of sending the bearer token. First contact with no stored pin
+    does TOFU and persists the pin."""
+    if origin in _verified_origins:
+        return
+    if (urllib.parse.urlsplit(origin).scheme == "http"
+            and not _is_loopback_url(origin)):
+        # Without TLS there is no server-authentication boundary at all;
+        # say so loudly rather than letting the pin imply safety.
+        print("WARNING: relay URL is cleartext %s -- bearer tokens and "
+              "message bodies travel unencrypted" % origin, file=sys.stderr)
+    try:
+        fingerprint, _pubkey = fetch_relay_identity(origin)
+    except Exception as e:
+        print("could not verify relay identity for %s: %s" % (origin, e),
+              file=sys.stderr)
+        sys.exit(1)
+    pinned = (cfg or {}).get("relay_identity_fingerprint")
+    if fingerprint is None:
+        # Relay has no identity key (503). Never downgrade an existing pin
+        # to unauthenticated operation (F4).
+        if pinned:
+            print("relay identity unavailable for %s but this config pins %s;"
+                  " aborting rather than sending credentials unauthenticated"
+                  % (origin, pinned), file=sys.stderr)
+            sys.exit(1)
+        print("WARNING: relay at %s has no identity key; continuing without "
+              "relay authentication (no pin established)" % origin,
+              file=sys.stderr)
+        _verified_origins.add(origin)
+        return
+    if pinned and pinned != fingerprint:
+        print("RELAY IDENTITY CHANGED: config pins %s but %s presents %s"
+              % (pinned, origin, fingerprint), file=sys.stderr)
+        print("aborting: verify out-of-band before proceeding. If you moved "
+              "relays intentionally, update relay_identity_fingerprint in "
+              "the config (or re-enroll).", file=sys.stderr)
+        sys.exit(1)
+    if not pinned:
+        print("pinned relay identity %s for %s (TOFU, first contact)"
+              % (fingerprint, origin), file=sys.stderr)
+        _persist_tofu_pin(cfg, fingerprint)
+    _verified_origins.add(origin)
+
+
 def req(cfg, method, path, body=None, base=None):
-    url = (base or base_url(cfg)) + path
+    origin = (base or base_url(cfg)).rstrip("/")
+    _ensure_origin_verified(origin, cfg)
+    url = origin + path
     token = auth_token(cfg)
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
@@ -451,9 +571,16 @@ def req(cfg, method, path, body=None, base=None):
     if data is not None:
         r.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(r, timeout=130) as resp:
+        with _open(r, timeout=130) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            # _NoRedirect raises for 3xx: never treat as a normal response.
+            loc = e.headers.get("Location") if e.headers else None
+            print("refusing redirect from relay: HTTP %d%s"
+                  % (e.code, (" -> " + loc) if loc else ""),
+                  file=sys.stderr)
+            sys.exit(1)
         try:
             payload = json.loads(e.read().decode("utf-8"))
         except Exception:
@@ -468,6 +595,15 @@ def req(cfg, method, path, body=None, base=None):
 # construction is: sha256("clack-relay-identity-v1" || ":" || n_be || ":"
 # || e_be), displayed as "sha256:<first 16 hex chars>", where n_be / e_be
 # are the minimal big-endian encodings of the "n" / "e" hex fields.
+#
+# Trust boundary (Flint review F5): TLS is the primary server
+# authentication -- your https:// origin. The pinned key is a second
+# layer: it catches a relay that changed keys and stops unsophisticated
+# impersonators, but it does not by itself prove the connection is direct.
+# A determined intermediary that can reach the genuine relay can proxy the
+# challenge and return a valid proof. The CLI enforces the pin on every
+# authenticated request and never follows redirects with credentials; it
+# does not claim the nonce challenge authenticates the channel.
 
 _IDENTITY_FP_DOMAIN = b"clack-relay-identity-v1"
 
@@ -503,24 +639,48 @@ def relay_identity_verify(pubkey, nonce_hex, signature_b64):
 def fetch_relay_identity(relay_url):
     """Fetch and verify the relay's identity.
 
+    Strict (Flint review F3): the proof must answer OUR challenge -- the
+    echoed nonce must equal the locally generated one exactly, the
+    algorithm field must be the expected value, and the signature is
+    verified over the local nonce bytes, not the echoed value. A recorded
+    valid proof for a different challenge is rejected even though its
+    signature is genuine.
+
     Returns (fingerprint, pubkey). Raises on transport/HTTP errors other
     than 503 (relay has no identity key), in which case returns (None, None)
-    and the caller must warn loudly.
+    and the caller must fail closed when a pin exists (F4).
     """
     nonce = os.urandom(32).hex()
     try:
-        with urllib.request.urlopen(
-            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
-        ) as resp:
+        with _open(relay_url + "/v1/identity?nonce=" + nonce,
+                   timeout=30) as resp:
             ident = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 503:
             return None, None
         raise
+    if not isinstance(ident, dict):
+        raise ValueError("relay identity response is not a JSON object")
+    if ident.get("nonce") != nonce:
+        raise ValueError("relay identity proof answers a different challenge")
+    if ident.get("algorithm") != "rsassa-pkcs1-v1_5-sha256":
+        raise ValueError("relay identity uses unexpected algorithm %r"
+                         % (ident.get("algorithm"),))
     pubkey = ident.get("public_key")
-    if not pubkey or "n" not in pubkey or "e" not in pubkey:
+    if not isinstance(pubkey, dict):
         raise ValueError("relay identity response has no public_key")
-    if not relay_identity_verify(pubkey, ident["nonce"], ident["signature"]):
+    for field in ("n", "e"):
+        try:
+            val = int(pubkey[field], 16)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("relay identity public_key has bad %r field"
+                             % field)
+        if val <= 0:
+            raise ValueError("relay identity public_key has non-positive %r"
+                             % field)
+    if not ident.get("signature"):
+        raise ValueError("relay identity response has no signature")
+    if not relay_identity_verify(pubkey, nonce, ident["signature"]):
         raise ValueError("relay identity signature verification failed")
     return relay_identity_fingerprint(pubkey), pubkey
 
@@ -531,8 +691,9 @@ def check_relay_identity(relay_url, cfg):
     Fetches the relay's stable identity key, verifies the nonce signature
     against it, and enforces the pinned fingerprint when the config already
     has one. Returns the fingerprint (or None when the relay has no
-    identity key). Aborts the process on pin mismatch -- a changed relay
-    key is never silently accepted.
+    identity key and no pin is stored). Aborts the process on pin mismatch
+    -- a changed relay key is never silently accepted -- and when the
+    identity service is unavailable but a pin exists (F4: no downgrade).
     """
     try:
         fingerprint, _pubkey = fetch_relay_identity(relay_url)
@@ -544,6 +705,14 @@ def check_relay_identity(relay_url, cfg):
         print("could not verify relay identity: %s" % e, file=sys.stderr)
         sys.exit(1)
     if fingerprint is None:
+        # Relay has no identity key (503). A stored pin is never silently
+        # downgraded to unauthenticated onboarding (Flint review F4).
+        pinned = (cfg or {}).get("relay_identity_fingerprint")
+        if pinned:
+            print("relay identity unavailable (no identity key) but this "
+                  "config pins %s; aborting rather than downgrading to "
+                  "unauthenticated onboarding" % pinned, file=sys.stderr)
+            sys.exit(1)
         return None
     pinned = (cfg or {}).get("relay_identity_fingerprint")
     if pinned and pinned != fingerprint:
@@ -1030,8 +1199,10 @@ def main():
     rv.add_argument("invite_id")
 
     args = ap.parse_args()
-    global _selected_peer
+    global _selected_peer, _config_path
     _selected_peer = args.peer
+    # TOFU pin persistence target for _ensure_origin_verified (F1).
+    _config_path = args.config
 
     if args.cmd in ("keygen", "redeem", "enroll"):
         # These manage the identity config file itself; no prior config needed.

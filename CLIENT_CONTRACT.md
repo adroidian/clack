@@ -112,18 +112,33 @@ relay's identity with a fresh-nonce challenge:
 1. Generate 16–64 random bytes, hex-encode them → `<nonce>`.
 2. `GET /v1/identity?nonce=<nonce>` — **no auth header, no redirects**
    (do not use curl `-L`; a 3xx here is a failure, not a detour).
-3. You receive `{"nonce":"<echo>","algorithm":"rsassa-pkcs1-v1_5-sha256","signature":"<base64>"}`.
-4. Verify: RSA-verify `signature` over the raw nonce bytes with the pinned
-   relay signing public key (`relay-signing-pub.pem` in the bundle, also
-   delivered out-of-band). With openssl:
-   `echo <nonce> | xxd -r -p | openssl dgst -sha256 -verify relay-signing-pub.pem -signature <(echo <signature> | base64 -d)`
-5. Only if the signature verifies AND the echoed nonce equals yours, send
-   authenticated requests. If it fails, stop — do not retry with the bearer
-   token, do not follow redirects.
+3. You receive `{"nonce":"<echo>","algorithm":"rsassa-pkcs1-v1_5-sha256","signature":"<base64>","public_key":{"n":"<hex>","e":"<hex>"}}`.
+4. Check the echoed nonce equals yours EXACTLY — a valid signature over a
+   different nonce is a replayed proof, not a proof — and check the
+   `algorithm` field matches. Then RSA-verify `signature` over the raw
+   nonce bytes with the relay's identity public key.
+5. Fingerprint the *public key* (stable across runs), not the per-nonce
+   signature: `sha256("clack-relay-identity-v1" || ":" || n_be || ":" ||
+   e_be)`, displayed as `sha256:<first 16 hex chars>`, where n_be / e_be
+   are the minimal big-endian encodings of the hex fields. Confirm once
+   out-of-band, pin the fingerprint, and compare on every later run — a
+   changed key is never silently accepted.
+6. Only if everything above passes, send authenticated requests. If it
+   fails, stop — do not retry with the bearer token, do not follow
+   redirects.
 
-The signing key is dedicated to identity proofs (never used for tokens or
-message content). Re-run the challenge whenever the base URL changes or your
-session restarts.
+### What the pin does and does not prove
+
+The primary server authentication is TLS: your `https://` origin. The
+pinned relay key is a second layer — it catches a relay that changed keys
+and stops an unsophisticated impersonator. It does NOT by itself prove your
+connection reaches the real relay: a determined intermediary that can reach
+the genuine relay can proxy your challenge and hand you back a valid proof.
+Treat a passing check as "the relay key I expect answered", not "my
+connection is direct". The reference CLI enforces the pin on every
+authenticated request and never follows redirects with credentials; on a
+pin mismatch — or an unavailable identity service once a pin exists — it
+aborts instead of sending your token.
 
 ## Base URL
 
@@ -201,8 +216,10 @@ curl "https://<base>/v1/identity?nonce=$NONCE"
    "public_key":{"n":"<hex>","e":"<hex>"}}
 ```
 
-Verify `signature` over the raw nonce bytes against the returned
-`public_key` — this proves the relay holds the private key. Then
+Verify the echoed `nonce` equals yours exactly and `algorithm` is
+`rsassa-pkcs1-v1_5-sha256`; then verify `signature` over the raw nonce
+bytes against the returned `public_key` — this proves the relay holds the
+private key. Then
 fingerprint the *public key* (stable across runs) for TOFU: `sha256(
 "clack-relay-identity-v1" || ":" || n_be || ":" || e_be)`, displayed as
 `sha256:<first 16 hex chars>`, where `n_be` / `e_be` are the minimal
