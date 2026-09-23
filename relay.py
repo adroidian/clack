@@ -28,7 +28,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.10"
+VERSION = "0.2.11"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -2060,9 +2060,12 @@ def main():
     load_identity_key(cfg)
     _install_signal_trap()
     port = int(cfg.get("port", 18802))
+    bind = cfg.get("bind", "127.0.0.1")
+    if not isinstance(bind, str) or not bind:
+        raise SystemExit("clack relay: config 'bind' must be a non-empty string")
     init_db(cfg)
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print("clack relay listening on 127.0.0.1:%d (peers: %s)" % (port, ",".join(sorted(peer_names))), flush=True)
+    server = ThreadingHTTPServer((bind, port), Handler)
+    print("clack relay listening on %s:%d (peers: %s)" % (bind, port, ",".join(sorted(peer_names))), flush=True)
     server.serve_forever()
 
 
