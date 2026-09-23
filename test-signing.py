@@ -270,6 +270,10 @@ def main():
         run_null_key()
         run_persistence()
         run_prune_and_cap()
+        run_key_validation()
+        run_legacy_gate()
+        run_rate_budget()
+        run_delayed_body()
         run_cli_round_trip()
         run_benchmark()
     finally:
@@ -485,7 +489,7 @@ def run_prune_and_cap():
         time.sleep(1)
     check(gone, "sweep prunes expired nonces, keeps live", rows)
 
-    # --- hard-cap eviction (unit test on _nonce_record, small cap) ---
+    # --- nonce store: fail closed at capacity, never evict live (R2) -------
     con = sqlite3.connect(":memory:")
     con.execute("CREATE TABLE seen_nonces(nonce TEXT PRIMARY KEY,"
                 " peer TEXT NOT NULL, expires_at REAL NOT NULL)")
@@ -493,24 +497,47 @@ def run_prune_and_cap():
     _rm.NONCE_STORE_CAP = 100
     try:
         base = time.time()
-        for i in range(150):
-            replayed = _rm._nonce_record(
-                con, "cap-%d" % i, "p", base + i)
-            assert not replayed, "unexpected replay at %d" % i
+        res = [_rm._nonce_record(con, "cap-%d" % i, "p", base + 3600 + i)
+               for i in range(150)]
         n = con.execute("SELECT COUNT(*) FROM seen_nonces").fetchone()[0]
-        oldest = con.execute(
-            "SELECT nonce FROM seen_nonces ORDER BY expires_at ASC LIMIT 1"
-        ).fetchone()[0]
+        # a live nonce recorded before capacity pressure is still known:
+        # the replay guarantee must not depend on load
+        still = _rm._nonce_record(con, "cap-50", "p", base + 3650)
         # duplicate insert reports replay and stores nothing new
-        dup = _rm._nonce_record(con, "cap-149", "p", base + 149)
+        dup = _rm._nonce_record(con, "cap-99", "p", base + 3699)
         n2 = con.execute("SELECT COUNT(*) FROM seen_nonces").fetchone()[0]
+        # expired rows are pruned to make room for a fresh nonce: use a
+        # second store with 98 live + 2 expired rows at cap; the new
+        # insert reaps the expired pair and lands.
+        con2 = sqlite3.connect(":memory:")
+        con2.execute("CREATE TABLE seen_nonces(nonce TEXT PRIMARY KEY,"
+                     " peer TEXT NOT NULL, expires_at REAL NOT NULL)")
+        base2 = time.time()
+        for i in range(98):
+            assert _rm._nonce_record(
+                con2, "k-%d" % i, "p", base2 + 3600) == "recorded"
+        con2.execute("INSERT INTO seen_nonces(nonce, peer, expires_at)"
+                     " VALUES(?,?,?)", ("old-1", "p", base2 - 10))
+        con2.execute("INSERT INTO seen_nonces(nonce, peer, expires_at)"
+                     " VALUES(?,?,?)", ("old-2", "p", base2 - 5))
+        con2.commit()
+        room = _rm._nonce_record(con2, "k-new", "p", base2 + 7200)
+        n3 = con2.execute("SELECT COUNT(*) FROM seen_nonces").fetchone()[0]
+        con2.close()
     finally:
         _rm.NONCE_STORE_CAP = old_cap
         con.close()
+    check(all(r == "recorded" for r in res[:100]),
+          "nonce store records up to cap", res[99])
+    check(all(r == "full" for r in res[100:]),
+          "nonce store refuses new requests at cap (fail closed)", res[100])
     check(n <= 100, "hard cap enforced (n=%d <= 100)" % n, n)
-    check(oldest != "cap-0", "oldest rows evicted first", oldest)
-    check(dup and n2 == n, "duplicate nonce -> replay, no growth",
+    check(still == "replay",
+          "R2 live nonce still rejected under capacity pressure", still)
+    check(dup == "replay" and n2 == n, "duplicate nonce -> replay, no growth",
           (dup, n2))
+    check(room == "recorded" and n3 == 99,
+          "expired rows pruned to make room", (room, n3))
 
 
 def run_cli_round_trip():
@@ -523,10 +550,14 @@ def run_cli_round_trip():
         capture_output=True, text=True, timeout=60)
     check(r.returncode == 0, "CLI keygen exit 0", r.stderr[-200:])
     cfg = json.load(open(cfgp))
+    # POSIX mode bits are meaningless on Windows (ACLs govern access);
+    # Flint's review confirmed the synthetic ACL was owner-only there.
+    mode_ok = (os.name == "nt" or
+               oct(os.stat(cfg["identity_privkey_path"]).st_mode & 0o777)
+               == "0o600")
     check(cfg.get("identity_privkey_path") == os.path.join(d, "cli.key")
           and "identity_privkey" not in cfg
-          and oct(os.stat(cfg["identity_privkey_path"]).st_mode & 0o777)
-          == "0o600",
+          and mode_ok,
           "CLI key in separate mode-600 file, not inline", str(cfg)[:120])
     r = subprocess.run(
         [sys.executable, CLI, "--config", cfgp, "enroll", "--name", "clichat",
@@ -553,6 +584,125 @@ def run_cli_round_trip():
         capture_output=True, text=True, timeout=60)
     check(r.returncode == 0, "CLI poll auto-signed exit 0",
           r.stderr[-200:])
+
+
+def run_key_validation():
+    """R5: small-order / non-prime-order Ed25519 keys are rejected."""
+    seed, pub = _ed.keygen()
+    check(_ed.is_valid_pubkey(pub), "R5 canonical keygen key accepted")
+    lo = bytes([1]) + bytes(31)
+    check(not _ed.is_valid_pubkey(lo), "R5 low-order key rejected")
+    check(not _ed.is_valid_pubkey(bytes(32)), "R5 all-zero key rejected")
+    check(not _ed.is_valid_pubkey(b"short"), "R5 wrong-length key rejected")
+    # The raw verifier still admits the trivial forgery -- that is why the
+    # gate exists; enrollment must refuse the key regardless.
+    check(_ed.verify(lo, lo + bytes(32), b"m1")
+          and _ed.verify(lo, lo + bytes(32), b"m2"),
+          "R5 PoC: raw verifier accepts trivial sig for two messages")
+    # Enrollment with the low-order key: the proof verifies, the key must not.
+    code, ch = call(None, "POST", "/v1/enroll/challenge", b"{}")[:2]
+    ch = json.loads(ch)
+    assert code == 200, ch
+    nonce = b64u_decode(ch["nonce"])
+    body = json.dumps(
+        {"identity_pubkey": b64u_encode(lo), "name": "loworder",
+         "proof": {"nonce": b64u_encode(nonce),
+                   "signature": b64u_encode(lo + bytes(32))}}).encode()
+    code, out = call(None, "POST", "/v1/enroll", body)[:2]
+    check(code == 400 and err_of(out) == "bad_identity",
+          "R5 enroll rejects low-order key", "%s %s" % (code, out[:80]))
+    # A pre-fix row holding a bad key fails closed at request time.
+    tok = "badkey-token-1"
+    con = sqlite3.connect(os.path.join(TMPD, "relay.db"))
+    try:
+        con.execute(
+            "INSERT INTO peers(name, token_hash, created_at, identity_pubkey,"
+            " enroll_gate) VALUES(?,?,?,?,?)",
+            ("badkey", hashlib.sha256(tok.encode()).hexdigest(),
+             time.time(), b64u_encode(lo), "open"))
+        con.commit()
+    finally:
+        con.close()
+    code, out = call(
+        tok, "POST", "/v1/peers", b"", peer="badkey",
+        headers={"X-Clack-Scheme": "1", "X-Clack-Key": "badkey",
+                 "X-Clack-Nonce": "%d:%s" % (int(time.time()),
+                                             secrets.token_hex(16)),
+                 "X-Clack-Sig": "00" * 64})[:2]
+    check(code == 401 and err_of(out) == "upgrade_required",
+          "R5 stored low-order key fails closed", "%s %s" % (code, out[:80]))
+
+
+def run_legacy_gate():
+    """R6: legacy invite endpoints honor the enrollment gate.
+
+    The scratch relay runs enrollment=open, so /v1/invites/challenge and
+    /v1/invites/redeem must refuse with invite_not_allowed."""
+    code, out = call(None, "POST", "/v1/invites/challenge",
+                     json.dumps({"invite_id": "nope"}).encode())[:2]
+    check(code == 400 and err_of(out) == "invite_not_allowed",
+          "R6 legacy challenge honors gate", "%s %s" % (code, out[:60]))
+    code, out = call(None, "POST", "/v1/invites/redeem",
+                     json.dumps({"invite_id": "nope"}).encode())[:2]
+    check(code == 400 and err_of(out) == "invite_not_allowed",
+          "R6 legacy redeem honors gate", "%s %s" % (code, out[:60]))
+
+
+def run_rate_budget():
+    """R4: unsigned garbage on a stolen bearer must not burn the peer's
+    60/min budget -- the budget is charged only after signature verify."""
+    bob_tok, _ = enroll_open("ratebob")
+    bad = 0
+    for _ in range(70):
+        code, _ = call(bob_tok, "GET", "/v1/peers", None)[:2]
+        if code == 401:
+            bad += 1
+    check(bad == 70, "R4 unsigned attempts are 401s, never 429", bad)
+    body = json.dumps({"id": str(uuid.uuid4()), "to": "alice",
+                       "text": "x"}).encode()
+    code, out = call(bob_tok, "POST", "/v1/send", body, peer="ratebob")[:2]
+    check(code == 200,
+          "R4 signed request still within budget after unsigned spam",
+          "%s %s" % (code, out[:80]))
+
+
+def run_delayed_body():
+    """R3: a request whose body arrives after its nonce expired is rejected
+    and never recorded -- freshness is rechecked after the client-paced
+    body read, immediately before the atomic nonce record."""
+    import socket
+    tok, _ = enroll_open("slowbob")
+    ts = int(time.time()) - 599  # just inside the 600s window at send time
+    nonce = "%d:%s" % (ts, secrets.token_hex(16))
+    body = json.dumps({"id": str(uuid.uuid4()), "to": "alice",
+                       "text": "delayed"}).encode()
+    hdrs = sign_headers("slowbob", "POST", "/v1/send", body, nonce=nonce)
+    head = ("POST /v1/send HTTP/1.1\r\nHost: x\r\n"
+            "Authorization: Bearer %s\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %d\r\n"
+            "X-Clack-Scheme: 1\r\nX-Clack-Key: slowbob\r\n"
+            "X-Clack-Nonce: %s\r\nX-Clack-Sig: %s\r\n"
+            "Connection: close\r\n\r\n"
+            % (tok, len(body), nonce, hdrs["X-Clack-Sig"]))
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=30)
+    try:
+        s.sendall(head.encode())
+        # Cross the expiry boundary while the body is "in flight".
+        time.sleep(3)
+        s.sendall(body)
+        resp = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+    finally:
+        s.close()
+    status = resp.split(b"\r\n", 1)[0]
+    check(b"401" in status and b"stale_nonce" in resp,
+          "R3 delayed body -> 401 stale_nonce, never recorded",
+          status[:60])
 
 
 def run_benchmark():

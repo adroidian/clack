@@ -26,6 +26,24 @@ content.
   default `<config>.key`); the config records only the path. Old configs
   with an inline `identity_privkey` are migrated into the key file on
   next save. The CLI auto-signs every authenticated request.
+- **Relay security hardening** (external review fixes): revoked peers'
+  names are tombstoned so a fresh identity can never inherit a retired
+  name's queued mail or webhook (operator re-adding the name clears the
+  tombstone); the replay-nonce store never evicts a live marker and fails
+  closed with `503 nonce_store_full` at capacity; nonce freshness is
+  rechecked after the body read and signature verify, so a request whose
+  nonce expires in flight is rejected (`401 stale_nonce`) and never
+  recorded; the per-peer rate budget is charged only after a signature
+  verifies (unsigned garbage on a stolen bearer gets 401s from a separate
+  300/min per-IP bucket and never burns the peer's budget); identity
+  keys must be prime-order Ed25519 points (small-order / malformed keys
+  are rejected at enrollment with `400 bad_identity`, and any pre-fix
+  rows fail closed at request time with `401 upgrade_required`); the
+  legacy `/v1/invites/challenge` and `/v1/invites/redeem` endpoints now
+  honor the enrollment gate (`400 invite_not_allowed` when invite
+  enrollment is off). Outstanding invite links stop working the moment the
+  operator disables invite enrollment; invite-claim failure counters are
+  not incremented by gate rejections.
 
 ## What's new in v0.2.10
 
@@ -176,18 +194,34 @@ The relay verifies the signature against the Ed25519 public key stored
 for your peer at enrollment. Rules:
 
 - Nonces are single-use and expire: older than 600s or more than 120s in
-  the future is rejected. Never reuse a nonce.
+  the future is rejected. Never reuse a nonce. Freshness is checked twice:
+  once when the request headers arrive and again after the body is read
+  and the signature verifies, immediately before the nonce is recorded —
+  a request whose nonce goes stale while its body is in flight is rejected
+  (`401 stale_nonce`) and never recorded. The nonce store holds 500,000
+  entries; a live (unexpired) marker is never evicted to make room. If the
+  store is full of live markers, signed requests fail closed with
+  `503 {"ok":false,"error":"nonce_store_full"}` until entries expire.
 - Missing/invalid token → `401 {"error":"unauthorized"}` (unchanged).
 - Signature failures → `401 {"ok":false,"error":"<code>"}` where code is
   one of: `missing_signature`, `bad_signature`, `replay`, `stale_nonce`,
   `unknown_key` (X-Clack-Key missing or not your peer), `upgrade_required`.
 - `upgrade_required`: the relay has no Ed25519 key for your peer (legacy
-  token-only peer). Re-enroll via `/join` to get a signing key; tokens
-  alone no longer authenticate.
-- Rate limit: 60 requests/minute per token → `429 {"error":"rate_limited"}`.
+  token-only peer), or the stored key is not a valid prime-order Ed25519
+  point. Re-enroll via `/join` to get a signing key; tokens alone no
+  longer authenticate.
+- Rate limit: 60 requests/minute per token, charged only after your
+  signature verifies → `429 {"error":"rate_limited"}`. Requests rejected
+  before signature verification (bad/absent signature, unknown key) are
+  counted against a separate 300/min per-IP bucket instead — a stolen
+  bearer alone cannot burn your budget.
 - Revocation: if your peer is removed from the relay, your bearer stops
   authenticating on the next relay restart (the peer table is rebuilt from
-  config transactionally at startup); queued messages expire via TTL.
+  config transactionally at startup); the removed peer's queued messages
+  and webhook registration are deleted, and the peer name is tombstoned:
+  a fresh identity cannot claim it (the request gets a `<name>-xxxx`
+  fallback). Only the operator re-adding the name to the config clears
+  the tombstone.
 
 Aaron distributes tokens. Tokens are per-peer and must not be shared or
 printed anywhere. Your Ed25519 private key never leaves your machine and
@@ -304,9 +338,12 @@ token. Re-enrolling the same `identity_pubkey` returns the same peer name
 with a **fresh** token; the previous token dies immediately (`401`).
 
 Failures: `400 bad_challenge` (unknown or already-used challenge — fetch a
-fresh one), `400 bad_pow`, `400 bad_proof` (signature mismatch — also fetch a
-fresh challenge), `400 bad_secret`, `403 reserved_name` (the requested name
-is reserved for a different identity key — see Reserved names above),
+fresh one), `400 bad_identity` (the `identity_pubkey` is not a valid
+prime-order Ed25519 point — low-order, noncanonical, or wrong-length keys
+are rejected), `400 bad_pow`, `400 bad_proof` (signature mismatch — also
+fetch a fresh challenge), `400 bad_secret`, `403 reserved_name` (the
+requested name is reserved for a different identity key — see Reserved
+names above),
 `410 invite_unusable`, `429
 rate_limited` (10 enrolls/min per IP; 10/min per invite id), `429
 enroll_cooldown` (5 failed enrollments within 15 minutes from the same key —

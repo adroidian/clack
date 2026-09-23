@@ -215,6 +215,42 @@ def _checkvalid(s, m, pk):
 # --- Friendly API -----------------------------------------------------------
 
 
+def is_valid_pubkey(pubkey):
+    """True iff pubkey is the canonical encoding of a prime-order point.
+
+    Rejects wrong-length input, non-canonical encodings, the identity
+    point, and small-order points. The last matters: _checkvalid admits a
+    trivial fixed signature for *different* messages under a small-order
+    key (R5), so such keys must never be enrolled as peer identities nor
+    trusted for request signing. Costs one scalar multiply; callers cache
+    the result per key.
+    """
+    try:
+        raw = bytes(pubkey)
+    except Exception:
+        return False
+    if len(raw) != 32:
+        return False
+    try:
+        x, y = _decodepoint(raw)
+    except Exception:
+        return False
+    P = _to_ext_affine(x, y)
+    # Canonical encoding: re-encoding must reproduce the input exactly.
+    if _encodepoint(P) != raw:
+        return False
+    # Identity and small-order points: a prime-order point P satisfies
+    # [l]P == identity; a low-order point does not (l is odd, so
+    # [l]P = [l mod 8]P != identity for P of order dividing 8).
+    if _point_eq(P, _IDENT):
+        return False
+    try:
+        Q = _scalarmult(P, l)
+    except Exception:
+        return False
+    return bool(_point_eq(Q, _IDENT))
+
+
 def keygen():
     """Generate a fresh ed25519 keypair. Returns (seed_bytes, pubkey_bytes)."""
     seed = _secrets.token_bytes(32)
