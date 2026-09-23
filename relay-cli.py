@@ -575,6 +575,77 @@ def cmd_keygen(args):
     return 0
 
 
+def cmd_attach_key(args, cfg):
+    """Attach a fresh Ed25519 signing key to an existing client config.
+
+    Legacy token-only configs (no "kind") are converted to identity
+    configs (kind == IDENTITY_KIND) so the CLI auto-signs every request;
+    identity configs that lost their key file get a fresh keypair. The
+    operator must register the printed pubkey in the relay's
+    "identity_pubkeys" map before the relay will accept signed requests.
+    Idempotent: a config that already has a usable seed is left alone.
+    """
+    if is_identity_cfg(cfg) and signing_seed(cfg) is not None:
+        pub = b64u_decode(cfg["identity_pubkey"])
+        print("already has a signing key: %s" % args.config)
+        print("pubkey: %s" % b64u_encode(pub))
+        return 0
+
+    if is_identity_cfg(cfg):
+        # Identity config whose key file is missing/unreadable: fresh
+        # keypair, keep everything else (relay_url, peer_name, token...).
+        new_cfg = dict(cfg)
+        peer_name = new_cfg.get("peer_name")
+        if not peer_name:
+            print("identity config has no peer_name; cannot attach a key",
+                  file=sys.stderr)
+            return 1
+    else:
+        # Legacy token config: pick the peer, carry token + URL forward.
+        peers = cfg.get("peers") or {}
+        peer_name = args.peer
+        if peer_name and peer_name not in peers:
+            print("peer %r not in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        if not peer_name:
+            if len(peers) == 1:
+                peer_name = next(iter(peers))
+            else:
+                print("config has %d peers; pass --peer <name>" % len(peers),
+                      file=sys.stderr)
+                return 1
+        token = peers.get(peer_name)
+        if not token:
+            print("no token for peer %r in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        relay_url = (cfg.get("base_url") or cfg.get("relay_url")
+                     or "http://127.0.0.1:%d" % cfg.get("port", 18802))
+        new_cfg = {
+            "kind": IDENTITY_KIND,
+            "relay_url": relay_url.rstrip("/"),
+            "peer_name": peer_name,
+            "service_token": token
+        }
+        if cfg.get("user_agent"):
+            new_cfg["user_agent"] = cfg["user_agent"]
+        if cfg.get("relay_identity_fingerprint"):
+            new_cfg["relay_identity_fingerprint"] = \
+                cfg["relay_identity_fingerprint"]
+
+    seed, pub = keygen()
+    new_cfg["identity_pubkey"] = b64u_encode(pub)
+    _save_identity_config(args.config, new_cfg, seed,
+                          key_path=getattr(args, "key_path", None))
+    print("signing key attached: %s (peer %s)" % (args.config, peer_name))
+    print("private key: %s (mode 600; never leaves this machine)"
+          % new_cfg["identity_privkey_path"])
+    print("pubkey for the relay operator's identity_pubkeys map:")
+    print(b64u_encode(pub))
+    return 0
+
+
 def parse_link(link):
     link = link.strip()
     if "#" not in link:
@@ -931,6 +1002,13 @@ def main():
                    help="private key file path (mode 600; default: <config>.key)")
     k.add_argument("--user-agent", default=None)
 
+    ak = sub.add_parser("attach-key",
+                        help="attach an ed25519 signing key to a legacy "
+                             "token config (prints the pubkey for the relay "
+                             "operator's identity_pubkeys map)")
+    ak.add_argument("--key-path", default=None,
+                    help="private key file path (mode 600; default: <config>.key)")
+
     m = sub.add_parser("mint-invite", help="mint a shareable join link")
     m.add_argument("--max-uses", type=int, default=1)
     m.add_argument("--expiry-hours", type=float, default=24.0)
@@ -1003,6 +1081,8 @@ def main():
         return cmd_invite_list(args, cfg)
     elif args.cmd == "invite-revoke":
         return cmd_invite_revoke(args, cfg)
+    elif args.cmd == "attach-key":
+        return cmd_attach_key(args, cfg)
 
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if 200 <= code < 300 else 1
