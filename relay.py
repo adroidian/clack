@@ -2275,7 +2275,11 @@ def _install_signal_trap():
             pass
         os.kill(os.getpid(), signum)
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    # SIGHUP does not exist on Windows; getattr keeps the tuple
+    # construction itself from raising before the per-signal guard runs.
+    _termsigs = [s for s in (signal.SIGTERM, signal.SIGINT,
+                             getattr(signal, "SIGHUP", None)) if s is not None]
+    for sig in _termsigs:
         try:
             signal.signal(sig, _on_term)
         except (OSError, ValueError):
