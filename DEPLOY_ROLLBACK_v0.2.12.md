@@ -6,7 +6,7 @@ itself awaits Aaron's go-ahead + Clingy Bear's signing key.
 ## Artifacts
 
 - Deploy: `dist/clack-relay-bundle-v0.2.12.tar.gz`
-  sha256 `dc20789dd6840025f488c0f80fa9ab2a2efb3d3912e7927eb63472e6ed6d4b1d`
+  sha256 `23c62cd5cd1f8abbbdaec9e223b951615a6beee275e398082a6960a6638f640a`
   (verify with `sha256sum` before deploying; must match this file)
 - Rollback: `dist/clack-relay-bundle-v0.2.11.tar.gz` (known-good, currently
   running in production)

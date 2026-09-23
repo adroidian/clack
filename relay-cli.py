@@ -471,7 +471,12 @@ def _open(req, timeout):
     return _opener.open(req, timeout=timeout)
 
 
-_verified_origins = {}  # origin -> "pinned" | "confirmed" | "tofu" | "unverified"
+_verified_origins = {}  # origin -> "pinned" | "confirmed"
+# Only positive verdicts are cached. A "tofu"/"unverified" verdict is never
+# cached because a pin can be established mid-process (redeem/enroll TOFU):
+# the next request must re-evaluate the now-pinned config instead of serving
+# a stale negative verdict and refusing to send. As a bonus, the pin is
+# re-validated against the live identity on every request until it is pinned.
 _config_path = None         # set by main(); TOFU pin persistence target
 
 
@@ -563,7 +568,8 @@ def _ensure_origin_verified(origin, cfg):
         print("WARNING: relay at %s has no identity key; continuing without "
               "relay authentication (no pin established)" % origin,
               file=sys.stderr)
-        _verified_origins[origin] = "unverified"
+        # Not cached: a pin established later in this process must take
+        # effect on the next request (see _verified_origins comment).
         return "unverified"
     if pinned and pinned != fingerprint:
         print("RELAY IDENTITY CHANGED: config pins %s but %s presents %s"
@@ -605,7 +611,8 @@ def _ensure_origin_verified(origin, cfg):
     print("pinned relay identity %s for %s (TOFU, first contact)"
           % (fingerprint, origin), file=sys.stderr)
     _persist_tofu_pin(cfg, fingerprint)
-    _verified_origins[origin] = "tofu"
+    # Not cached: the pin is now in cfg, so the next request re-evaluates
+    # and lands on "pinned" (a stale "tofu" here broke redeem/enroll hellos).
     return "tofu"
 
 

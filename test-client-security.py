@@ -372,6 +372,25 @@ def main():
         finally:
             _rc._config_path = None
 
+        # --- stale-cache: mid-process TOFU pin upgrades the verdict --------
+        # Reproduces the redeem/enroll hello bug: the challenge request ran
+        # tokenless and pinless (silent TOFU); after the pin landed in cfg
+        # the hello must see "pinned", not a stale "tofu" that refuses the
+        # fresh token.
+        _rc._verified_origins.clear()
+        cfg = {"base_url": REAL}  # tokenless, pinless: silent TOFU
+        with captured_stderr():
+            level = _rc._ensure_origin_verified(REAL, cfg)
+        check(level == "tofu", "mid-process pin: tokenless first contact is tofu",
+              level)
+        # cmd_redeem/cmd_enroll now hold a token AND the TOFU pin in cfg.
+        cfg["service_token"] = "tok"
+        cfg["relay_identity_fingerprint"] = real_fp
+        with captured_stderr():
+            level = _rc._ensure_origin_verified(REAL, cfg)
+        check(level == "pinned", "mid-process pin: verdict upgrades to pinned",
+              level)
+
         # --- F2: redirect on authenticated request fails closed --------------
         hb = fresh_handler("sink")
         srv_b, url_b = run_stub(hb)
