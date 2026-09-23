@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -28,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -49,6 +50,66 @@ PENDING_CAP = 500
 RETENTION = 7 * 86400
 RATE_PER_MIN = 60
 SWEEP_MIN_INTERVAL = 60.0
+
+# --- Mandatory Ed25519 request signing (v0.2.12) -------------------------------
+# Every authenticated request carries:
+#   X-Clack-Scheme: 1
+#   X-Clack-Key:    <peer name, must match the Bearer token's peer>
+#   X-Clack-Nonce:  <unix_seconds>:<32 hex chars random>
+#   X-Clack-Sig:    <hex Ed25519 signature>
+# over the canonical bytes:
+#   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
+# Unsigned endpoints: /health, GET /v1/identity, /join, /join/client, and the
+# pre-enrollment POSTs (/v1/invites/challenge, /v1/invites/redeem,
+# /v1/enroll/challenge, /v1/enroll). Everything else: Bearer + valid
+# signature, verified against the peer's stored Ed25519 identity_pubkey.
+SIGN_SCHEME_ID = "clack-ed25519-v1"
+NONCE_TTL = 600.0          # seconds a nonce stays valid (and is remembered)
+NONCE_FUTURE_SKEW = 120.0  # seconds of clock skew tolerated into the future
+NONCE_STORE_CAP = 100000   # hard cap on seen_nonces rows; oldest evicted
+NONCE_RAND_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+# Operator-supplied Ed25519 identity keys for config-managed peers, from the
+# "identity_pubkeys" config map: {peer_name: b64u(32-byte pubkey)}. This is
+# the upgrade path for token-only config peers -- re-read from config on
+# every restart, so removing a key downgrades the peer to upgrade_required.
+_IDENTITY_PUBKEYS = {}
+
+
+def _parse_identity_pubkeys(cfg):
+    """Strictly validate relay-config.json "identity_pubkeys".
+
+    Returns {name: canonical b64u pubkey}. Malformed entries raise
+    ValueError (startup refuses loudly, mirroring reserved_names)."""
+    raw = cfg.get("identity_pubkeys", {}) if cfg else {}
+    if not isinstance(raw, dict):
+        raise ValueError("identity_pubkeys must be an object, got %s"
+                         % type(raw).__name__)
+    peers = cfg.get("peers", {}) if cfg else {}
+    out = {}
+    for name, key_b64 in raw.items():
+        if name not in peers:
+            raise ValueError("identity_pubkeys entry %r is not a configured peer"
+                             % (name,))
+        try:
+            key = b64u_decode(key_b64)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("identity_pubkeys entry %r has a malformed key"
+                             % (name,))
+        if len(key) != 32:
+            raise ValueError("identity_pubkeys entry %r key is %d bytes, want 32"
+                             % (name, len(key)))
+        out[name] = b64u_encode(key)  # canonical form for comparison
+    return out
+
+
+def _init_identity_pubkeys(cfg):
+    global _IDENTITY_PUBKEYS
+    try:
+        _IDENTITY_PUBKEYS = _parse_identity_pubkeys(cfg)
+    except ValueError as e:
+        raise SystemExit("clack-relay: invalid identity_pubkeys: %s" % e)
+
 
 # --- Invite-link onboarding (v0.2.5, MVP) ------------------------------------
 # Contacts-first: an invitation introduces two independently controlled Muse
@@ -192,18 +253,41 @@ def init_db(cfg):
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_identity ON peers(identity_pubkey)"
     )
+    # v0.2.12: persistent seen-nonce store for request-signing replay
+    # protection. Rows expire NONCE_TTL after the nonce's timestamp; the
+    # sweep prunes them and inserts enforce NONCE_STORE_CAP.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS seen_nonces(
+               nonce TEXT PRIMARY KEY,
+               peer TEXT NOT NULL,
+               expires_at REAL NOT NULL)"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_nonces_exp ON seen_nonces(expires_at)"
+    )
     now = time.time()
     # Revocation-safe rebuild: peers removed from the config must lose
-    # authentication on restart. Only config-managed rows (identity_pubkey
-    # IS NULL) are rebuilt; invite-enrolled identity rows survive restarts.
+    # authentication on restart. Config-managed rows (enroll_gate='config',
+    # or legacy rows with no gate and no identity key) are rebuilt from the
+    # config; invite/pow/open-enrolled identity rows survive restarts.
     # Queued messages are left alone; they expire via TTL and are
     # undeliverable without auth.
+    #
+    # v0.2.12: config peers may carry an Ed25519 identity_pubkey from the
+    # "identity_pubkeys" config map -- the operator upgrade path for
+    # token-only peers. Keys are re-read from config every restart, so
+    # removing a key downgrades the peer back to upgrade_required.
     with conn:
-        conn.execute("DELETE FROM peers WHERE identity_pubkey IS NULL")
+        conn.execute(
+            "DELETE FROM peers WHERE enroll_gate='config' "
+            "OR (enroll_gate IS NULL AND identity_pubkey IS NULL)"
+        )
         conn.executemany(
-            "INSERT OR IGNORE INTO peers(name, token_hash, created_at, enroll_gate) VALUES(?,?,?,?)",
+            "INSERT INTO peers(name, token_hash, created_at, identity_pubkey, enroll_gate)"
+            " VALUES(?,?,?,?,?)",
             [
-                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now, "config")
+                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now,
+                 _IDENTITY_PUBKEYS.get(name), "config")
                 for name, token in cfg.get("peers", {}).items()
             ],
         )
@@ -258,6 +342,9 @@ def sweep(now):
             "DELETE FROM enroll_challenges WHERE expires_at <= ? OR (used != 0 AND created_at <= ?)",
             (now, now - 3600),
         )
+        # v0.2.12: drop expired seen nonces (replay window is NONCE_TTL
+        # past the nonce's own timestamp).
+        conn.execute("DELETE FROM seen_nonces WHERE expires_at <= ?", (now,))
         conn.commit()
 
 
@@ -773,11 +860,60 @@ def fetch_pending(recipient, now):
     ]
 
 
+def _nonce_record(conn, nonce, peer, expires_at):
+    """Record a verified nonce in the seen_nonces store.
+
+    Returns True when the nonce was already present (replay). Enforces
+    NONCE_STORE_CAP by evicting the oldest rows first; sweep() prunes
+    expired rows on its regular pass. Extracted for unit testing."""
+    if conn.execute(
+        "SELECT 1 FROM seen_nonces WHERE nonce=?", (nonce,)
+    ).fetchone():
+        return True
+    n = conn.execute("SELECT COUNT(*) FROM seen_nonces").fetchone()[0]
+    if n >= NONCE_STORE_CAP:
+        conn.execute(
+            """DELETE FROM seen_nonces WHERE nonce IN (
+                   SELECT nonce FROM seen_nonces
+                   ORDER BY expires_at ASC LIMIT ?)""",
+            (n - int(NONCE_STORE_CAP * 0.9) + 1,),
+        )
+    conn.execute(
+        "INSERT INTO seen_nonces(nonce, peer, expires_at) VALUES(?,?,?)",
+        (nonce, peer, expires_at),
+    )
+    conn.commit()
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClackRelay/" + VERSION
 
     def log_message(self, fmt, *args):  # keep logs token/text free
         pass
+
+    def setup(self):
+        # Raw request body cache: signature verification (v0.2.12) needs the
+        # exact bytes before the endpoint handlers parse them, and rfile is
+        # a one-shot stream. _read_body fills this once; _read_json parses
+        # from it.
+        self._body = None
+        super().setup()
+
+    def _read_body(self):
+        if self._body is None:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 2_000_000:
+                self._body = b""
+            else:
+                try:
+                    self._body = self.rfile.read(length)
+                except Exception:
+                    self._body = b""
+        return self._body
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode("utf-8")
@@ -788,17 +924,83 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            return None
-        if length <= 0 or length > 2_000_000:
+        raw = self._read_body()
+        if not raw:
             return None
         try:
-            raw = self.rfile.read(length)
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return None
+
+    def _verify_signature(self, peer):
+        """Mandatory Ed25519 request signing (v0.2.12).
+
+        Returns None when the request's signature verifies against the
+        peer's stored Ed25519 identity_pubkey, else a stable error code:
+        missing_signature | unknown_key | upgrade_required | stale_nonce |
+        bad_signature | replay. Never raises: malformed input maps to a
+        code, never a dropped connection."""
+        h = self.headers
+        if h.get("X-Clack-Scheme") != "1":
+            return "missing_signature"
+        key_name = h.get("X-Clack-Key")
+        if not key_name:
+            return "missing_signature"
+        if key_name != peer:
+            # The claimed key identity does not match the Bearer token's
+            # peer: unknown in this authentication context.
+            return "unknown_key"
+        with db_lock:
+            row = conn.execute(
+                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+            ).fetchone()
+        pub_b64 = row[0] if row else None
+        try:
+            pubkey = b64u_decode(pub_b64) if pub_b64 else b""
+        except (ValueError, TypeError, AttributeError):
+            pubkey = b""
+        if len(pubkey) != 32:
+            # No (or corrupt) Ed25519 key on file: the peer must re-enroll
+            # via /join to get one. Never silently bypass.
+            return "upgrade_required"
+        nonce = h.get("X-Clack-Nonce") or ""
+        ts_s, sep, rand = nonce.partition(":")
+        if not sep or not NONCE_RAND_RE.match(rand):
+            return "stale_nonce"
+        try:
+            ts = float(ts_s)
+        except ValueError:
+            return "stale_nonce"
+        now = time.time()
+        # isfinite rejects NaN ("nan" parses but defeats every comparison,
+        # silently passing the window check below).
+        if not math.isfinite(ts) or ts < now - NONCE_TTL or ts > now + NONCE_FUTURE_SKEW:
+            return "stale_nonce"
+        try:
+            sig = bytes.fromhex(h.get("X-Clack-Sig") or "")
+        except ValueError:
+            return "bad_signature"
+        if len(sig) != 64:
+            return "bad_signature"
+        parsed = urlparse(self.path)
+        path_q = parsed.path + ("?" + parsed.query if parsed.query else "")
+        body = self._read_body()
+        canon = (
+            SIGN_SCHEME_ID + "\n"
+            + self.command.upper() + "\n"
+            + path_q + "\n"
+            + hashlib.sha256(body).hexdigest() + "\n"
+            + nonce
+        ).encode("utf-8")
+        if not ed25519.verify(pubkey, sig, canon):
+            return "bad_signature"
+        # Atomic check-and-record: the nonce is marked seen only after a
+        # valid signature, so a bad signature can never burn someone else's
+        # nonce. The store is pruned by sweep() and hard-capped here.
+        with db_lock:
+            if _nonce_record(conn, nonce, peer, ts + NONCE_TTL):
+                return "replay"
+        return None
 
     def _require_auth(self):
         peer = auth_peer(self.headers)
@@ -807,6 +1009,10 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if not rate_ok(token_sha_of(self.headers)):
             self._json(429, {"error": "rate_limited"})
+            return None
+        sig_err = self._verify_signature(peer)
+        if sig_err is not None:
+            self._json(401, {"ok": False, "error": sig_err})
             return None
         return peer
 
@@ -876,7 +1082,17 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "n": 7,
                     "title": "Talk",
-                    "detail": "Use the service_token as a Bearer token: POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack to confirm handling.",
+                    "detail": "Use the service_token as a Bearer token AND sign every request "
+                    "with your Ed25519 key (v0.2.12+: signing is mandatory): "
+                    "X-Clack-Scheme: 1, X-Clack-Key: <your peer name>, "
+                    "X-Clack-Nonce: <unix_seconds>:<32 hex random>, "
+                    "X-Clack-Sig: hex(Ed25519_sign(seed, "
+                    "\"clack-ed25519-v1\\n\" + METHOD + \"\\n\" + path_and_query + \"\\n\" + "
+                    "sha256_hex(body) + \"\\n\" + nonce)). "
+                    "POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack "
+                    "to confirm handling. Unsigned requests get 401 missing_signature; "
+                    "peers with no stored key get 401 upgrade_required (re-enroll via /join "
+                    "to fix). Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
                 },
             ],
         }
@@ -920,6 +1136,20 @@ class Handler(BaseHTTPRequestHandler):
             "   POST " + base + "/v1/send to send, GET " + base + "/v1/poll?timeout=25"
             " to receive,\n"
             "   POST " + base + "/v1/ack to confirm.\n"
+            "   v0.2.12+: EVERY request must ALSO carry Ed25519 request\n"
+            "   signatures (mandatory, not optional):\n"
+            "     X-Clack-Scheme: 1\n"
+            "     X-Clack-Key: <your peer name>   (must match the Bearer peer)\n"
+            "     X-Clack-Nonce: <unix_seconds>:<32 hex random>\n"
+            "     X-Clack-Sig: hex(Ed25519_sign(seed,\n"
+            "       \"clack-ed25519-v1\\n\" + METHOD + \"\\n\" + path_and_query\n"
+            "       + \"\\n\" + sha256_hex(raw_body) + \"\\n\" + nonce))\n"
+            "   path_and_query is the path plus ?query when present; the empty\n"
+            "   body hashes as sha256 of zero bytes. Nonces older than 600s or\n"
+            "   more than 120s in the future are rejected, and each nonce is\n"
+            "   single-use. Missing/invalid signature -> 401 missing_signature /\n"
+            "   bad_signature / replay / stale_nonce; a peer with no stored\n"
+            "   Ed25519 key gets 401 upgrade_required (re-enroll to fix).\n"
             "4. Full protocol: CLIENT_CONTRACT.md in the clack-relay repo.\n"
             "\n"
             "Enrollment on this relay: " + gates + ".\n"
@@ -2057,6 +2287,7 @@ def main():
     cfg = load_config()
     relay_cfg = cfg
     _init_reserved_names(cfg)  # strict: malformed entries refuse startup
+    _init_identity_pubkeys(cfg)  # strict: malformed entries refuse startup
     load_identity_key(cfg)
     _install_signal_trap()
     port = int(cfg.get("port", 18802))

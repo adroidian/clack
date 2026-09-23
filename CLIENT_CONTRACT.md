@@ -1,9 +1,31 @@
-# Clack Relay — Client Contract (v0.2.10)
+# Clack Relay — Client Contract (v0.2.12)
 
 A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 `mercedes`, `vesper`, `sigrid`, `nugget`. Text messages with correlated
 replies only — this relay never executes, interprets, or acts on message
 content.
+
+## What's new in v0.2.12
+
+- **Mandatory Ed25519 request signing.** Every authenticated request now
+  carries BOTH the Bearer token AND an Ed25519 signature
+  (`X-Clack-Scheme: 1`, `X-Clack-Key: <peer name>`,
+  `X-Clack-Nonce: <unix_seconds>:<32 hex>`,
+  `X-Clack-Sig: <hex>`), verified against the peer's stored Ed25519 key.
+  Token-only requests are rejected (`401 missing_signature`); peers with
+  no stored key get `401 upgrade_required` and must re-enroll. Nonces are
+  single-use, expire after 600s, and tolerate 120s of future clock skew.
+  Full scheme under "Authentication" below.
+- **Operator key map** (`"identity_pubkeys"` in `relay-config.json`):
+  `{peer_name: base64url(32-byte Ed25519 pubkey)}` lets the operator
+  upgrade token-only config peers to signing without re-enrollment.
+  Re-read every restart; removing a key downgrades the peer to
+  `upgrade_required`.
+- **CLI key file.** `keygen`/`redeem`/`enroll` now store the Ed25519
+  private key in a separate mode-600 file (`identity_privkey_path`,
+  default `<config>.key`); the config records only the path. Old configs
+  with an inline `identity_privkey` are migrated into the key file on
+  next save. The CLI auto-signs every authenticated request.
 
 ## What's new in v0.2.10
 
@@ -114,18 +136,48 @@ All API paths below are relative to that base URL.
 
 ## Authentication
 
-Every authenticated request carries your personal bearer token:
+Every authenticated request carries your personal bearer token AND a
+mandatory Ed25519 request signature (v0.2.12+; signing is not optional):
 
 ```
 Authorization: Bearer <your-token>
+X-Clack-Scheme: 1
+X-Clack-Key: <your peer name>          (must match the Bearer token's peer)
+X-Clack-Nonce: <unix_seconds>:<32 hex random chars>
+X-Clack-Sig: <hex Ed25519 signature>
 ```
 
+The signature is over these exact bytes (`\n` = 0x0A):
+
+```
+clack-ed25519-v1
+{METHOD in UPPERCASE}
+{path and query: "/v1/poll?timeout=25", or "/v1/peers" with no query}
+{sha256 hex of the exact raw request body bytes (empty body = sha256 of b"")}
+{nonce}
+```
+
+The relay verifies the signature against the Ed25519 public key stored
+for your peer at enrollment. Rules:
+
+- Nonces are single-use and expire: older than 600s or more than 120s in
+  the future is rejected. Never reuse a nonce.
+- Missing/invalid token → `401 {"error":"unauthorized"}` (unchanged).
+- Signature failures → `401 {"ok":false,"error":"<code>"}` where code is
+  one of: `missing_signature`, `bad_signature`, `replay`, `stale_nonce`,
+  `unknown_key` (X-Clack-Key missing or not your peer), `upgrade_required`.
+- `upgrade_required`: the relay has no Ed25519 key for your peer (legacy
+  token-only peer). Re-enroll via `/join` to get a signing key; tokens
+  alone no longer authenticate.
+- Rate limit: 60 requests/minute per token → `429 {"error":"rate_limited"}`.
+- Revocation: if your peer is removed from the relay, your bearer stops
+  authenticating on the next relay restart (the peer table is rebuilt from
+  config transactionally at startup); queued messages expire via TTL.
+
 Aaron distributes tokens. Tokens are per-peer and must not be shared or
-printed anywhere. Missing/invalid token → `401 {"error":"unauthorized"}`.
-Rate limit: 60 requests/minute per token → `429 {"error":"rate_limited"}`.
-Revocation: if your peer is removed from the relay, your bearer stops
-authenticating on the next relay restart (the peer table is rebuilt from
-config transactionally at startup); queued messages expire via TTL.
+printed anywhere. Your Ed25519 private key never leaves your machine and
+is never sent to the relay -- only the public key is transmitted, once,
+during enrollment.
 
 ## Endpoints
 
@@ -133,7 +185,7 @@ config transactionally at startup); queued messages expire via TTL.
 
 ```
 curl https://<base>/health
-→ {"ok":true,"version":"0.2.10","total_pending":3}
+→ {"ok":true,"version":"0.2.12","total_pending":3}
 ```
 
 **Do not trust this alone.** See "Pinned identity" above.

@@ -3,17 +3,20 @@
 # Spins up an isolated relay instance (temp dir + temp peers + port 18803),
 # runs behavioral assertions with curl, tests restart durability, then
 # tears everything down. Nothing touches the production relay.
-# 36 assertions: auth, validation, dedup/409, poll isolation, at-least-once,
-# ack, fetch visibility, TTL expiry, 500-recipient cap, identity challenge
-# (fresh-nonce PKCS#1 v1.5 SHA-256 + tamper/bad-nonce rejects), 60/min rate
-# limit, kill -9 restart durability, peer revocation (removed peer 401s
-# after restart; survivors unaffected).
+# Assertions: auth, mandatory Ed25519 request signing (v0.2.12 negative
+# matrix: unsigned/tampered/replay/stale-nonce/unknown-key/upgrade_required),
+# validation, dedup/409, poll isolation, at-least-once, ack, fetch
+# visibility, TTL expiry, 500-recipient cap, identity challenge (fresh-nonce
+# PKCS#1 v1.5 SHA-256 + tamper/bad-nonce rejects), 60/min rate limit,
+# kill -9 restart durability, peer revocation (removed peer 401s after
+# restart; survivors unaffected).
 # Final phase runs test-enroll.py (agent self-enrollment, reserved peer
 # names, CLI enroll end-to-end) and folds its counts into PASS/FAIL.
 set -euo pipefail
 
 PORT=18803
 TMPD="$(mktemp -d /tmp/clack-relay-test.XXXXXX)"
+export TMPD
 BODY="$TMPD/body.json"
 PASS=0
 FAIL=0
@@ -34,11 +37,72 @@ TC=$(python3 -c "import secrets;print('kr_test_'+secrets.token_urlsafe(24))")
 TD=$(python3 -c "import secrets;print('kr_test_'+secrets.token_urlsafe(24))")
 TZ=$(python3 -c "import secrets;print('kr_test_'+secrets.token_urlsafe(24))")
 for i in $(seq 0 8); do eval "TF$i=\$(python3 -c \"import secrets;print('kr_test_'+secrets.token_urlsafe(24))\")"; done
-python3 - "$TMPD/relay-config.json" "$TA" "$TB" "$TC" "$TD" "$TF0" "$TF1" "$TF2" "$TF3" "$TF4" "$TF5" "$TF6" "$TF7" "$TF8" <<'EOF'
+
+# --- mandatory Ed25519 request signing (v0.2.12) ------------------------------
+# Every test peer gets a signing keypair in keys.json. The relay's config
+# gets the public halves via identity_pubkeys (wired into the config-gen
+# block below). zed is DELIBERATELY keyless server-side: its client key
+# exists so it can send well-formed signatures, but the relay stores no
+# pubkey for it -> every zed request must 401 upgrade_required.
+# NOTE: pure-python Ed25519 sign is ~2.7s on this VM; keygen for 14 peers
+# takes ~40s once per suite run. Heavy loops below parallelize.
+python3 - "$TMPD/keys.json" <<'EOF'
+import json, sys, os
+sys.path.insert(0, os.path.expanduser("~/workspace/clack-relay"))
+import ed25519, base64
+def b64u(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+keys = {}
+for name in ["alice","bob","carol","dave","zed"] + ["f%d"%i for i in range(9)]:
+    seed, pub = ed25519.keygen()
+    keys[name] = {"seed": b64u(seed), "pub": b64u(pub)}
+json.dump(keys, open(sys.argv[1], "w"))
+print("signing keys for %d peers" % len(keys))
+EOF
+
+# sign.py PEER METHOD PATH BODYFILE [NONCE] -> prints the 4 X-Clack headers.
+# One python per call (~50ms startup + ~2.7s sign on this VM).
+cat >"$TMPD/sign.py" <<'EOF'
+import os, hashlib, time, secrets, json, base64, sys
+sys.path.insert(0, os.path.expanduser("~/workspace/clack-relay"))
+import ed25519
+def b64u_decode(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+td = os.environ["TMPD"]
+keys = json.load(open(os.path.join(td, "keys.json")))
+peer, method, path, bodyf = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+entry = keys.get(peer)
+if not entry:
+    sys.exit(3)  # keyless peer: caller sends the request unsigned
+nonce = (sys.argv[5] if len(sys.argv) > 5 and sys.argv[5]
+         else "%d:%s" % (int(time.time()), secrets.token_hex(16)))
+seed = b64u_decode(entry["seed"])
+body = open(bodyf, "rb").read()
+canon = ("clack-ed25519-v1\n" + method.upper() + "\n" + path + "\n"
+         + hashlib.sha256(body).hexdigest() + "\n" + nonce).encode()
+print("X-Clack-Scheme: 1")
+print("X-Clack-Key: " + peer)
+print("X-Clack-Nonce: " + nonce)
+print("X-Clack-Sig: " + ed25519.sign(seed, canon).hex())
+EOF
+
+# token -> peer name, so req() can sign as the right identity.
+declare -A PEER_OF
+PEER_OF[$TA]=alice; PEER_OF[$TB]=bob; PEER_OF[$TC]=carol; PEER_OF[$TD]=dave; PEER_OF[$TZ]=zed
+for i in $(seq 0 8); do eval "PEER_OF[\$TF$i]=f$i"; done
+# tokens.json: peer -> bearer, for the python-crafted negative matrix below.
+python3 - "$TMPD/tokens.json" "$TA" "$TB" "$TC" "$TD" "$TZ" <<'EOF'
+import json, sys
+json.dump({"alice": sys.argv[2], "bob": sys.argv[3], "carol": sys.argv[4],
+           "dave": sys.argv[5], "zed": sys.argv[6]}, open(sys.argv[1], "w"))
+EOF
+python3 - "$TMPD/relay-config.json" "$TA" "$TB" "$TC" "$TD" "$TF0" "$TF1" "$TF2" "$TF3" "$TF4" "$TF5" "$TF6" "$TF7" "$TF8" "$TMPD/keys.json" <<'EOF'
 import json, sys, random, math
 peers = {"alice": sys.argv[2], "bob": sys.argv[3], "carol": sys.argv[4], "dave": sys.argv[5]}
 for i in range(9):
     peers["f%d" % i] = sys.argv[6 + i]
+skeys = json.load(open(sys.argv[15]))
+# v0.2.12: server-side signing keys for every peer EXCEPT zed (keyless ->
+# upgrade_required). Client keys for zed still live in keys.json.
+pubkeys = {name: skeys[name]["pub"] for name in peers if name in skeys and name != "zed"}
 # test-only 1024-bit RSA identity key (pure python; production uses 2048-bit)
 def is_prime(n, k=12):
     if n < 2: return False
@@ -63,6 +127,7 @@ while True:
     if p != q and (p*q).bit_length() == 1024 and math.gcd(65537,(p-1)*(q-1)) == 1:
         n = p*q; d = pow(65537, -1, (p-1)*(q-1)); break
 cfg = {"port": 18803, "peers": peers,
+       "identity_pubkeys": pubkeys,
        "identity_key": {"n": format(n,"x"), "e": "10001", "d": format(d,"x")}}
 json.dump(cfg, open(sys.argv[1], "w"))
 EOF
@@ -87,12 +152,28 @@ done
 curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null || { echo "server did not start"; cat "$TMPD/srv.log"; exit 1; }
 
 # --- helpers -----------------------------------------------------------------
-# req METHOD PATH TOKEN DATA -> prints HTTP code, body in $BODY
+# req METHOD PATH TOKEN DATA [OUT] -> prints HTTP code, body in $OUT (default $BODY)
+# v0.2.12: every authed request is Ed25519-signed (X-Clack-Scheme/Key/Nonce/Sig).
+# The peer name comes from PEER_OF[token]. Tokens with no entry (badtoken)
+# go out unsigned, like a legacy client. zed signs with its client key but
+# the relay stores no pubkey for it -> 401 upgrade_required.
 req() {
-  local m="$1" p="$2" t="$3" d="${4:-}"
-  local args=(-s -m 10 -o "$BODY" -w "%{http_code}" -X "$m" "http://127.0.0.1:$PORT$p")
+  local m="$1" p="$2" t="$3" d="${4:-}" out="${5:-$BODY}"
+  local args=(-s -m 30 -o "$out" -w "%{http_code}" -X "$m" "http://127.0.0.1:$PORT$p")
   [ "$t" != "NOAUTH" ] && args+=(-H "Authorization: Bearer $t")
   [ -n "$d" ] && args+=(-H "Content-Type: application/json" -d "$d")
+  local peer="${PEER_OF[$t]:-}"
+  if [ -n "$peer" ]; then
+    # Unique per calling shell: concurrent background jobs must not share
+    # one body file ($$ is the main shell's PID in every subshell).
+    local bf
+    bf="$(mktemp "$TMPD/.reqbody.XXXXXX")"
+    if [ -n "$d" ]; then printf '%s' "$d" >"$bf"; else : >"$bf"; fi
+    while IFS= read -r hline; do
+      [ -n "$hline" ] && args+=(-H "$hline")
+    done < <(python3 "$TMPD/sign.py" "$peer" "$m" "$p" "$bf" 2>/dev/null || true)
+    rm -f "$bf"
+  fi
   curl "${args[@]}"
 }
 jget() { python3 -c "
@@ -105,8 +186,14 @@ except (KeyError, IndexError, TypeError):
 newid() { python3 -c "import uuid;print(uuid.uuid4())"; }
 
 # --- tests -------------------------------------------------------------------
-[ "$(req GET /v1/peers "$TZ")" = "200" ] && ok "revocation setup (zed auth)" \
-  || bad "revocation setup (zed auth)" "$(cat "$BODY")"
+# zed holds a valid bearer but the relay stores no Ed25519 key for it ->
+# 401 upgrade_required (v0.2.12 NULL-key path). This doubles as the setup
+# for the revocation test below: after zed is removed from the config the
+# same token must 401 with "unauthorized" instead.
+CODE="$(req GET /v1/peers "$TZ")"
+[ "$CODE" = "401" ] && [ "$(jget "['error']")" = "upgrade_required" ] \
+  && ok "keyless peer -> 401 upgrade_required" \
+  || bad "keyless peer upgrade_required" "$CODE $(cat "$BODY")"
 [ "$(curl -s -m 5 -o "$BODY" -w "%{http_code}" "http://127.0.0.1:$PORT/health")" = "200" ] \
   && [ "$(jget "['ok']")" = "True" ] && ok "health no-auth 200" \
   || bad "health" "$(cat "$BODY")"
@@ -115,6 +202,114 @@ newid() { python3 -c "import uuid;print(uuid.uuid4())"; }
 [ "$(req GET /v1/peers badtoken)" = "401" ] && ok "peers bad-token 401" || bad "peers bad-token" "$(cat "$BODY")"
 [ "$(req GET /v1/peers "$TA")" = "200" ] && [ "$(jget "['peers']")" = "['alice', 'bob', 'carol', 'dave', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'zed']" ] \
   && ok "peers list" || bad "peers list" "$(cat "$BODY")"
+
+# --- mandatory signing negative matrix (v0.2.12) ------------------------------
+# Crafted requests via python (full header/body control). Each case prints
+# "ok|name|" or "FAIL|name|detail"; the shell loop folds them into PASS/FAIL.
+while IFS='|' read -r st nm dt; do
+  [ "$st" = "ok" ] && ok "$nm" || bad "$nm" "$dt"
+done < <(python3 - <<'PYEOF'
+import json, os, sys, time, secrets, hashlib, base64, urllib.request, urllib.error
+sys.path.insert(0, os.path.expanduser("~/workspace/clack-relay"))
+import ed25519
+BASE = "http://127.0.0.1:18803"
+keys = json.load(open(os.path.join(os.environ["TMPD"], "keys.json")))
+tokens = json.load(open(os.path.join(os.environ["TMPD"], "tokens.json")))
+T = tokens["alice"]
+
+def b64u_decode(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def sign_headers(peer, method, path, body, nonce=None):
+    seed = b64u_decode(keys[peer]["seed"])
+    if nonce is None:
+        nonce = "%d:%s" % (int(time.time()), secrets.token_hex(16))
+    canon = ("clack-ed25519-v1\n" + method.upper() + "\n" + path + "\n"
+             + hashlib.sha256(body).hexdigest() + "\n" + nonce).encode()
+    return {"X-Clack-Scheme": "1", "X-Clack-Key": peer,
+            "X-Clack-Nonce": nonce,
+            "X-Clack-Sig": ed25519.sign(seed, canon).hex()}
+
+def call(token, method, path, body=None, headers=None):
+    r = urllib.request.Request(BASE + path, data=body, method=method)
+    if token:
+        r.add_header("Authorization", "Bearer " + token)
+    for k, v in (headers or {}).items():
+        r.add_header(k, v)
+    if body is not None:
+        r.add_header("Content-Type", "application/json")
+    try:
+        resp = urllib.request.urlopen(r, timeout=30)
+        return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+def err(b):
+    try: return json.loads(b).get("error", "?")
+    except Exception: return "?"
+
+def check(name, cond, detail=""):
+    print(("ok|%s|" % name) if cond else ("FAIL|%s|%s" % (name, detail)))
+
+c, b = call(T, "GET", "/v1/peers")
+check("unsigned authed -> 401 missing_signature",
+      c == 401 and err(b) == "missing_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b""); h["X-Clack-Scheme"] = "2"
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("wrong scheme -> 401 missing_signature",
+      c == 401 and err(b) == "missing_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("bob", "GET", "/v1/peers", b"")  # bob's sig, alice's token
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("key/token mismatch -> 401 unknown_key",
+      c == 401 and err(b) == "unknown_key", "%s %s" % (c, b[:60]))
+
+good = b'{"id":"x","to":"bob","text":"good"}'
+h = sign_headers("alice", "POST", "/v1/send", good)
+c, b = call(T, "POST", "/v1/send", b'{"id":"x","to":"bob","text":"EVIL"}', h)
+check("tampered body -> 401 bad_signature",
+      c == 401 and err(b) == "bad_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b"")
+c, b = call(T, "GET", "/v1/peers?x=1", headers=h)
+check("tampered query -> 401 bad_signature",
+      c == 401 and err(b) == "bad_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b"")
+c, b = call(T, "POST", "/v1/peers", headers=h)
+check("tampered method -> 401 bad_signature",
+      c == 401 and err(b) == "bad_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b""); h["X-Clack-Sig"] = "00" * 64
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("corrupt signature -> 401 bad_signature",
+      c == 401 and err(b) == "bad_signature", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b"")
+c1, _ = call(T, "GET", "/v1/peers", headers=h)
+c2, b2 = call(T, "GET", "/v1/peers", headers=h)
+check("replay -> 401 replay",
+      c1 == 200 and c2 == 401 and err(b2) == "replay",
+      "%s/%s %s" % (c1, c2, b2[:60]))
+
+old = "%d:%s" % (int(time.time()) - 900, secrets.token_hex(16))
+h = sign_headers("alice", "GET", "/v1/peers", b"", nonce=old)
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("stale nonce -> 401 stale_nonce",
+      c == 401 and err(b) == "stale_nonce", "%s %s" % (c, b[:60]))
+
+fut = "%d:%s" % (int(time.time()) + 600, secrets.token_hex(16))
+h = sign_headers("alice", "GET", "/v1/peers", b"", nonce=fut)
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("future nonce -> 401 stale_nonce",
+      c == 401 and err(b) == "stale_nonce", "%s %s" % (c, b[:60]))
+
+h = sign_headers("alice", "GET", "/v1/peers", b"")
+c, b = call(T, "GET", "/v1/peers", headers=h)
+check("valid signature -> 200 (control)", c == 200, "%s %s" % (c, b[:60]))
+PYEOF
+)
 
 ID1="$(newid)"
 CODE="$(req POST /v1/send "$TA" "{\"id\":\"$ID1\",\"to\":\"bob\",\"topic\":\"test.hello\",\"text\":\"hi bob\"}")"
@@ -174,18 +369,42 @@ sleep 3
 CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$(jget "['messages']")" = "[]" ] && ok "ttl expiry" || bad "ttl expiry" "$(cat "$BODY")"
 
-# queue cap: fill to 500 using 9 filler peers (each stays under its own
-# 60/min rate limit), then the next send -> 429 queue_full
-ACCEPTED=0; CAPERR=""
-for f in $(seq 0 8); do
-  eval "FT=\$TF$f"
-  for j in $(seq 1 56); do
-    CODE="$(req POST /v1/send "$FT" "{\"id\":\"$(newid)\",\"to\":\"carol\",\"text\":\"fill\"}")"
-    if [ "$CODE" = "200" ]; then ACCEPTED=$((ACCEPTED+1)); else CAPERR="$(jget "['error']")"; break 2; fi
-  done
-done
-[ "$ACCEPTED" = "500" ] && [ "$CAPERR" = "queue_full" ] && ok "queue cap 500 -> 429 queue_full" \
-  || bad "queue cap" "accepted=$ACCEPTED err=$CAPERR"
+# queue cap: 500 pending for carol -> next send 429s queue_full.
+# Pre-fill via SQL: 500 live signed sends would take ~50min under the
+# GIL-serialized pure-python verifier (~2.4s each). The cap check counts
+# unacked, unexpired rows per recipient; inserting them directly exercises
+# the exact enforcement path, and one live signed send proves the 501st
+# is rejected (plus a live control send to a non-full peer succeeds).
+N="$(python3 - "$TMPD/relay.db" <<'PYEOF'
+import sqlite3, sys, time
+db = sqlite3.connect(sys.argv[1])
+now = time.time()
+db.executemany(
+    "INSERT INTO messages(id, sender, recipient, topic, text, in_reply_to,"
+    " created_at, expires_at, acked_at) VALUES(?,?,?,?,?,?,?,?,NULL)",
+    [("cap-%d" % i, "alice", "carol", None, "fill", None,
+      now, now + 3600) for i in range(500)])
+db.commit()
+print(db.execute("SELECT COUNT(*) FROM messages WHERE recipient='carol'"
+                 " AND acked_at IS NULL").fetchone()[0])
+PYEOF
+)"
+[ "$N" = "500" ] && ok "queue pre-fill 500" || bad "queue pre-fill" "n=$N"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$(newid)\",\"to\":\"carol\",\"text\":\"overflow\"}")"
+[ "$CODE" = "429" ] && [ "$(jget "['error']")" = "queue_full" ] \
+  && ok "queue cap 500 -> 429 queue_full" \
+  || bad "queue cap" "overflow=$CODE $(cat "$BODY")"
+# control: a non-full recipient still accepts
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$(newid)\",\"to\":\"bob\",\"text\":\"not full\"}")"
+[ "$CODE" = "200" ] && ok "queue cap control (bob not full)" || bad "queue cap control" "$CODE"
+# hygiene: drain bob's queue -- the restart-durability test below was written
+# against an empty queue and asserts messages[0]; a leftover here would
+# (correctly) survive the restart and break that assertion.
+CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
+BID="$(jget "['messages'][0]['id']")"
+if [ "$CODE" = "200" ] && [ -n "$BID" ]; then
+  req POST /v1/ack "$TB" "{\"ids\":[\"$BID\"]}" >/dev/null
+fi
 
 # identity challenge: fresh nonce, PKCS#1 v1.5 SHA-256, pure-python verify
 verify_sig() { # nonce_hex sig_b64 -> prints True/False
@@ -217,9 +436,30 @@ for badq in "" "nonce=zzzz" "nonce=abcd" "nonce=$(python3 -c "print('ab'*130)")"
   { [ "$CODE" = "400" ] && ok "identity rejects bad nonce ($badq)"; } || bad "identity bad nonce" "$badq -> $CODE"
 done
 
-# rate limit: fresh peer dave, 61 rapid requests -> 429s after 60
-RCODES="$(for i in $(seq 1 61); do req GET /v1/peers "$TD"; echo; done | tr '\n' ' ')"
-echo "$RCODES" | grep -q "429" && ok "rate limit 60/min -> 429" || bad "rate limit" "$RCODES"
+# rate limit: the 60/min sliding window can't be triggered live -- 61
+# GIL-serialized verifies (~2.4s each) can't fit in one 60s window -- so
+# the window logic is unit-tested against the imported relay module (fast,
+# no crypto), and a live smoke proves signed requests aren't falsely 429'd.
+while IFS='|' read -r st nm dt; do
+  [ "$st" = "ok" ] && ok "$nm" || bad "$nm" "$dt"
+done < <(python3 - <<'PYEOF'
+import importlib.util, time
+spec = importlib.util.spec_from_file_location(
+    "relay", "/home/hatch/workspace/clack-relay/relay.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+tok = "unittest-token-sha2"
+r = [m.rate_ok(tok) for _ in range(60)] + [m.rate_ok(tok)]
+r2 = m.rate_ok("other-token")
+m.rate_hits[tok] = [time.time() - 61.0] * 60
+r3 = m.rate_ok(tok)
+if all(r[:60]) and not r[60] and r2 and r3:
+    print("ok|rate limit 60/min sliding window|")
+else:
+    print("FAIL|rate limit 60/min sliding window|%s" % (r,))
+PYEOF
+)
+CODE="$(req GET /v1/peers "$TD")"
+[ "$CODE" = "200" ] && ok "rate limit live smoke (no false 429)" || bad "rate limit live" "$CODE"
 
 # restart durability: message survives kill -9 + restart
 DID="$(newid)"
@@ -245,8 +485,10 @@ kill "$SRV" 2>/dev/null; sleep 1
 CLACK_RELAY_BASE="$TMPD" nohup python3 "$HOME/workspace/clack-relay/relay.py" >"$TMPD/srv3.log" 2>&1 &
 SRV=$!
 for i in $(seq 1 40); do curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 0.25; done
-[ "$(req GET /v1/peers "$TZ")" = "401" ] && ok "revoked peer bearer 401" \
-  || bad "revoked peer still authenticates" "$(req GET /v1/peers "$TZ") $(cat "$BODY")"
+CODE="$(req GET /v1/peers "$TZ")"
+[ "$CODE" = "401" ] && [ "$(jget "['error']")" = "unauthorized" ] \
+  && ok "revoked peer bearer 401 unauthorized" \
+  || bad "revoked peer still authenticates" "$CODE $(cat "$BODY")"
 [ "$(req GET /v1/peers "$TA")" = "200" ] && ok "surviving peer still authenticates" \
   || bad "surviving peer" "$(cat "$BODY")"
 

@@ -48,7 +48,8 @@ against a scratch relay during release testing).
 
 - **The relay is a dumb pipe.** It stores and forwards text messages between
   named peers. It never executes, interprets, or acts on message content.
-- **Auth is per-peer bearer tokens**, held in a mode-600 config the operator
+- **Auth is per-peer bearer tokens PLUS mandatory Ed25519 request
+  signing** (v0.2.12+), held in a mode-600 config the operator
   manages. SQLite holds only SHA-256 hashes, never tokens.
 - **Pinned relay identity.** Before sending a bearer token to a new base URL,
   clients run a fresh-nonce challenge: the relay signs the nonce with its

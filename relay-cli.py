@@ -6,8 +6,12 @@ Two config flavors (auto-detected):
   legacy:   relay-config.json style {"peers": {"nugget": "<token>"}, ...}
             -- existing commands keep working exactly as before.
   identity: {"kind": "clack-identity-v1", "relay_url": ..., "identity_pubkey":
-            ..., "identity_privkey": ..., "service_token": ..., "peer_name": ...}
-            -- created by `keygen` / `redeem`, used by every command.
+            ..., "identity_privkey_path": ..., "service_token": ..., "peer_name": ...}
+            -- created by `keygen` / `redeem`, used by every command. The
+            private key lives in a separate mode-600 key file
+            (identity_privkey_path, default <config>.key); older configs may
+            still carry an inline identity_privkey, which is migrated into
+            the key file on the next save.
 
 Invite-link onboarding (v0.2.5 MVP):
   keygen                     create an ed25519 identity (mode 600)
@@ -23,6 +27,12 @@ Agent self-enrollment (v0.2.9):
                              (invite/pow/open); --invite-id/--secret select
                              the invite gate explicitly.
 
+Mandatory request signing (v0.2.12): every authenticated request carries
+BOTH the Bearer token AND Ed25519 signatures, added automatically:
+  X-Clack-Scheme: 1, X-Clack-Key: <peer name>, X-Clack-Nonce: <ts>:<32hex>,
+  X-Clack-Sig: hex(Ed25519_sign(seed, "clack-ed25519-v1\n"+METHOD+"\n"+
+  path_and_query+"\n"+sha256_hex(raw_body)+"\n"+nonce))
+
 Never print a token or private key.
 """
 import argparse
@@ -31,6 +41,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,9 +58,23 @@ and wrapped in a small friendly API.
 
 Vendored (not a new dependency) because the relay is stdlib-only by design
 and neither `cryptography` nor PyNaCl is guaranteed on every machine that
-runs it (verified absent 2026-09-21). Pure-Python signing costs ~50-200ms
-per operation -- fine for invite flows, which are rare. Do NOT use this for
-high-throughput signing; that is out of scope for the relay.
+runs it (verified absent 2026-09-21).
+
+Security posture: this is the DJB reference implementation, which is not
+constant-time (double-and-add branches on secret scalar bits). That matches
+the reference and is acceptable here: the relay only ever verifies
+(all inputs public), and signing happens on the key owner's own machine.
+Do not use this module where a local timing adversary is in scope.
+
+v0.2.12 performance rework (2026-09-23): the original affine formulas
+inverted twice per point addition -- each inversion a full 255-bit modular
+exponentiation in pure Python -- costing ~3.1s per sign/verify on this VM.
+The group law below uses extended coordinates (Hisilop-Wong-Carter-Dawson):
+additions/doublings need only multiplications, with a single inversion when
+converting back to affine. Measured tens of ms per operation after the
+rework. Signatures are deterministic, so the rework is verified
+byte-identical against the old affine implementation on random inputs
+(see test-signing.py).
 """
 
 import hashlib
@@ -64,59 +89,102 @@ def _H(m):
     return hashlib.sha512(m).digest()
 
 
-def _expmod(base, exp, mod):
-    if exp == 0:
-        return 1
-    t = _expmod(base, exp // 2, mod) ** 2 % mod
-    if exp & 1:
-        t = (t * base) % mod
-    return t
-
-
 def _inv(x):
-    return _expmod(x, q - 2, q)
+    # C-speed builtin; the old recursive pure-Python _expmod was the
+    # dominant cost of every point operation (~3s per sign/verify).
+    return pow(x, q - 2, q)
 
 
-_d = -121665 * _inv(121666)
-_I = _expmod(2, (q - 1) // 4, q)
+_d = (-121665 * _inv(121666)) % q
+_2d = (2 * _d) % q
+_I = pow(2, (q - 1) // 4, q)
 
 
 def _xrecover(y):
-    xx = (y * y - 1) * _inv(_d * y * y + 1)
-    x = _expmod(xx, (q + 3) // 8, q)
+    xx = (y * y - 1) * _inv(_d * y * y + 1) % q
+    x = pow(xx, (q + 3) // 8, q)
     if (x * x - xx) % q != 0:
         x = (x * _I) % q
-    if x % 2 != 0:
+    if x & 1:
         x = q - x
     return x
 
 
-_By = 4 * _inv(5)
-_Bx = _xrecover(_By)
-_B = [_Bx % q, _By % q]
+# --- Extended-coordinate group law ---------------------------------------
+# A point is (X, Y, Z, T) with affine x = X/Z, y = Y/Z. Addition and
+# doubling use only multiplications; _to_affine inverts once at the end.
+# Formulas: Hisilop-Wong-Carter-Dawson, "Twisted Edwards Curves Revisited"
+# (addition), with a = -1 for Ed25519.
+
+_IDENT = (0, 1, 1, 0)
 
 
-def _edwards(P, Q):
-    # Twisted Edwards addition for a*x^2 + y^2 = 1 + d*x^2*y^2 with a = -1
-    # (Ed25519). NOTE the y-numerator is (y1*y2 + x1*x2): the "- a*x1*x2"
-    # term becomes "+" when a = -1. Getting this sign wrong produces a
-    # self-consistent-but-wrong group law that fails the l*B == identity
-    # check -- which is exactly how the bug was caught (2026-09-21).
-    x1, y1 = P[0], P[1]
-    x2, y2 = Q[0], Q[1]
-    x3 = (x1 * y2 + x2 * y1) * _inv(1 + _d * x1 * x2 * y1 * y2)
-    y3 = (y1 * y2 + x1 * x2) * _inv(1 - _d * x1 * x2 * y1 * y2)
-    return [x3 % q, y3 % q]
+def _to_ext_affine(x, y):
+    return (x % q, y % q, 1, (x * y) % q)
+
+
+def _to_affine(P):
+    X, Y, Z, _T = P
+    iz = _inv(Z)
+    return (X * iz % q, Y * iz % q)
+
+
+def _point_eq(P, Q):
+    # Projective equality without inverting: X1/Z1 == X2/Z2 and
+    # Y1/Z1 == Y2/Z2  <=>  cross-multiplied differences are 0 mod q.
+    X1, Y1, Z1, _t1 = P
+    X2, Y2, Z2, _t2 = Q
+    return (X1 * Z2 - X2 * Z1) % q == 0 and (Y1 * Z2 - Y2 * Z1) % q == 0
+
+
+def _edwards_add(P, Q):
+    X1, Y1, Z1, T1 = P
+    X2, Y2, Z2, T2 = Q
+    A = (Y1 - X1) * (Y2 - X2) % q
+    B = (Y1 + X1) * (Y2 + X2) % q
+    C = T1 * _2d % q * T2 % q
+    D = (2 * Z1 % q) * Z2 % q
+    E = (B - A) % q
+    F = (D - C) % q
+    G = (D + C) % q
+    H = (B + A) % q
+    return (E * F % q, G * H % q, F * G % q, E * H % q)
+
+
+def _edwards_dbl(P):
+    X1, Y1, Z1, _T1 = P
+    A = X1 * X1 % q
+    B = Y1 * Y1 % q
+    C = 2 * Z1 * Z1 % q
+    D = (-A) % q  # a = -1 for Ed25519
+    E = ((X1 + Y1) * (X1 + Y1) - A - B) % q
+    G = (D + B) % q
+    F = (G - C) % q
+    H = (D - B) % q
+    return (E * F % q, G * H % q, F * G % q, E * H % q)
 
 
 def _scalarmult(P, e):
-    if e == 0:
-        return [0, 1]
-    Q = _scalarmult(P, e // 2)
-    Q = _edwards(Q, Q)
-    if e & 1:
-        Q = _edwards(Q, P)
+    # NB: scalars here can be up to 512 bits (r and h in _signature /
+    # _checkvalid are full _Hint outputs). Must iterate every bit --
+    # truncating to 256 silently produces wrong points.
+    Q = _IDENT
+    for i in range(max(b, e.bit_length()) - 1, -1, -1):
+        Q = _edwards_dbl(Q)
+        if (e >> i) & 1:
+            Q = _edwards_add(Q, P)
     return Q
+
+
+# --- Base point (extended) -------------------------------------------------
+
+_By = (4 * _inv(5)) % q
+_Bx = _xrecover(_By)
+_B = (_Bx, _By, 1, _Bx * _By % q)
+
+
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
 
 
 def _encodeint(y):
@@ -134,28 +202,29 @@ def _encodepoint(P):
     )
 
 
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _publickey(sk):
-    h = _H(sk)
-    a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
-    return _encodepoint(_scalarmult(_B, a))
-
-
 def _Hint(m):
     h = _H(m)
     return sum(2**i * _bit(h, i) for i in range(2 * b))
+
+
+def _publickey_point(sk):
+    h = _H(sk)
+    a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
+    return _scalarmult(_B, a)
+
+
+def _publickey(sk):
+    return _encodepoint(_to_affine(_publickey_point(sk)))
 
 
 def _signature(m, sk, pk):
     h = _H(sk)
     a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
     r = _Hint(h[b // 8 : b // 4] + m)
-    R = _scalarmult(_B, r)
-    S = (r + _Hint(_encodepoint(R) + pk + m) * a) % l
-    return _encodepoint(R) + _encodeint(S)
+    Rext = _scalarmult(_B, r)
+    Renc = _encodepoint(_to_affine(Rext))
+    S = (r + _Hint(Renc + pk + m) * a) % l
+    return Renc + _encodeint(S)
 
 
 def _isoncurve(P):
@@ -173,7 +242,7 @@ def _decodepoint(s):
     x = _xrecover(y)
     if x & 1 != sign:
         x = q - x
-    P = [x, y]
+    P = (x, y)
     if not _isoncurve(P):
         raise ValueError("decoding point that is not on curve")
     return P
@@ -189,8 +258,8 @@ def _checkvalid(s, m, pk):
     S = _decodeint(s[b // 8 : b // 4])
     h = _Hint(_encodepoint(R) + pk + m)
     v1 = _scalarmult(_B, S)
-    v2 = _edwards(R, _scalarmult(A, h))
-    return v1 == v2
+    v2 = _edwards_add(_to_ext_affine(*R), _scalarmult(_to_ext_affine(*A), h))
+    return _point_eq(v1, v2)
 
 
 # --- Friendly API -----------------------------------------------------------
@@ -266,7 +335,107 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.9"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.12"
+
+
+# --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
+# Mirrors relay.py: every authenticated request carries
+#   X-Clack-Scheme: 1
+#   X-Clack-Key: <peer name, must match the Bearer token's peer>
+#   X-Clack-Nonce: <unix_seconds>:<32 hex chars random>
+#   X-Clack-Sig: hex(Ed25519_sign(seed, canonical))
+# with canonical bytes
+#   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
+# Signs only when the config carries an identity seed AND a peer_name (i.e.
+# post-enrollment). The pre-enrollment calls (challenge/enroll/redeem) have
+# no peer_name yet, so they stay unsigned; the relay's unsigned endpoints
+# accept them. Legacy token configs have no seed and are never signed --
+# the relay answers those 401s; upgrade the client and re-enroll.
+SIGN_SCHEME_ID = "clack-ed25519-v1"
+
+
+def signing_seed(cfg):
+    """Return the 32-byte Ed25519 seed for an identity config, or None.
+
+    Preferred: identity_privkey_path (a separate mode-600 key file holding
+    the b64u seed). Legacy: inline identity_privkey (b64u). Never prints or
+    logs the seed."""
+    if not is_identity_cfg(cfg):
+        return None
+    path = cfg.get("identity_privkey_path")
+    if path:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read().strip()
+        except OSError:
+            return None
+        if len(raw) == 32:
+            return raw
+        try:
+            seed = b64u_decode(raw.decode("ascii"))
+        except Exception:
+            return None
+        return seed if len(seed) == 32 else None
+    inline = cfg.get("identity_privkey")
+    if not inline:
+        return None
+    try:
+        seed = b64u_decode(inline)
+    except Exception:
+        return None
+    return seed if len(seed) == 32 else None
+
+
+def sign_headers(cfg, method, path, body_bytes):
+    """Build the X-Clack-* signing headers for one request, or {} when the
+    config cannot sign yet (no seed or no peer_name). Pure function of its
+    inputs apart from the fresh random nonce."""
+    seed = signing_seed(cfg)
+    peer = cfg.get("peer_name") if is_identity_cfg(cfg) else None
+    if seed is None or not peer:
+        return {}
+    nonce = "%d:%s" % (int(time.time()), _secrets.token_hex(16))
+    canon = (
+        SIGN_SCHEME_ID + "\n"
+        + method.upper() + "\n"
+        + path + "\n"
+        + hashlib.sha256(body_bytes or b"").hexdigest() + "\n"
+        + nonce
+    ).encode("utf-8")
+    return {
+        "X-Clack-Scheme": "1",
+        "X-Clack-Key": peer,
+        "X-Clack-Nonce": nonce,
+        "X-Clack-Sig": sign(seed, canon).hex(),
+    }
+
+
+def _write_key_file(path, seed):
+    """Write the b64u seed to path with mode 600. Private key material:
+    never printed, never transmitted."""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(b64u_encode(seed) + "\n")
+
+
+def _save_identity_config(path, cfg, seed, key_path=None):
+    """Persist an identity config (mode 600) with the private key in a
+    separate mode-600 key file. cfg records identity_privkey_path; any
+    legacy inline identity_privkey is migrated into the file."""
+    kp = key_path or cfg.get("identity_privkey_path") or (path + ".key")
+    cfg.pop("identity_privkey", None)
+    cfg["identity_privkey_path"] = kp
+    _write_key_file(kp, seed)
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
 
 
 def req(cfg, method, path, body=None, base=None):
@@ -277,6 +446,8 @@ def req(cfg, method, path, body=None, base=None):
     if token:
         r.add_header("Authorization", "Bearer " + token)
     r.add_header("User-Agent", user_agent(cfg))
+    for k, v in sign_headers(cfg, method, path, data).items():
+        r.add_header(k, v)
     if data is not None:
         r.add_header("Content-Type", "application/json")
     try:
@@ -393,16 +564,13 @@ def cmd_keygen(args):
         "kind": IDENTITY_KIND,
         "relay_url": args.relay_url,
         "identity_pubkey": b64u_encode(pub),
-        "identity_privkey": b64u_encode(seed),
     }
     if args.user_agent:
         cfg["user_agent"] = args.user_agent
     os.makedirs(os.path.dirname(os.path.abspath(args.config)) or ".", exist_ok=True)
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    _save_identity_config(args.config, cfg, seed, key_path=args.key_path)
     print("identity created: %s" % args.config)
+    print("private key:      %s (mode 600; never leaves this machine)" % cfg["identity_privkey_path"])
     print("pubkey: %s" % cfg["identity_pubkey"])
     return 0
 
@@ -488,10 +656,15 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "identity_privkey": b64u_encode(seed),
-            "user_agent": "ClackRelay-CLI/0.2.9",
+            "user_agent": "ClackRelay-CLI/0.2.12",
         }
-    seed = b64u_decode(cfg["identity_privkey"])
+        # Persist the private key immediately (mode 600 key file): the relay
+        # never sees it, and nothing below may proceed without it on disk.
+        _save_identity_config(args.config, cfg, seed)
+    seed = signing_seed(cfg)
+    if seed is None:
+        print("config has no usable identity private key", file=sys.stderr)
+        return 1
     pub = b64u_decode(cfg["identity_pubkey"])
 
     # Challenge -> sign(nonce || invite_id || pubkey) -> redeem.
@@ -517,10 +690,8 @@ def cmd_redeem(args):
     cfg["display_name"] = out["display_name"]
     if relay_fp:
         cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
+    # Same config-save path as keygen: private key stays in its 0600 file.
+    _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s...)" % (out["peer_name"], out["identity"][:12]))
 
     # Greeting exchange: hello to the inviter. Onboarding succeeds when the
@@ -628,10 +799,15 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "identity_privkey": b64u_encode(seed),
-            "user_agent": "ClackRelay-CLI/0.2.9",
+            "user_agent": "ClackRelay-CLI/0.2.12",
         }
-    seed = b64u_decode(cfg["identity_privkey"])
+        # Persist the private key immediately (mode 600 key file): the relay
+        # never sees it, and nothing below may proceed without it on disk.
+        _save_identity_config(args.config, cfg, seed)
+    seed = signing_seed(cfg)
+    if seed is None:
+        print("config has no usable identity private key", file=sys.stderr)
+        return 1
     pub = b64u_decode(cfg["identity_pubkey"])
 
     # Challenge -> (solve PoW when the gate is pow) -> sign -> enroll.
@@ -670,17 +846,14 @@ def cmd_enroll(args):
         print("enroll failed: %s" % json.dumps(out), file=sys.stderr)
         return 1
 
-    # Same config-save path as redeem: same file, same mode 600.
+    # Same config-save path as redeem: private key stays in its 0600 file.
     cfg["relay_url"] = relay_url
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
     if relay_fp:
         cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
+    _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s..., via %s gate)"
           % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
 
@@ -754,6 +927,8 @@ def main():
     k = sub.add_parser("keygen", help="create an ed25519 identity config")
     k.add_argument("--relay-url", required=True, help="relay base URL, e.g. http://127.0.0.1:18998")
     k.add_argument("--force", action="store_true", help="overwrite existing config")
+    k.add_argument("--key-path", default=None,
+                   help="private key file path (mode 600; default: <config>.key)")
     k.add_argument("--user-agent", default=None)
 
     m = sub.add_parser("mint-invite", help="mint a shareable join link")
