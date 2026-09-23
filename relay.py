@@ -522,6 +522,34 @@ def _enrollment_gates():
     return gates or {"invite"}
 
 
+def _trusted_proxy_nets():
+    """CIDR list from relay-config.json "trusted_proxies" (Flint P2-deploy).
+
+    Only connections arriving FROM these networks may supply the real
+    client IP via CF-Connecting-IP / X-Forwarded-For for rate limiting.
+    Default: empty -- the socket peer address is always used, so a
+    listener reachable by untrusted clients never trusts forwarded headers.
+    """
+    raw = relay_cfg.get("trusted_proxies", []) if relay_cfg else []
+    if isinstance(raw, str):
+        raw = [raw]
+    nets = []
+    for entry in raw or []:
+        try:
+            nets.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _valid_client_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
 def _pow_difficulty():
     try:
         return int(relay_cfg.get("pow_difficulty", ENROLL_DEFAULT_POW_DIFFICULTY))
@@ -1121,8 +1149,34 @@ class Handler(BaseHTTPRequestHandler):
                 return "nonce_store_full"
         return None
 
+    def _client_ip(self):
+        """Best-effort client IP for rate limiting (Flint P2-deploy).
+
+        Behind a trusted edge (e.g. cloudflared dialing 127.0.0.1:18802)
+        every remote client shares the socket peer address, collapsing all
+        per-IP buckets into one. When the socket peer is inside
+        "trusted_proxies", the real client IP is taken from
+        CF-Connecting-IP, else the first X-Forwarded-For entry; anything
+        else falls back to the socket address. Forwarded headers from an
+        untrusted source are never honored.
+        """
+        sock = self.client_address[0] if self.client_address else "?"
+        try:
+            sock_addr = ipaddress.ip_address(sock)
+        except ValueError:
+            return sock
+        if any(sock_addr in net for net in _trusted_proxy_nets()):
+            cf = (self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf and _valid_client_ip(cf):
+                return cf
+            xff = self.headers.get("X-Forwarded-For") or ""
+            first = xff.split(",")[0].strip()
+            if first and _valid_client_ip(first):
+                return first
+        return sock
+
     def _require_auth(self):
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         peer = auth_peer(self.headers)
         if peer is None:
             # No peer budget exists to charge; the cheap source-level
@@ -1379,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
             if id_n is None:
                 self._json(503, {"error": "identity_unavailable"})
                 return
-            ip = self.client_address[0] if self.client_address else "?"
+            ip = self._client_ip()
             if not ip_rate_ok(ip):
                 self._json(429, {"error": "rate_limited"})
                 return
@@ -1820,7 +1874,7 @@ class Handler(BaseHTTPRequestHandler):
         if "invite" not in _enrollment_gates():
             self._json(400, {"error": "invite_not_allowed"})
             return
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         if not invite_rate_ok("cip:" + ip, 30) or not invite_rate_ok(
             "cinv:" + invite_id, 10
         ):
@@ -1861,7 +1915,7 @@ class Handler(BaseHTTPRequestHandler):
         secret_s = body.get("secret")
         pubkey_s = body.get("identity_pubkey")
         proof = body.get("proof")
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         # R6: honor the enrollment gate (see _handle_invite_challenge). A
         # policy rejection is not an invite failure: answer directly without
         # touching the invite's failure counters.
@@ -2045,7 +2099,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         invite_id = body.get("invite_id")
         gates = _enrollment_gates()
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         if invite_id is not None:
             # Invite gate: validate exactly like /v1/invites/challenge.
             if not isinstance(invite_id, str) or not invite_id:
@@ -2136,7 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
         invite_id = body.get("invite_id")
         pow_nonce_s = body.get("pow_nonce")
         gates = _enrollment_gates()
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         # Gate resolution: exactly one must apply.
         if invite_id is not None:
             gate = "invite"

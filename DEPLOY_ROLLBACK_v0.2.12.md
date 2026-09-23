@@ -40,6 +40,14 @@ the extra `retired_names` table is ignored, `/health` returns
 
 ## Notes
 
+- The tunnel deployment dials 127.0.0.1:18802, so every remote client
+  shares the socket peer address and all per-IP rate-limit buckets
+  collapse into one (Flint P2-deploy). Before going live, set in
+  relay-config.json: `"trusted_proxies": ["127.0.0.1/32"]` — then the
+  relay keys buckets on `CF-Connecting-IP` (else the first
+  `X-Forwarded-For` entry) for connections arriving via the tunnel.
+  Forwarded headers from any other source are never honored; leave the
+  list empty and the socket IP is always used.
 - Mandatory signing is backward-compatible at the protocol level, but
   legacy token-only clients get `401 missing_signature` after the upgrade
   — confirm Clingy Bear's key is registered and her client signs before

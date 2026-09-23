@@ -15,6 +15,12 @@ fresh openssl identity key) plus tiny loopback stubs, and covers:
       unexpected algorithm field -> rejected
   F4: 503 identity with a stored pin -> check_relay_identity aborts
       503 identity with no pin -> returns None (fresh-onboarding path)
+  P1: 503 identity + token-bearing config -> req() aborts BEFORE the API
+      request is sent (stub records zero API hits and no Authorization
+      header anywhere: no 503 credential downgrade)
+  P2: first contact + token, non-interactive -> req() aborts, pins nothing
+      first contact + token, interactive YES -> confirms, pins, proceeds
+      first contact + token, interactive decline -> aborts
   F5: cleartext http:// to a non-loopback origin -> loud WARNING
       (loopback http stays quiet)
 """
@@ -24,6 +30,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -223,6 +230,63 @@ def captured_stderr():
         sys.stderr = old
 
 
+@contextlib.contextmanager
+def captured_stdout():
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        yield buf
+    finally:
+        sys.stdout = old
+
+
+class _FakeStdin(io.StringIO):
+    def __init__(self, text, tty):
+        io.StringIO.__init__(self, text)
+        self._is_a_tty = tty
+
+    def isatty(self):
+        return self._is_a_tty
+
+
+@contextlib.contextmanager
+def fake_stdin(text, tty):
+    """Deterministic stdin for the P2 interactive-confirmation paths."""
+    old = sys.stdin
+    sys.stdin = _FakeStdin(text, tty)
+    try:
+        yield
+    finally:
+        sys.stdin = old
+
+
+def check_private_file(path, name):
+    """The config holds Bearer <redacted>: only owner/admins may read it.
+
+    Platform-aware (Flint re-review note): POSIX mode bits are meaningless
+    on Windows, so there we inspect the ACL via icacls and require that no
+    ACE grants access to a broad identity (Everyone/Users/...).
+    """
+    if os.name == "nt":
+        try:
+            p = subprocess.run(["icacls", path], capture_output=True,
+                               text=True, timeout=20)
+            out = p.stdout
+        except Exception as e:
+            check(False, name, "icacls failed: %s" % e)
+            return
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        aces = lines[1:] if len(lines) > 1 else []
+        broad = [a for a in aces if re.search(
+            r"Everyone|\\Users\b|Authenticated Users|INTERACTIVE", a, re.I)]
+        check(bool(aces) and not broad, name,
+              "icacls aces: %s" % " | ".join(aces)[:220])
+    else:
+        mode = oct(os.stat(path).st_mode & 0o777)
+        check(mode == "0o600", name, mode)
+
+
 def expect_exit(fn, name):
     _rc._verified_origins.clear()
     try:
@@ -267,7 +331,7 @@ def main():
             code, out = _rc.req(cfg, "GET", "/health", base=REAL)
         check(code == 200, "F1 right pin: request transmitted", code)
 
-        # --- F1: TOFU pins and persists --------------------------------------
+        # --- P2: first contact + token needs explicit confirmation ---------
         _rc._verified_origins.clear()
         cfg_path = os.path.join(TMPD, "tofu-config.json")
         with open(cfg_path, "w") as f:
@@ -275,17 +339,36 @@ def main():
         _rc._config_path = cfg_path
         cfg = {"peers": {"x": "tok"}, "base_url": REAL}
         try:
-            with captured_stderr() as err:
-                code, out = _rc.req(cfg, "GET", "/health", base=REAL)
-            check(code == 200, "F1 TOFU first contact succeeds", code)
+            # Non-interactive: abort, pin nothing, send nothing.
+            with fake_stdin("", False):
+                if expect_exit(
+                        lambda: _rc.req(cfg, "GET", "/health", base=REAL),
+                        "P2 first contact + token, non-interactive aborts"):
+                    pass
+            saved = json.load(open(cfg_path))
+            check("relay_identity_fingerprint" not in saved,
+                  "P2 aborted first contact persists no pin")
+            # Interactive YES: confirm out-of-band, pin, proceed.
+            _rc._verified_origins.clear()
+            with fake_stdin("YES\n", True):
+                with captured_stdout() as out_buf:
+                    code, out = _rc.req(cfg, "GET", "/health", base=REAL)
+            check(code == 200, "P2 confirmed first contact succeeds", code)
             saved = json.load(open(cfg_path))
             check(saved.get("relay_identity_fingerprint") == real_fp,
-                  "F1 TOFU pin persisted to config",
+                  "P2 confirmed pin persisted to config",
                   saved.get("relay_identity_fingerprint"))
-            check(oct(os.stat(cfg_path).st_mode & 0o777) == "0o600",
-                  "F1 TOFU config stays mode 600")
-            check("TOFU" in err.getvalue(),
-                  "F1 TOFU pin is announced on stderr")
+            check_private_file(cfg_path, "P2 confirmed config stays private")
+            check("FIRST CONTACT" in out_buf.getvalue()
+                  and real_fp in out_buf.getvalue(),
+                  "P2 confirmation prompt names the fingerprint")
+            # Interactive decline: abort.
+            _rc._verified_origins.clear()
+            cfg2 = {"peers": {"x": "tok"}, "base_url": REAL}
+            with fake_stdin("no\n", True):
+                expect_exit(
+                    lambda: _rc.req(cfg2, "GET", "/health", base=REAL),
+                    "P2 first contact + token, declined aborts")
         finally:
             _rc._config_path = None
 
@@ -353,6 +436,26 @@ def main():
         with captured_stderr():
             got = _rc.check_relay_identity(stub, {})
         check(got is None, "F4 503 without pin returns None", got)
+        srv.shutdown()
+
+        # --- P1: 503 identity + token-bearing config -> fail closed ----------
+        # Mirrors Flint's credential-capture proof: the endpoint answers 503
+        # on the identity challenge, then watches for the Bearer <redacted>
+        # on the API call. The client must abort before any API request.
+        h = fresh_handler("unavailable")
+        srv, stub = run_stub(h)
+        cfg = {"peers": {"x": "tok"}, "base_url": stub}
+        if expect_exit(lambda: _rc.req(cfg, "GET", "/v1/peers", base=stub),
+                       "P1 503 + token aborts before the API request"):
+            api_hits = [x for x in h.hits
+                        if not x[1].startswith("/v1/identity")]
+            check(len(api_hits) == 0,
+                  "P1 503 + token: zero API requests transmitted",
+                  "saw %d" % len(api_hits))
+            check(not any("Authorization" in x[2] for x in h.hits),
+                  "P1 503 + token: no Authorization header observed anywhere")
+            check(any(x[1].startswith("/v1/identity") for x in h.hits),
+                  "P1 503 + token: identity was checked first")
         srv.shutdown()
 
         # --- F5: cleartext warning for non-loopback http ----------------------

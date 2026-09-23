@@ -127,12 +127,53 @@ def err_of(body):
         return "?"
 
 
+def _der_ints(der):
+    """Minimal DER parser returning the INTEGERs of a PKCS#1 RSAPrivateKey."""
+    ints = []
+    i = 0
+
+    def read_len(j):
+        n = der[j]
+        j += 1
+        if n & 0x80:
+            k = n & 0x7F
+            n = int.from_bytes(der[j:j + k], "big")
+            j += k
+        return n, j
+    assert der[i] == 0x30
+    i += 1
+    _, i = read_len(i)
+    while i < len(der):
+        assert der[i] == 0x02
+        i += 1
+        ln, i = read_len(i)
+        ints.append(int.from_bytes(der[i:i + ln], "big"))
+        i += ln
+    return ints
+
+
+def _gen_rsa_identity_key(tmpd):
+    """Scratch RSA identity key for the relay (P1/P2: the CLI round trip
+    needs a real /v1/identity, otherwise token-bearing CLI calls abort)."""
+    pem = os.path.join(tmpd, "test-id.pem")
+    der = os.path.join(tmpd, "test-id.der")
+    subprocess.run(["openssl", "genrsa", "-out", pem, "1024"],
+                   check=True, capture_output=True)
+    subprocess.run(["openssl", "rsa", "-in", pem, "-traditional",
+                    "-outform", "DER", "-out", der],
+                   check=True, capture_output=True)
+    with open(der, "rb") as f:
+        _ver, n, e, d = _der_ints(f.read())[:4]
+    return {"n": format(n, "x"), "e": format(e, "x"), "d": format(d, "x")}
+
+
 def start_relay():
     global SRV
     cfg = {"port": PORT,
            "peers": {"alice": ALICE_TOKEN},
            "identity_pubkeys": {"alice": KEYS["alice"][2]},
-           "enrollment": "open", "pow_difficulty": 8}
+           "enrollment": "open", "pow_difficulty": 8,
+           "identity_key": _gen_rsa_identity_key(TMPD)}
     with open(os.path.join(TMPD, "relay-config.json"), "w") as f:
         json.dump(cfg, f)
     log = open(os.path.join(TMPD, "srv.log"), "a")
@@ -272,6 +313,7 @@ def main():
         run_prune_and_cap()
         run_key_validation()
         run_legacy_gate()
+        run_trusted_proxy()
         run_rate_budget()
         run_delayed_body()
         run_cli_round_trip()
@@ -280,6 +322,57 @@ def main():
         stop_relay()
     print("signing tests: %d passed, %d failed" % (PASS, FAIL))
     return 1 if FAIL else 0
+
+
+class _FakeHandlerSelf:
+    def __init__(self, ip, headers):
+        self.client_address = (ip, 9999)
+        self.headers = headers
+
+
+def _client_ip_for(sock_ip, headers, trusted_proxies):
+    old = _rm.relay_cfg
+    _rm.relay_cfg = {"trusted_proxies": trusted_proxies}
+    try:
+        return _rm.Handler._client_ip(_FakeHandlerSelf(sock_ip, headers))
+    finally:
+        _rm.relay_cfg = old
+
+
+def run_trusted_proxy():
+    """Flint P2-deploy: per-IP rate-limit buckets behind a trusted edge."""
+    # Default (no trusted_proxies): forwarded headers are never honored.
+    check(_client_ip_for("10.1.2.3",
+                         {"X-Forwarded-For": "203.0.113.7"}, []) == "10.1.2.3",
+          "untrusted: X-Forwarded-For ignored")
+    check(_client_ip_for("10.1.2.3",
+                         {"CF-Connecting-IP": "203.0.113.7"}, None)
+          == "10.1.2.3",
+          "untrusted: CF-Connecting-IP ignored")
+    # Trusted edge: CF-Connecting-IP wins, else first XFF entry.
+    check(_client_ip_for("127.0.0.1", {"CF-Connecting-IP": "203.0.113.7"},
+                         ["127.0.0.1/32"]) == "203.0.113.7",
+          "trusted: CF-Connecting-IP honored")
+    check(_client_ip_for("127.0.0.1",
+                         {"X-Forwarded-For": "198.51.100.9, 10.0.0.1"},
+                         ["127.0.0.1/32"]) == "198.51.100.9",
+          "trusted: first X-Forwarded-For entry honored")
+    check(_client_ip_for("127.0.0.1", {}, ["127.0.0.1/32"]) == "127.0.0.1",
+          "trusted: no headers falls back to socket IP")
+    check(_client_ip_for("127.0.0.1", {"CF-Connecting-IP": "garbage!!"},
+                         ["127.0.0.1/32"]) == "127.0.0.1",
+          "trusted: invalid header value falls back to socket IP")
+    # A source outside the trusted CIDRs never gets header treatment.
+    check(_client_ip_for("10.9.9.9", {"CF-Connecting-IP": "203.0.113.7"},
+                         ["127.0.0.1/32"]) == "10.9.9.9",
+          "outside trusted CIDRs: headers ignored")
+    # Config ergonomics: bare string and bad CIDRs.
+    check(_client_ip_for("127.0.0.1", {"CF-Connecting-IP": "203.0.113.7"},
+                         "127.0.0.1/32") == "203.0.113.7",
+          "trusted_proxies accepts a bare string")
+    check(_client_ip_for("127.0.0.1", {"CF-Connecting-IP": "203.0.113.7"},
+                         ["not-a-cidr"]) == "127.0.0.1",
+          "invalid CIDR entries are ignored")
 
 
 def run_round_trip():

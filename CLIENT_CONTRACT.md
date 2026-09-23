@@ -154,9 +154,24 @@ connection reaches the real relay: a determined intermediary that can reach
 the genuine relay can proxy your challenge and hand you back a valid proof.
 Treat a passing check as "the relay key I expect answered", not "my
 connection is direct". The reference CLI enforces the pin on every
-authenticated request and never follows redirects with credentials; on a
-pin mismatch — or an unavailable identity service once a pin exists — it
-aborts instead of sending your token.
+authenticated request and never follows redirects with credentials.
+
+Fail-closed identity rules (the CLI aborts instead of sending your
+Bearer <redacted> when any of these hold):
+- the presented fingerprint does not match the stored pin;
+- the identity service is unavailable (HTTP 503 / transport error) —
+  whether or not a pin exists. An endpoint that answers 503 must not be
+  able to harvest credentials by downgrading you to unauthenticated mode;
+- first contact with no stored pin while the config bears a token: the
+  operator must confirm the presented fingerprint out-of-band before it is
+  pinned. Interactive runs prompt for an explicit YES; non-interactive runs
+  abort and tell you to provision `relay_identity_fingerprint` in the
+  config (confirmed out-of-band) or run once interactively.
+
+The only requests that ever cross an unverified origin are tokenless
+first-contact enrollment calls (`enroll` / `redeem`), which show the
+fingerprint at their own confirmation tap and never transmit an existing
+secret.
 
 ## Base URL
 
@@ -260,7 +275,12 @@ fingerprint the *public key* (stable across runs) for TOFU: `sha256(
 big-endian encodings of the hex fields. Confirm once out-of-band, pin
 the fingerprint, and compare on every later run — a changed key is never
 silently accepted. Missing/malformed nonce → `400`. No-auth endpoint,
-30 req/min per IP → `429`.
+30 req/min per IP → `429`. Per-IP buckets key on the socket peer address
+unless the relay config sets `trusted_proxies` (CIDR list): connections
+arriving from those networks — e.g. a local Cloudflare tunnel dialing
+127.0.0.1 — may supply the real client IP via `CF-Connecting-IP` (else the
+first `X-Forwarded-For` entry). Forwarded headers from any other source
+are never honored; the default is an empty list, i.e. socket IP always.
 
 ### POST /v1/enroll/challenge (no auth)
 

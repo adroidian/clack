@@ -471,7 +471,7 @@ def _open(req, timeout):
     return _opener.open(req, timeout=timeout)
 
 
-_verified_origins = set()  # origins whose relay identity passed this process
+_verified_origins = {}  # origin -> "pinned" | "confirmed" | "tofu" | "unverified"
 _config_path = None         # set by main(); TOFU pin persistence target
 
 
@@ -510,18 +510,34 @@ def _persist_tofu_pin(cfg, fingerprint):
 def _ensure_origin_verified(origin, cfg):
     """Verify the relay identity for `origin` before any secret crosses it.
 
-    Fail-closed: pin mismatch, unavailable identity service with an
-    existing pin, transport errors, and bad proofs all abort the process
-    instead of sending the bearer token. First contact with no stored pin
-    does TOFU and persists the pin."""
+    Returns the verification level: "pinned" (stored pin matched),
+    "confirmed" (fingerprint interactively confirmed this session), "tofu"
+    (first-contact TOFU, tokenless configs only), or "unverified" (relay
+    has no identity key and the config bears no token).
+
+    Fail-closed (Flint review P1/P2): a config that bears a Bearer <redacted>
+    NEVER sends it unless the origin is "pinned" or "confirmed".
+      - pin mismatch, or identity unavailable (503) while a pin exists,
+        aborts (existing F1/F4 behavior);
+      - identity unavailable with no pin but an existing token aborts: a
+        hostile endpoint must not harvest credentials by answering 503 (P1);
+      - first contact with no pin and an existing token requires the
+        operator to confirm the presented fingerprint out-of-band before it
+        is pinned and any request is sent (P2). Non-interactive sessions
+        abort with instructions instead of silently pinning.
+    Tokenless configs (fresh enroll/redeem) keep the explicit enrollment
+    path, which shows the fingerprint at its own confirmation tap and never
+    transmits an existing secret.
+    """
     if origin in _verified_origins:
-        return
+        return _verified_origins[origin]
     if (urllib.parse.urlsplit(origin).scheme == "http"
             and not _is_loopback_url(origin)):
         # Without TLS there is no server-authentication boundary at all;
         # say so loudly rather than letting the pin imply safety.
-        print("WARNING: relay URL is cleartext %s -- bearer tokens and "
+        print("WARNING: relay URL is cleartext %s -- Bearer <redacted> and "
               "message bodies travel unencrypted" % origin, file=sys.stderr)
+    token = auth_token(cfg)
     try:
         fingerprint, _pubkey = fetch_relay_identity(origin)
     except Exception as e:
@@ -531,17 +547,24 @@ def _ensure_origin_verified(origin, cfg):
     pinned = (cfg or {}).get("relay_identity_fingerprint")
     if fingerprint is None:
         # Relay has no identity key (503). Never downgrade an existing pin
-        # to unauthenticated operation (F4).
+        # to unauthenticated operation (F4), and never let an unavailable
+        # identity launder an existing Bearer <redacted> (P1).
         if pinned:
             print("relay identity unavailable for %s but this config pins %s;"
                   " aborting rather than sending credentials unauthenticated"
                   % (origin, pinned), file=sys.stderr)
             sys.exit(1)
+        if token:
+            print("relay identity unavailable for %s and this config bears "
+                  "credentials; aborting rather than sending them "
+                  "unauthenticated (an endpoint that answers 503 could be "
+                  "harvesting tokens)" % origin, file=sys.stderr)
+            sys.exit(1)
         print("WARNING: relay at %s has no identity key; continuing without "
               "relay authentication (no pin established)" % origin,
               file=sys.stderr)
-        _verified_origins.add(origin)
-        return
+        _verified_origins[origin] = "unverified"
+        return "unverified"
     if pinned and pinned != fingerprint:
         print("RELAY IDENTITY CHANGED: config pins %s but %s presents %s"
               % (pinned, origin, fingerprint), file=sys.stderr)
@@ -549,18 +572,56 @@ def _ensure_origin_verified(origin, cfg):
               "relays intentionally, update relay_identity_fingerprint in "
               "the config (or re-enroll).", file=sys.stderr)
         sys.exit(1)
-    if not pinned:
-        print("pinned relay identity %s for %s (TOFU, first contact)"
-              % (fingerprint, origin), file=sys.stderr)
+    if pinned:
+        _verified_origins[origin] = "pinned"
+        return "pinned"
+    if token:
+        # P2: first contact while bearing a token. Silent TOFU would let a
+        # stolen/reassigned endpoint become the stored pin and receive the
+        # first Bearer <redacted> The operator must confirm the fingerprint
+        # out-of-band before it is pinned.
+        if not sys.stdin.isatty():
+            print("relay at %s presents identity %s, but this config has no "
+                  "stored pin and bears credentials."
+                  % (origin, fingerprint), file=sys.stderr)
+            print("aborting: confirm the fingerprint out-of-band, then add "
+                  "\"relay_identity_fingerprint\": \"%s\" to the config, "
+                  "or run once interactively to confirm and pin it."
+                  % fingerprint, file=sys.stderr)
+            sys.exit(1)
+        print("FIRST CONTACT: relay at %s presents identity" % origin)
+        print("  fingerprint: %s" % fingerprint)
+        print("Confirm this fingerprint out-of-band (relay operator, invite "
+              "material, or the relay's published identity page) before any "
+              "credential is sent.")
+        ans = input("Type YES to pin this relay identity and continue: "
+                    ).strip()
+        if ans != "YES":
+            print("aborted: relay identity not confirmed", file=sys.stderr)
+            sys.exit(1)
         _persist_tofu_pin(cfg, fingerprint)
-    _verified_origins.add(origin)
+        _verified_origins[origin] = "confirmed"
+        return "confirmed"
+    print("pinned relay identity %s for %s (TOFU, first contact)"
+          % (fingerprint, origin), file=sys.stderr)
+    _persist_tofu_pin(cfg, fingerprint)
+    _verified_origins[origin] = "tofu"
+    return "tofu"
 
 
 def req(cfg, method, path, body=None, base=None):
     origin = (base or base_url(cfg)).rstrip("/")
-    _ensure_origin_verified(origin, cfg)
-    url = origin + path
     token = auth_token(cfg)
+    level = _ensure_origin_verified(origin, cfg)
+    if token and level not in ("pinned", "confirmed"):
+        # Defense in depth (Flint P1): a Bearer <redacted> only crosses a
+        # pin-matched or explicitly confirmed origin. _ensure_origin_verified
+        # already aborts in these cases; the invariant is stated here too so
+        # no future caller can bypass it.
+        print("refusing to send credentials to %s: relay identity %s"
+              % (origin, level), file=sys.stderr)
+        sys.exit(1)
+    url = origin + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
     if token:
@@ -937,8 +998,10 @@ def cmd_redeem(args):
     # Greeting exchange: hello to the inviter. Onboarding succeeds when the
     # invitee receives AND acknowledges the inviter's reply (checked by the
     # inviter via /v1/receipts -> acked).
+    # P1: the hello bears the fresh token, so it only goes to a
+    # pin-verified origin -- never to a relay with no identity key.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -950,6 +1013,9 @@ def cmd_redeem(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     else:
         print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
@@ -1098,9 +1164,10 @@ def cmd_enroll(args):
           % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
 
     # Greeting exchange, mirroring redeem: hello to the inviter when the
-    # invite gate names one.
+    # invite gate names one. P1: token-bearing, so only to a pin-verified
+    # origin -- never to a relay with no identity key.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -1112,6 +1179,9 @@ def cmd_enroll(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     print("config saved: %s" % args.config)
     return 0
 
