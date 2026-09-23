@@ -544,7 +544,7 @@ def _ensure_origin_verified(origin, cfg):
               "message bodies travel unencrypted" % origin, file=sys.stderr)
     token = auth_token(cfg)
     try:
-        fingerprint, _pubkey = fetch_relay_identity(origin)
+        fingerprint, _pubkey = fetch_relay_identity(origin, cfg)
     except Exception as e:
         print("could not verify relay identity for %s: %s" % (origin, e),
               file=sys.stderr)
@@ -704,7 +704,7 @@ def relay_identity_verify(pubkey, nonce_hex, signature_b64):
     return em == expect
 
 
-def fetch_relay_identity(relay_url):
+def fetch_relay_identity(relay_url, cfg=None):
     """Fetch and verify the relay's identity.
 
     Strict (Flint review F3): the proof must answer OUR challenge -- the
@@ -714,14 +714,19 @@ def fetch_relay_identity(relay_url):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
+    The configured user_agent is sent (default ClackRelay-CLI/0.2.12):
+    Cloudflare-fronted relays 403 Python-urllib's default signature, so a
+    bare _open() fails closed before any normal operation can run.
+
     Returns (fingerprint, pubkey). Raises on transport/HTTP errors other
     than 503 (relay has no identity key), in which case returns (None, None)
     and the caller must fail closed when a pin exists (F4).
     """
     nonce = os.urandom(32).hex()
+    id_req = urllib.request.Request(relay_url + "/v1/identity?nonce=" + nonce)
+    id_req.add_header("User-Agent", user_agent(cfg or {}))
     try:
-        with _open(relay_url + "/v1/identity?nonce=" + nonce,
-                   timeout=30) as resp:
+        with _open(id_req, timeout=30) as resp:
             ident = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 503:
@@ -764,7 +769,7 @@ def check_relay_identity(relay_url, cfg):
     identity service is unavailable but a pin exists (F4: no downgrade).
     """
     try:
-        fingerprint, _pubkey = fetch_relay_identity(relay_url)
+        fingerprint, _pubkey = fetch_relay_identity(relay_url, cfg)
     except urllib.error.HTTPError as e:
         print("could not verify relay identity: HTTP Error %d" % e.code,
               file=sys.stderr)
