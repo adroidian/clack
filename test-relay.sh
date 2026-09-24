@@ -14,7 +14,8 @@
 # names, CLI enroll end-to-end) and folds its counts into PASS/FAIL.
 set -euo pipefail
 
-PORT=18803
+PORT=${CLACK_TEST_PORT:-18803}
+export PORT
 TMPD="$(mktemp -d /tmp/clack-relay-test.XXXXXX)"
 export TMPD
 BODY="$TMPD/body.json"
@@ -95,7 +96,7 @@ json.dump({"alice": sys.argv[2], "bob": sys.argv[3], "carol": sys.argv[4],
            "dave": sys.argv[5], "zed": sys.argv[6]}, open(sys.argv[1], "w"))
 EOF
 python3 - "$TMPD/relay-config.json" "$TA" "$TB" "$TC" "$TD" "$TF0" "$TF1" "$TF2" "$TF3" "$TF4" "$TF5" "$TF6" "$TF7" "$TF8" "$TMPD/keys.json" <<'EOF'
-import json, sys, random, math
+import json, sys, os, random, math
 peers = {"alice": sys.argv[2], "bob": sys.argv[3], "carol": sys.argv[4], "dave": sys.argv[5]}
 for i in range(9):
     peers["f%d" % i] = sys.argv[6 + i]
@@ -126,7 +127,7 @@ while True:
     p, q = gen_prime(512), gen_prime(512)
     if p != q and (p*q).bit_length() == 1024 and math.gcd(65537,(p-1)*(q-1)) == 1:
         n = p*q; d = pow(65537, -1, (p-1)*(q-1)); break
-cfg = {"port": 18803, "peers": peers,
+cfg = {"port": int(os.environ.get("PORT", "18803")), "peers": peers,
        "identity_pubkeys": pubkeys,
        "identity_key": {"n": format(n,"x"), "e": "10001", "d": format(d,"x")}}
 json.dump(cfg, open(sys.argv[1], "w"))
@@ -186,6 +187,36 @@ except (KeyError, IndexError, TypeError):
 newid() { python3 -c "import uuid;print(uuid.uuid4())"; }
 
 # --- tests -------------------------------------------------------------------
+# v0.2.13: mutual-consent handshakes gate /v1/send. This suite tests the
+# relay protocol (auth, signing, validation, dedup, poll, ...), not the
+# handshake flow (that's test-handshake.py), so it white-boxes ACTIVE
+# handshake rows for the pairs this suite sends between: alice<->bob and
+# alice->carol (the queue-cap probe expects 429, which the gate would
+# otherwise shadow with 403). Real handshake setup would exercise the
+# same gate; these rows isolate this suite's actual subject.
+python3 - "$TMPD/relay.db" <<'EOF'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("PRAGMA busy_timeout=5000")
+def ident(peer):
+    r = c.execute("SELECT identity_pubkey FROM peers WHERE name=?", (peer,)).fetchone()
+    return r[0] if r and r[0] else peer
+now = time.time()
+for x, y in (("alice", "bob"), ("alice", "carol")):
+    a, b = sorted([ident(x), ident(y)])
+    c.execute(
+        """INSERT OR REPLACE INTO handshakes(
+               a_identity, b_identity, status, created_at,
+               pending_expires_at, expires_at, last_activity,
+               via_link_id, redeemer_identity, generation)
+           VALUES(?, ?, 'active', ?, NULL, NULL, ?, 'test-relay-sh', NULL, 0)""",
+        (a, b, now, now),
+    )
+c.commit()
+c.close()
+print("handshake rows seeded")
+EOF
+[ $? -eq 0 ] && ok "handshake rows seeded" || bad "handshake seed" "python failed"
 # zed holds a valid bearer but the relay stores no Ed25519 key for it ->
 # 401 upgrade_required (v0.2.12 NULL-key path). This doubles as the setup
 # for the revocation test below: after zed is removed from the config the
@@ -212,7 +243,7 @@ done < <(python3 - <<'PYEOF'
 import json, os, sys, time, secrets, hashlib, base64, urllib.request, urllib.error
 sys.path.insert(0, os.path.expanduser("~/workspace/clack-relay"))
 import ed25519
-BASE = "http://127.0.0.1:18803"
+BASE = "http://127.0.0.1:%s" % os.environ.get("PORT", "18803")
 keys = json.load(open(os.path.join(os.environ["TMPD"], "keys.json")))
 tokens = json.load(open(os.path.join(os.environ["TMPD"], "tokens.json")))
 T = tokens["alice"]
@@ -492,12 +523,45 @@ CODE="$(req GET /v1/peers "$TZ")"
 [ "$(req GET /v1/peers "$TA")" = "200" ] && ok "surviving peer still authenticates" \
   || bad "surviving peer" "$(cat "$BODY")"
 
+# --- peer_hashes regression (test-peer-hashes.py) ---------------------------
+# Hash-only config peers (protected provisioning) must survive the
+# init_db config rebuild: no revocation, no message/webhook loss, no
+# name retirement. Spins no relay; exercises init_db directly on
+# scratch DBs. Never touches production.
+echo "---- peer-hashes phase (test-peer-hashes.py) ----"
+PH_RC=0
+PH_OUT="$(python3 "$HOME/workspace/clack-relay/test-peer-hashes.py" 2>&1)" || PH_RC=$?
+echo "$PH_OUT"
+PH_PASS="$(printf '%s\n' "$PH_OUT" | sed -n 's/^pass=\([0-9][0-9]*\) fail=.*/\1/p')"
+PH_FAIL="$(printf '%s\n' "$PH_OUT" | sed -n 's/^pass=.* fail=\([0-9][0-9]*\)/\1/p')"
+PASS=$((PASS + ${PH_PASS:-0}))
+FAIL=$((FAIL + ${PH_FAIL:-0}))
+[ "$PH_RC" = "0" ] || bad "test-peer-hashes.py exit code" "$PH_RC"
+
+# --- real supervisor-style restart (test-real-restart.py) -------------------
+# Spawns ACTUAL relay processes, SIGTERMs them like a supervisor would,
+# restarts them, and verifies hash-only peer/message/webhook retention,
+# revocation, dual-source fail-closed, and disposable restore. Scratch
+# ports 18980-18983 and scratch dirs only; never touches production.
+echo "---- real-restart phase (test-real-restart.py) ----"
+RR_RC=0
+RR_OUT="$(python3 "$HOME/workspace/clack-relay/test-real-restart.py" 2>&1)" || RR_RC=$?
+echo "$RR_OUT"
+RR_PASS="$(printf '%s\n' "$RR_OUT" | sed -n 's/^pass=\([0-9][0-9]*\) fail=.*/\1/p')"
+RR_FAIL="$(printf '%s\n' "$RR_OUT" | sed -n 's/^pass=.* fail=\([0-9][0-9]*\)/\1/p')"
+PASS=$((PASS + ${RR_PASS:-0}))
+FAIL=$((FAIL + ${RR_FAIL:-0}))
+[ "$RR_RC" = "0" ] || bad "test-real-restart.py exit code" "$RR_RC"
+
 # --- agent self-enrollment + reserved names (test-enroll.py) ------------------
 # Final phase: spins its own scratch instances (ports 18996-18999); never
 # touches this script's instance or the production relay.
 echo "---- enrollment phase (test-enroll.py) ----"
 ENROLL_RC=0
-ENROLL_OUT="$(python3 "$HOME/workspace/clack-relay/test-enroll.py" 2>&1)" || ENROLL_RC=$?
+# test-enroll.py spins its own scratch instances on its default ports
+# (18994-18999); drop our port override so it doesn't collide with this
+# script's relay on $PORT.
+ENROLL_OUT="$(env -u CLACK_TEST_PORT python3 "$HOME/workspace/clack-relay/test-enroll.py" 2>&1)" || ENROLL_RC=$?
 echo "$ENROLL_OUT"
 ENROLL_PASS="$(printf '%s\n' "$ENROLL_OUT" | sed -n 's/^pass=\([0-9][0-9]*\) fail=.*/\1/p')"
 ENROLL_FAIL="$(printf '%s\n' "$ENROLL_OUT" | sed -n 's/^pass=.* fail=\([0-9][0-9]*\)/\1/p')"

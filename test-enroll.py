@@ -30,7 +30,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY_PY = os.path.join(HERE, "relay.py")
 CLI = os.path.join(HERE, "relay-cli.py")
-PORT = 18996
+PORT = int(os.environ.get("CLACK_TEST_PORT", "18996"))
 BASE = "http://127.0.0.1:%d" % PORT
 ALICE_TOKEN = "kr_test_" + secrets.token_urlsafe(24)
 TMPD = tempfile.mkdtemp(prefix="clack-enroll-test-")
@@ -658,6 +658,10 @@ def run_cli_tests():
         cfg = {"port": port, "peers": {"alice": token},
                # v0.2.12: alice needs a signing key for authed calls.
                "identity_pubkeys": {"alice": ALICE_PUB_B64},
+               # v0.2.13 F4: the CLI fails closed when the relay has no
+               # verifiable identity, so scratch relays must provision one
+               # (as run_tofu_tests already does).
+               "identity_key": _gen_test_rsa_key(d),
                "enrollment": enrollment, "pow_difficulty": 8}
         with open(os.path.join(d, "relay-config.json"), "w") as f:
             json.dump(cfg, f)
@@ -916,6 +920,24 @@ def _run_telemetry_tests_inner():
     code, out, pub_b64, seed = enroll_agent(name="telepeer", gate="open")
     check(code == 200, "telemetry enroll ok", out)
     tok = out.get("service_token")
+    # v0.2.13: /v1/send requires mutual consent. This suite tests
+    # enrollment telemetry, not handshakes (see test-handshake.py), so
+    # seed the ACTIVE row directly, mirroring caller_identity().
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA busy_timeout=5000")
+    r = con.execute("SELECT identity_pubkey FROM peers WHERE name='alice'").fetchone()
+    alice_id = r[0] if r and r[0] else "alice"
+    a, b = sorted([alice_id, pub_b64])
+    now = time.time()
+    con.execute(
+        """INSERT OR REPLACE INTO handshakes(
+               a_identity, b_identity, status, created_at,
+               pending_expires_at, expires_at, last_activity,
+               via_link_id, redeemer_identity, generation)
+           VALUES(?, ?, 'active', ?, NULL, NULL, ?, 'test-enroll', NULL, 0)""",
+        (a, b, now, now))
+    con.commit()
+    con.close()
     row = peer_row("telepeer")
     check(row is not None and row[0] == "open",
           "telemetry enroll_gate='open'", row)

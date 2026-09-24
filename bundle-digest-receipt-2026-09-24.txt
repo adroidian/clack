@@ -1,0 +1,20 @@
+bundle-digest receipt -- v0.2.13
+generated: 2026-09-24T04:45:00Z
+branch: v0.2.13
+
+RUNTIME BUNDLE PROVENANCE (do not conflate with evidence provenance):
+  built from source commit: f05741923f027c6649ee81128e856fae45bea43c
+  the later commit 830b829 changed docs/tests/receipts only --
+  the bundle is byte-identical and was NOT rebuilt.
+
+sha256sum dist/clack-relay-bundle-v0.2.13.tar.gz:
+5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d  dist/clack-relay-bundle-v0.2.13.tar.gz
+
+recorded digest in DEPLOY_ROLLBACK_v0.2.13.md:
+sha256 `5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d`
+
+match: YES
+
+OPEN (not claimed complete): archive availability + hash verification
+from the published location, and isolated suite reproduction on a clean
+checkout -- operator/Zari verification tasks.

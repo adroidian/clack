@@ -1,0 +1,29 @@
+isolated suite reproduction -- v0.2.13
+generated: 2026-09-24T05:05:00Z
+checkout: clean detached worktree at 8a81ec9 (git worktree add --detach),
+          /tmp/clack-iso-0213, removed after the run
+method: full suite executed inside the isolated checkout only;
+        scratch ports 18803/18804/18805; production 18802 untouched
+
+archive retrieval + hash (from the isolated checkout):
+  sha256 dist/clack-relay-bundle-v0.2.13.tar.gz:
+  5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d
+  match vs recorded digest: YES
+
+suite results (isolated):
+  test-handshake.py:        103 passed, 0 failed
+  test-client-security.py:  120 passed, 0 failed
+  test-enroll.py:            82 passed, 0 failed  (first pass: 81/82 with
+                             one PoW timing flake; re-run 82/82 green)
+  test-signing.py:           81 passed, 0 failed
+  test-relay.sh:            133 passed, 0 failed
+  test-peer-lifecycle.py:    13 passed, 0 failed
+  total: 532 passed
+
+code provenance: git diff f057419..8a81ec9 touches docs/tests/receipts
+only; the runtime bundle (built from f057419) is byte-identical to what
+the current tree builds.
+
+OPEN (not claimed): archive hash from the published release location
+(no release published yet); target-specific recovery/relink checks at
+canary time.
