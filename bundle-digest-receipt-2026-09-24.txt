@@ -1,0 +1,10 @@
+bundle-digest receipt -- v0.2.13
+generated: 2026-09-24T04:34:41Z
+source commit: f05741923f027c6649ee81128e856fae45bea43c
+branch: v0.2.13
+
+sha256sum dist/clack-relay-bundle-v0.2.13.tar.gz:
+5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d  dist/clack-relay-bundle-v0.2.13.tar.gz
+
+recorded digest in DEPLOY_ROLLBACK_v0.2.13.md:
+sha256 `5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d`

@@ -1,6 +1,6 @@
 {"test": "migration_zero_rows", "handshake_rows": 0, "link_revocation_rows": 0, "has_generation": true, "has_dead_reason": true, "has_grant_handshake": true, "passed": true}
 {"test": "round_trip", "mint": 200, "redeem": 200, "accept": 200, "send_before_accept": 403, "send_after_accept": 200, "poll_delivered": 1, "passed": true}
-{"test": "no_deadline_extension", "t1": 1790309721.4044206, "t2": 1790309721.4044206, "unchanged": true, "db_value": 1790309721.4044206, "passed": true}
+{"test": "no_deadline_extension", "t1": 1790310829.8825297, "t2": 1790310829.8825297, "unchanged": true, "db_value": 1790310829.8825297, "passed": true}
 {"test": "expired_accept_denied", "code": 410, "row_not_active": true, "fresh_redeem_deadline_newer": true, "passed": true}
 {"test": "tampered_by", "minter_identity_matches": true, "passed": true}
 {"test": "revoke_dead_letters", "dead_letter_rows": 1, "dead_reason": "handshake_revoked", "poll_returned": 0, "send_after_revoke": 403, "accept_after_revoke": 410, "passed": true}
@@ -9,8 +9,10 @@
 {"test": "old_link_no_resurrect", "code": 403, "passed": true}
 {"test": "replayed_accept_stale_generation", "code": 409, "row_still_pending": true, "fresh_accept": 200, "passed": true}
 {"test": "final_use_race", "threads": 6, "max_uses": 3, "successes": 3, "db_uses": 3, "db_max_uses": 3, "pending_rows": 3, "passed": true}
-{"test": "accept_revoke_race", "accept_code": 200, "revoke_code": 200, "final_status": "revoked", "generation": 1, "passed": true}
-{"test": "send_revoke_race", "sends_200": 5, "sends_403": 5, "dead_lettered": 5, "poll_returned": 0, "passed": true}
-{"test": "restart_deadline_persistence", "before": 1790309726.294743, "after": 1790309726.294743, "unchanged": true, "re_redeem_unchanged": true, "passed": true}
+{"test": "accept_revoke_race", "accept_code": 410, "revoke_code": 200, "final_status": "revoked", "generation": 1, "passed": true}
+{"test": "send_revoke_race", "sends_200": 10, "sends_403": 0, "dead_lettered": 10, "poll_returned": 0, "passed": true}
+{"test": "restart_deadline_persistence", "before": 1790310833.9527686, "after": 1790310833.9527686, "unchanged": true, "re_redeem_unchanged": true, "passed": true}
 {"test": "restart_expired_accept_denied", "code": 410, "error": "handshake_revoked", "row_not_active": true, "passed": true}
-{"test": "cap_reached", "code": 403, "active_handshakes": 3, "named": 3, "peer_hints": ["guest-b431ca26", "guest-8a8e9b24", "guest-05a64a7d"], "passed": true}
+{"test": "revoke_survives_expiry_sweep", "generation_before": 1, "generation_after": 1, "revocation_memory_intact": true, "pair_still_revoked": true, "passed": true}
+{"test": "poll_revoke_ordering", "iterations": 12, "invariant": "delivered_iff_collected_else_dead_lettered", "violations": 0, "passed": true}
+{"test": "cap_reached", "code": 403, "active_handshakes": 3, "named": 3, "peer_hints": ["guest-e3d34ea2", "guest-e91546f6", "guest-d74e84fc"], "passed": true}

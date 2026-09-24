@@ -25,6 +25,16 @@ plus the Zari canary amendments:
   A5. Restart persistence: pending_expires_at survives SIGKILL + restart
       byte-identical (no reset, no recompute, no extension); an
       expired-by-restart deadline still denies accept atomically.
+  A6. Zari review round 2 (2026-09-24):
+        - a user revoke is never erased by expiry/sweep: forcing
+          hard-expiry conditions on a revoked row and running the
+          periodic sweep leaves status/generation/revocation-memory
+          untouched; stale accepts and old links still cannot resurrect
+          the pair.
+        - poll/revoke concurrent ordering: across raced iterations the
+          invariant holds that a message is delivered by a poll IFF it
+          was collected (fetched pre-revoke-commit); otherwise it is
+          dead-lettered with handshake_revoked and never delivered.
 
 Documented delivery boundary (also in relay.py's revoke handler):
 revocation cannot retract delivered plaintext. Messages already polled
@@ -911,6 +921,138 @@ try:
     receipt(test="restart_expired_accept_denied", code=410,
             error=out.get("error"), row_not_active=(st9 != "active"),
             passed=True)
+
+    # ------- phase 11: user revoke is not erased by expiry/sweep (Zari A6)
+    print("== phase 11: revoke survives expiry/sweep ==")
+    S7_IDENT = Ident(TMPD, "s7")
+    _, frag9 = mint_link(N, max_uses=1, exp_days=7)
+    code, red9 = redeem_fresh(S7_IDENT, frag9)
+    check("s7 redeem 200", code == 200, (code, red9))
+    S7 = Client(red9["peer_name"], S7_IDENT, red9["service_token"])
+    HSID_S7 = red9["handshake_id"]
+    code, _ = S7.req("POST", "/v1/handshakes/accept",
+                     {"handshake_id": HSID_S7})
+    assert code == 200, code
+    code, _ = N.req("POST", "/v1/handshakes/revoke",
+                    {"peer": red9["peer_name"]})
+    check("s7 revoke 200", code == 200, code)
+    a7, b7 = sorted([N_IDENT.pub_b64, S7_IDENT.pub_b64])
+    c = db()
+    before = c.execute(
+        "SELECT status, generation FROM handshakes"
+        " WHERE a_identity=? AND b_identity=?", (a7, b7)).fetchone()
+    check("revoked at generation 1",
+          before["status"] == "revoked" and before["generation"] == 1,
+          dict(before))
+    mem = c.execute(
+        "SELECT COUNT(*) FROM link_revocations"
+        " WHERE link_id=? AND a_identity=? AND b_identity=?",
+        (frag9["h"], a7, b7)).fetchone()[0]
+    check("revocation memory present", mem == 1, mem)
+    # Simulate hard expiry on the REVOKED row, then force the periodic
+    # sweep (restart resets the sweep timer; any request then runs it).
+    c.execute("UPDATE handshakes SET expires_at=?, pending_expires_at=?"
+              " WHERE a_identity=? AND b_identity=?",
+              (time.time() - 10, time.time() - 10, a7, b7))
+    c.commit()
+    c.close()
+    stop_relay()
+    start_relay()
+    code, _ = N.req("GET", "/v1/handshakes")  # trigger the sweep
+    check("sweep-trigger request 200", code == 200, code)
+    c = db()
+    after = c.execute(
+        "SELECT status, generation FROM handshakes"
+        " WHERE a_identity=? AND b_identity=?", (a7, b7)).fetchone()
+    check("sweep left the revoked row untouched",
+          after["status"] == "revoked"
+          and after["generation"] == before["generation"],
+          dict(after))
+    mem2 = c.execute(
+        "SELECT COUNT(*) FROM link_revocations"
+        " WHERE link_id=? AND a_identity=? AND b_identity=?",
+        (frag9["h"], a7, b7)).fetchone()[0]
+    c.close()
+    check("revocation memory intact after sweep", mem2 == 1, mem2)
+    # Stale artifacts still cannot resurrect the pair.
+    code, out = S7.req("POST", "/v1/handshakes/accept",
+                       {"handshake_id": HSID_S7})
+    check("stale accept on revoked pair -> 410 handshake_revoked",
+          code == 410 and out.get("error") == "handshake_revoked",
+          (code, out))
+    code, out = redeem_authed(S7, frag9)
+    check("old link re-redeem after sweep -> 403 link_unusable",
+          code == 403 and out.get("error") == "link_unusable", (code, out))
+    c = db()
+    st = c.execute("SELECT status FROM handshakes"
+                   " WHERE a_identity=? AND b_identity=?",
+                   (a7, b7)).fetchone()[0]
+    c.close()
+    check("pair still revoked", st == "revoked", st)
+    receipt(test="revoke_survives_expiry_sweep",
+            generation_before=before["generation"],
+            generation_after=after["generation"],
+            revocation_memory_intact=(mem2 == 1),
+            pair_still_revoked=(st == "revoked"),
+            passed=True)
+
+    # ------- phase 12: poll/revoke concurrent ordering (Zari A6)
+    print("== phase 12: poll vs revoke ordering ==")
+    ORDER_OK = True
+    ORDER_DETAIL = []
+    for i in range(12):
+        ri = Ident(TMPD, "po%d" % i)
+        _, fragx = mint_link(N, max_uses=1, exp_days=7)
+        code, redx = redeem_fresh(ri, fragx)
+        assert code == 200, (i, code, redx)
+        RX = Client(redx["peer_name"], ri, redx["service_token"])
+        code, _ = RX.req("POST", "/v1/handshakes/accept",
+                         {"handshake_id": redx["handshake_id"]})
+        assert code == 200, (i, code)
+        mid = str(uuid.uuid4())
+        code, _ = N.req("POST", "/v1/send",
+                        {"id": mid, "to": redx["peer_name"], "text": "order"})
+        assert code == 200, (i, mid, code)
+        got = {}
+
+        def do_poll(c=RX):
+            try:
+                got["res"] = c.req("GET", "/v1/poll?timeout=3")
+            except Exception as e:  # noqa: BLE001
+                got["res"] = ("exc", str(e))
+
+        tp = threading.Thread(target=do_poll)
+        tp.start()
+        # No sleep: revoke while the poll is in flight to maximize overlap.
+        code, _ = N.req("POST", "/v1/handshakes/revoke",
+                        {"peer": redx["peer_name"]})
+        assert code == 200, (i, code)
+        tp.join(timeout=60)
+        pcode, pol = got["res"]
+        delivered = ([m["id"] for m in pol.get("messages", [])]
+                     if isinstance(pol, dict) else [])
+        c = db()
+        row = c.execute("SELECT collected_at, dead_reason FROM messages"
+                        " WHERE id=?", (mid,)).fetchone()
+        c.close()
+        was_delivered = mid in delivered
+        collected = row is not None and row[0] is not None
+        dead = (row is not None and row[1] == "handshake_revoked"
+                and row[0] is None)
+        # Invariant: delivered IFF collected (fetched pre-revoke-commit);
+        # otherwise dead-lettered, uncollected, and never delivered.
+        ok = (pcode == 200 and was_delivered == collected
+              and (collected or dead))
+        if not ok:
+            ORDER_OK = False
+            ORDER_DETAIL.append(
+                (i, pcode, was_delivered, collected, dead,
+                 dict(row) if row else None))
+    check("12 poll/revoke races: delivery iff collected, else dead-lettered",
+          ORDER_OK and not ORDER_DETAIL, ORDER_DETAIL[:3])
+    receipt(test="poll_revoke_ordering", iterations=12,
+            invariant="delivered_iff_collected_else_dead_lettered",
+            violations=len(ORDER_DETAIL), passed=ORDER_OK)
 
     # --------------------------------- phase 10: at-cap names handshakes
     print("== phase 10: handshake cap ==")
