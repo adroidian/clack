@@ -453,6 +453,22 @@ def _save_identity_config(path, cfg, seed, key_path=None):
 # a determined intermediary that can reach the genuine relay can proxy the
 # challenge and return a valid proof. The CLI enforces the pin and refuses
 # redirects; it does not claim the challenge authenticates the channel.
+#
+# v0.2.13 handshake release gate (spec section 11, review F1-F4):
+# F1: centralized in req()/_ensure_origin_verified -- every request carrying
+# a bearer token, claim secret, signature, or message body routes through
+# this one transport, which verifies the relay identity (pin check) BEFORE
+# transmitting, on every origin including --base-url overrides.
+# F2: _NoRedirect raises on ANY 3xx (cross-host, cross-port, scheme-change,
+# method-changing 301/302/303/307/308) -- the client never follows with
+# credentials.
+# F3: fetch_relay_identity requires the echoed nonce to EXACTLY equal the
+# locally generated challenge, strictly validates the algorithm field, and
+# verifies the signature over the local nonce bytes (never the echo).
+# F4: fail closed -- identity unavailable (503, transport error, missing
+# material) aborts before any secret, enrollment proof, or message body
+# leaves the client, with or without a stored pin. No warning/--yes
+# bypass: first contact verifies-and-pins, or aborts.
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -763,10 +779,13 @@ def check_relay_identity(relay_url, cfg):
 
     Fetches the relay's stable identity key, verifies the nonce signature
     against it, and enforces the pinned fingerprint when the config already
-    has one. Returns the fingerprint (or None when the relay has no
-    identity key and no pin is stored). Aborts the process on pin mismatch
-    -- a changed relay key is never silently accepted -- and when the
-    identity service is unavailable but a pin exists (F4: no downgrade).
+    has one. Returns the fingerprint. Aborts the process on pin mismatch
+    -- a changed relay key is never silently accepted -- and whenever the
+    identity service is unavailable for ANY reason (503, transport error,
+    missing identity material), whether or not a pin exists (v0.2.13 F4:
+    fail closed before any secret, enrollment proof, or message body leaves
+    the client). There is no warn-and-continue and no --yes bypass for
+    identity authentication: first contact verifies-and-pins, or aborts.
     """
     try:
         fingerprint, _pubkey = fetch_relay_identity(relay_url, cfg)
@@ -778,15 +797,17 @@ def check_relay_identity(relay_url, cfg):
         print("could not verify relay identity: %s" % e, file=sys.stderr)
         sys.exit(1)
     if fingerprint is None:
-        # Relay has no identity key (503). A stored pin is never silently
-        # downgraded to unauthenticated onboarding (Flint review F4).
+        # Relay has no identity key (503) or identity material is missing.
+        # Fail closed: never downgrade to unauthenticated onboarding, with
+        # or without a stored pin -- a hostile endpoint must not harvest
+        # claim secrets or enrollment proofs by answering 503 (F4/P1).
         pinned = (cfg or {}).get("relay_identity_fingerprint")
-        if pinned:
-            print("relay identity unavailable (no identity key) but this "
-                  "config pins %s; aborting rather than downgrading to "
-                  "unauthenticated onboarding" % pinned, file=sys.stderr)
-            sys.exit(1)
-        return None
+        print("relay identity unavailable for %s%s; aborting before any "
+              "secret or enrollment proof is sent"
+              % (relay_url,
+                 (" (this config pins %s)" % pinned) if pinned else ""),
+              file=sys.stderr)
+        sys.exit(1)
     pinned = (cfg or {}).get("relay_identity_fingerprint")
     if pinned and pinned != fingerprint:
         print("RELAY IDENTITY CHANGED: pinned %s but relay now presents %s"
@@ -936,11 +957,9 @@ def cmd_redeem(args):
 
     print("You are about to join a relay:")
     print("  relay:            %s" % relay_url)
-    if relay_fp:
-        print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
-    else:
-        print("  relay key (TOFU): UNAVAILABLE (relay has no identity key) --")
-        print("                    continuing without relay authentication")
+    # check_relay_identity aborts when the relay has no verifiable identity
+    # (F4: fail closed), so relay_fp is always set here.
+    print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
     print("  invited by:       %s" % f["by"])
     print("  link expires:     %s" % exp_human)
     print("  link version:     %s" % f["v"])
@@ -1001,8 +1020,8 @@ def cmd_redeem(args):
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
-    if relay_fp:
-        cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
+    # check_relay_identity guarantees relay_fp (it aborts otherwise).
+    cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
     # Same config-save path as keygen: private key stays in its 0600 file.
     _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s...)" % (out["peer_name"], out["identity"][:12]))
@@ -1010,10 +1029,11 @@ def cmd_redeem(args):
     # Greeting exchange: hello to the inviter. Onboarding succeeds when the
     # invitee receives AND acknowledges the inviter's reply (checked by the
     # inviter via /v1/receipts -> acked).
-    # P1: the hello bears the fresh token, so it only goes to a
-    # pin-verified origin -- never to a relay with no identity key.
+    # F4: the hello bears the fresh token, so it only goes to the
+    # pin-verified origin -- check_relay_identity above guaranteed a
+    # verifiable relay identity, and the pin is stored below.
     inviter = out.get("inviter_name")
-    if inviter and cfg.get("relay_identity_fingerprint"):
+    if inviter:
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -1025,9 +1045,6 @@ def cmd_redeem(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
-    elif inviter:
-        print("note: relay has no identity key; skipping hello rather than "
-              "sending credentials to an unverified relay")
     else:
         print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
@@ -1075,11 +1092,9 @@ def cmd_enroll(args):
 
     print("You are about to enroll a new agent identity on a relay:")
     print("  relay:            %s" % relay_url)
-    if relay_fp:
-        print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
-    else:
-        print("  relay key (TOFU): UNAVAILABLE (relay has no identity key) --")
-        print("                    continuing without relay authentication")
+    # check_relay_identity aborts when the relay has no verifiable identity
+    # (F4: fail closed), so relay_fp is always set here.
+    print("  relay key (TOFU): %s  <- stable key; confirm once, pinned after" % relay_fp)
     if invite_id:
         print("  invite gate:      %s" % invite_id)
     if args.name:
@@ -1169,17 +1184,18 @@ def cmd_enroll(args):
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
-    if relay_fp:
-        cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
+    # check_relay_identity guarantees relay_fp (it aborts otherwise).
+    cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
     _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s..., via %s gate)"
           % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
 
     # Greeting exchange, mirroring redeem: hello to the inviter when the
-    # invite gate names one. P1: token-bearing, so only to a pin-verified
-    # origin -- never to a relay with no identity key.
+    # invite gate names one. F4: token-bearing, so only to the pin-verified
+    # origin -- check_relay_identity above guaranteed a verifiable relay
+    # identity, and the pin is stored above.
     inviter = out.get("inviter_name")
-    if inviter and cfg.get("relay_identity_fingerprint"):
+    if inviter:
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -1191,9 +1207,8 @@ def cmd_enroll(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
-    elif inviter:
-        print("note: relay has no identity key; skipping hello rather than "
-              "sending credentials to an unverified relay")
+    else:
+        print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
     return 0
 

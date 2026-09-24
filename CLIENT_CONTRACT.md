@@ -1,4 +1,4 @@
-# Clack Relay — Client Contract (v0.2.12)
+# Clack Relay — Client Contract (v0.2.13)
 
 A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 `mercedes`, `vesper`, `sigrid`, `nugget`. Text messages with correlated
@@ -147,31 +147,41 @@ relay's identity with a fresh-nonce challenge:
 
 ### What the pin does and does not prove
 
-The primary server authentication is TLS: your `https://` origin. The
-pinned relay key is a second layer — it catches a relay that changed keys
-and stops an unsophisticated impersonator. It does NOT by itself prove your
-connection reaches the real relay: a determined intermediary that can reach
-the genuine relay can proxy your challenge and hand you back a valid proof.
-Treat a passing check as "the relay key I expect answered", not "my
-connection is direct". The reference CLI enforces the pin on every
-authenticated request and never follows redirects with credentials.
+The primary server authentication is TLS to the stable, operator-owned
+origin (for the public rollout: `relay.tryclack.com` — a stable origin,
+not a recycled tunnel). The pinned relay key is defense-in-depth against
+tunnel-recycling and path attacks: it catches a relay that changed keys
+and stops an unsophisticated impersonator. It is NOT independent
+destination authentication, and it does NOT by itself prove your
+connection reaches the real relay — the nonce challenge is freely
+proxyable: a determined intermediary that can reach the genuine relay
+can forward your challenge and hand you back a valid proof. Never
+describe the challenge as standalone proof of the destination. Treat a
+passing check as "the relay key I expect answered", not "my connection
+is direct". The reference CLI enforces the pin on every authenticated
+request and never follows redirects with credentials.
 
 Fail-closed identity rules (the CLI aborts instead of sending your
-Bearer <redacted> when any of these hold):
+bearer token, claim secret, enrollment proof, or message body when any
+of these hold):
 - the presented fingerprint does not match the stored pin;
-- the identity service is unavailable (HTTP 503 / transport error) —
-  whether or not a pin exists. An endpoint that answers 503 must not be
-  able to harvest credentials by downgrading you to unauthenticated mode;
+- the identity service is unavailable (HTTP 503 / transport error /
+  missing identity material) — whether or not a pin exists. An endpoint
+  that answers 503 must not be able to harvest credentials by downgrading
+  you to unauthenticated mode. There is no warning-and-continue and no
+  `--yes` bypass for identity authentication;
 - first contact with no stored pin while the config bears a token: the
   operator must confirm the presented fingerprint out-of-band before it is
   pinned. Interactive runs prompt for an explicit YES; non-interactive runs
   abort and tell you to provision `relay_identity_fingerprint` in the
   config (confirmed out-of-band) or run once interactively.
 
-The only requests that ever cross an unverified origin are tokenless
-first-contact enrollment calls (`enroll` / `redeem`), which show the
-fingerprint at their own confirmation tap and never transmit an existing
-secret.
+The identity challenge request itself (`GET /v1/identity?nonce=...`)
+carries no credentials by construction. Every other request — including
+the tokenless first-contact enrollment calls (`enroll` / `redeem`) — is
+sent only after the relay identity verifies; when verification is
+unavailable the CLI aborts before any claim secret, enrollment proof, or
+message body is transmitted. Verify-and-pin, or abort.
 
 ## Base URL
 

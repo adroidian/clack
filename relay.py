@@ -29,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.12"
+VERSION = "0.2.13"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -118,6 +118,155 @@ def _init_identity_pubkeys(cfg):
     except ValueError as e:
         raise SystemExit("clack-relay: invalid identity_pubkeys: %s" % e)
 
+
+# --- Mutual-consent handshakes (v0.2.13) ---------------------------------------
+# Two strangers connect over one link: N mints (authenticated+signed, N's
+# consent recorded with N's identity), Z redeems (pending) then accepts
+# (signed by Z, Z's consent). /v1/send requires an ACTIVE handshake between
+# the sender's and recipient's identities. No backfill: the relay can never
+# create a handshake on its own authority -- only the two peers can.
+HANDSHAKE_LINK_VERSION = 4
+HANDSHAKE_PENDING_WINDOW = 86400.0  # 24h: redeem -> accept window
+HANDSHAKE_NOTE_MAX = 280
+# Tier knobs (config; no billing wired). 0 = unlimited / never. Parsed and
+# validated in main(); module defaults keep bare imports working.
+# NOTE (canary, Zari): handshake_inactivity_expiry_days defaults to 0 =
+# never, and there is intentionally NO inactivity sweep in v0.2.13.
+# Future semantics (recorded, not implemented): when enabled, only
+# successfully authorized pair traffic refreshes last_activity -- never
+# poll/health/rejected attempts; warn before expiry; require a fresh
+# mutual handshake afterward.
+HS_MAX_PER_IDENTITY = 0
+HS_EXPIRY_DAYS = 0
+HS_INACTIVITY_DAYS = 0
+
+
+def _parse_handshake_knobs(cfg):
+    """Validate the section-9 tier knobs from relay-config.json. Strict:
+    malformed entries refuse startup, like reserved_names/identity_pubkeys."""
+    global HS_MAX_PER_IDENTITY, HS_EXPIRY_DAYS, HS_INACTIVITY_DAYS
+
+    def _num(name, default, integer=False):
+        v = cfg.get(name, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            raise ValueError("%s must be a number >= 0, got %r" % (name, v))
+        if integer and not float(v).is_integer():
+            raise ValueError("%s must be an integer >= 0, got %r" % (name, v))
+        return int(v) if integer else float(v)
+
+    HS_MAX_PER_IDENTITY = _num("max_handshakes_per_identity", 0, integer=True)
+    HS_EXPIRY_DAYS = _num("handshake_expiry_days", 0)
+    # Canary: inactivity expiry is OFF (0 = never). No sweep implements it.
+    HS_INACTIVITY_DAYS = _num("handshake_inactivity_expiry_days", 0)
+
+
+def _hs_pair(x, y):
+    """Order-independent pair key: (a_identity, b_identity) sorted."""
+    return (x, y) if x <= y else (y, x)
+
+
+def _hs_id(a, b, generation):
+    """Wire id for a handshake row. Embeds the pair generation (amendment:
+    accept binds to the CURRENT generation; a stale id from a pre-revoke
+    pending is rejected). Identities are b64u or [a-z0-9_-] names; neither
+    charset contains '|'."""
+    return "%s|%s|%d" % (a, b, generation)
+
+
+def _parse_hs_id(hid):
+    """Parse a handshake_id back to (a, b, generation) with the pair in
+    canonical sorted order, or None."""
+    if not isinstance(hid, str):
+        return None
+    parts = hid.split("|")
+    if len(parts) != 3 or not parts[0] or not parts[1]:
+        return None
+    try:
+        gen = int(parts[2])
+    except ValueError:
+        return None
+    if gen < 0:
+        return None
+    a, b = _hs_pair(parts[0], parts[1])
+    return (a, b, gen)
+
+
+def _build_handshake_link(base_url, link_id, secret, minter_name, exp, max_uses):
+    """v4 link fragment: h=link id, k=claim secret, by=display name
+    (DISPLAY-ONLY -- the server always derives the minter from its mint
+    record, never from this field), exp, max."""
+    frag = "v=%d&r=%s&h=%s&k=%s&by=%s&exp=%d&max=%d" % (
+        HANDSHAKE_LINK_VERSION,
+        b64u_encode(base_url.encode("utf-8")),
+        link_id,
+        b64u_encode(secret),
+        urllib.parse.quote(minter_name, safe=""),
+        int(exp),
+        max_uses,
+    )
+    return base_url.rstrip("/") + "/join#" + frag
+
+
+def _hs_public(a, b, row):
+    """Serialize a handshake row for the API. row is
+    (status, created_at, pending_expires_at, expires_at, last_activity,
+     via_link_id, generation)."""
+    return {
+        "handshake_id": _hs_id(a, b, row[6]),
+        "a_identity": a,
+        "b_identity": b,
+        "status": row[0],
+        "created_at": row[1],
+        "pending_expires_at": row[2],
+        "expires_at": row[3],
+        "last_activity": row[4],
+        "via_link_id": row[5],
+        "generation": row[6],
+    }
+
+
+# Row shape shared by the handshake handlers: status, created_at,
+# pending_expires_at, expires_at, last_activity, via_link_id, generation,
+# redeemer_identity.
+_HS_COLS = ("status, created_at, pending_expires_at, expires_at,"
+            " last_activity, via_link_id, generation, redeemer_identity")
+
+
+def _active_handshake_count(ident):
+    """Established (active) handshakes involving ident, either direction.
+    Pending handshakes do not count until accepted."""
+    with db_lock:
+        return conn.execute(
+            "SELECT COUNT(*) FROM handshakes WHERE status='active'"
+            " AND (a_identity=? OR b_identity=?)",
+            (ident, ident),
+        ).fetchone()[0]
+
+
+def _active_handshake_list(ident):
+    """Active handshakes for the at-cap response: named so the peer can
+    revoke to make room."""
+    with db_lock:
+        rows = conn.execute(
+            """SELECT a_identity, b_identity, created_at, last_activity, generation
+               FROM handshakes WHERE status='active'
+                 AND (a_identity=? OR b_identity=?)
+               ORDER BY last_activity DESC""",
+            (ident, ident),
+        ).fetchall()
+    out = []
+    for a, b, created_at, last_activity, generation in rows:
+        other = b if a == ident else a
+        out.append(
+            {
+                "handshake_id": _hs_id(a, b, generation),
+                "peer_identity": other,
+                "peer_name_hint": peer_name_for_identity(other),
+                "created_at": created_at,
+                "last_activity": last_activity,
+            }
+        )
+    return out
 
 # --- Invite-link onboarding (v0.2.5, MVP) ------------------------------------
 # Contacts-first: an invitation introduces two independently controlled Muse
@@ -290,6 +439,66 @@ def init_db(cfg):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_seen_nonces_exp ON seen_nonces(expires_at)"
     )
+    # v0.2.13: mutual-consent handshakes. a/b are order-independent
+    # identities (identity pubkey b64, or legacy config peer name).
+    # NO BACKFILL (spec section 8): this migration creates tables/columns
+    # only -- zero handshake rows. Enforcement begins immediately.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS handshakes(
+               a_identity TEXT NOT NULL,
+               b_identity TEXT NOT NULL,
+               status TEXT NOT NULL,
+               created_at REAL NOT NULL,
+               pending_expires_at REAL,
+               expires_at REAL,
+               last_activity REAL NOT NULL,
+               via_link_id TEXT,
+               redeemer_identity TEXT,
+               -- Per-pair generation, bumped on every revoke. The issued
+               -- handshake_id embeds the generation; accept binds to the
+               -- CURRENT generation, so an accept (or replayed accept)
+               -- minted for a pre-revoke pending can never land on the
+               -- post-revoke row. Quota-expiry transitions do NOT bump it.
+               generation INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (a_identity, b_identity))"""
+    )
+    # Pair-scoped revocation memory: a revoked link can never resurrect
+    # the specific connection it created (spec section 7).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS link_revocations(
+               link_id TEXT NOT NULL,
+               a_identity TEXT NOT NULL,
+               b_identity TEXT NOT NULL,
+               revoked_at REAL NOT NULL,
+               PRIMARY KEY (link_id, a_identity, b_identity))"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_handshakes_status ON handshakes(status)"
+    )
+    # Ensure-column path: CREATE TABLE IF NOT EXISTS is a no-op when a
+    # partial handshakes table already exists (e.g. an earlier 0.2.13
+    # dev build), so the generation column gets its own ALTER guard.
+    hs_cols = {r[1] for r in conn.execute("PRAGMA table_info(handshakes)")}
+    if "generation" not in hs_cols:
+        conn.execute(
+            "ALTER TABLE handshakes ADD COLUMN"
+            " generation INTEGER NOT NULL DEFAULT 0"
+        )
+    inv_cols = {r[1] for r in conn.execute("PRAGMA table_info(invites)")}
+    for _col, _ddl in (
+        # A handshake link IS an invite row with grant_handshake=1.
+        ("grant_handshake", "INTEGER DEFAULT 0"),
+        ("note", "TEXT"),
+    ):
+        if _col not in inv_cols:
+            conn.execute("ALTER TABLE invites ADD COLUMN %s %s" % (_col, _ddl))
+    # v0.2.13: revocation dead-letter reason. Queued-but-unpolled messages
+    # killed by a handshake revoke carry dead_reason='handshake_revoked';
+    # they surface via /v1/receipts as expired-with-reason and are never
+    # delivered after revocation.
+    msg_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "dead_reason" not in msg_cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN dead_reason TEXT")
     now = time.time()
     # Revocation-safe rebuild: peers removed from the config must lose
     # authentication on restart. Config-managed rows (enroll_gate='config',
@@ -403,6 +612,29 @@ def sweep(now):
         # v0.2.12: drop expired seen nonces (replay window is NONCE_TTL
         # past the nonce's own timestamp).
         conn.execute("DELETE FROM seen_nonces WHERE expires_at <= ?", (now,))
+        # v0.2.13: handshake lifecycle. Expired pendings can never be
+        # accepted (the accept guard also enforces this atomically); hard
+        # expiry retires actives/pendings when the knob is set. These are
+        # quota hygiene, NOT explicit revokes, so no link_revocations
+        # entries are written -- an expired/exhausted-quota pair may
+        # re-consent over any link, and generation is NOT bumped.
+        # There is deliberately NO inactivity sweep in v0.2.13 (canary):
+        # handshake_inactivity_expiry_days defaults to 0 = never.
+        conn.execute(
+            """UPDATE handshakes SET status='revoked', pending_expires_at=NULL,
+                                  redeemer_identity=NULL
+               WHERE status='pending' AND pending_expires_at IS NOT NULL
+                 AND pending_expires_at <= ?""",
+            (now,),
+        )
+        if HS_EXPIRY_DAYS > 0:
+            conn.execute(
+                """UPDATE handshakes SET status='revoked', pending_expires_at=NULL,
+                                      redeemer_identity=NULL
+                   WHERE status IN ('pending','active') AND expires_at IS NOT NULL
+                     AND expires_at <= ?""",
+                (now,),
+            )
         conn.commit()
 
 
@@ -1463,6 +1695,9 @@ class Handler(BaseHTTPRequestHandler):
         peer = self._require_auth()
         if peer is None:
             return
+        if parsed.path == "/v1/handshakes":
+            self._handle_handshakes_list(peer)
+            return
         if parsed.path == "/v1/invites/list":
             ident = caller_identity(peer)
             with db_lock:
@@ -1581,7 +1816,7 @@ class Handler(BaseHTTPRequestHandler):
             with db_lock:
                 rows = conn.execute(
                     """SELECT id, recipient, topic, created_at, expires_at,
-                              collected_at, acked_at
+                              collected_at, acked_at, dead_reason
                        FROM messages WHERE sender=? AND created_at >= ?
                        ORDER BY created_at DESC LIMIT ?""",
                     (peer, since, limit),
@@ -1593,7 +1828,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif r[5] is not None:
                     state = "collected"
                 elif r[4] <= now:
-                    state = "expired"
+                    # v0.2.13: revoked handshakes dead-letter queued
+                    # messages; the reason is exposed for the sender.
+                    state = "dead" if r[7] else "expired"
                 else:
                     state = "queued"
                 out.append(
@@ -1606,6 +1843,7 @@ class Handler(BaseHTTPRequestHandler):
                         "state": state,
                         "collected_at": r[5],
                         "acked_at": r[6],
+                        "dead_reason": r[7],
                     }
                 )
             self._json(200, {"receipts": out})
@@ -1655,6 +1893,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/enroll":
             self._handle_enroll(now)
             return
+        if parsed.path == "/v1/handshakes/redeem":
+            # Public for new identities, authenticated (bearer + signature)
+            # for enrolled ones -- the handler decides from the
+            # Authorization header.
+            self._handle_handshake_redeem(now)
+            return
         peer = self._require_auth()
         if peer is None:
             return
@@ -1663,6 +1907,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/v1/invites/revoke":
             self._handle_invite_revoke(peer)
+            return
+        if parsed.path == "/v1/handshakes/mint-link":
+            self._handle_handshake_mint(peer, now)
+            return
+        if parsed.path == "/v1/handshakes/accept":
+            self._handle_handshake_accept(peer, now)
+            return
+        if parsed.path == "/v1/handshakes/revoke":
+            self._handle_handshake_revoke(peer, now)
             return
         if parsed.path == "/v1/ack":
             body = self._read_json()
@@ -1730,38 +1983,96 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": err})
                 return
 
+            # v0.2.13: mutual-consent gate. Identities are stable per peer
+            # name, so read them before the write transaction.
+            s_id = caller_identity(peer)
+            r_id = caller_identity(to)
+            ga, gb = _hs_pair(s_id, r_id)
             with db_lock:
-                row = conn.execute("SELECT sender FROM messages WHERE id=?", (mid,)).fetchone()
-                if row:
-                    if row[0] == peer:
-                        self._json(200, {"accepted": True, "duplicate": True, "id": mid})
-                    else:
-                        self._json(409, {"error": "id_collision"})
-                    return
-                cap = conn.execute(
-                    "SELECT COUNT(*) FROM messages WHERE recipient=? AND acked_at IS NULL AND expires_at > ?",
-                    (to, now),
-                ).fetchone()[0]
-                if cap >= PENDING_CAP:
-                    self._json(429, {"error": "queue_full"})
-                    return
-                expires_at = now + ttl
-                conn.execute(
-                    """INSERT INTO messages(id, sender, recipient, topic, text,
-                                            in_reply_to, created_at, expires_at, acked_at)
-                       VALUES(?,?,?,?,?,?,?,?,NULL)""",
-                    (
-                        mid,
-                        peer,
-                        to,
-                        topic if topic else None,
-                        text,
-                        in_reply_to if in_reply_to else None,
-                        now,
-                        expires_at,
-                    ),
-                )
-                conn.commit()
+                now2 = time.time()
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute("SELECT sender FROM messages WHERE id=?", (mid,)).fetchone()
+                    if row:
+                        conn.execute("ROLLBACK")
+                        # Dedup is checked BEFORE the gate, deliberately: a
+                        # retry of an accepted send returns the original
+                        # outcome (duplicate:true) without re-consulting
+                        # handshake state, so a post-revoke retry is not
+                        # misreported as a 403 and reveals nothing about
+                        # the current handshake. (If the original was
+                        # later dead-lettered by a revoke, the duplicate
+                        # still reports the accepted outcome; the dead
+                        # state is visible via /v1/receipts.) A retry of a
+                        # never-stored (rejected) send misses dedup and is
+                        # gated fresh below. Both checks share this one
+                        # transaction, so a revoke cannot interleave
+                        # between them.
+                        if row[0] == peer:
+                            self._json(200, {"accepted": True, "duplicate": True, "id": mid})
+                        else:
+                            self._json(409, {"error": "id_collision"})
+                        return
+                    # The gate lives INSIDE the same transaction as the
+                    # INSERT: a revoke committing between a separate gate
+                    # check and this insert could otherwise deliver
+                    # post-revocation. Either the send fully precedes the
+                    # revoke (its message is then dead-lettered) or fully
+                    # follows it (403 here). Pending or no handshake:
+                    # 403 handshake_required. Revoked or hard-expired:
+                    # 403 handshake_revoked. Successful authorized traffic
+                    # refreshes last_activity; rejected attempts don't.
+                    hs = conn.execute(
+                        "SELECT status, expires_at FROM handshakes"
+                        " WHERE a_identity=? AND b_identity=?",
+                        (ga, gb),
+                    ).fetchone()
+                    if hs is None or hs[0] == "pending":
+                        conn.execute("ROLLBACK")
+                        self._json(403, {"error": "handshake_required"})
+                        return
+                    if hs[0] == "revoked" or (hs[1] is not None and hs[1] <= now2):
+                        conn.execute("ROLLBACK")
+                        self._json(403, {"error": "handshake_revoked"})
+                        return
+                    cap = conn.execute(
+                        "SELECT COUNT(*) FROM messages WHERE recipient=? AND acked_at IS NULL AND expires_at > ?",
+                        (to, now2),
+                    ).fetchone()[0]
+                    if cap >= PENDING_CAP:
+                        conn.execute("ROLLBACK")
+                        self._json(429, {"error": "queue_full"})
+                        return
+                    expires_at = now2 + ttl
+                    conn.execute(
+                        """INSERT INTO messages(id, sender, recipient, topic, text,
+                                                in_reply_to, created_at, expires_at, acked_at)
+                           VALUES(?,?,?,?,?,?,?,?,NULL)""",
+                        (
+                            mid,
+                            peer,
+                            to,
+                            topic if topic else None,
+                            text,
+                            in_reply_to if in_reply_to else None,
+                            now2,
+                            expires_at,
+                        ),
+                    )
+                    conn.execute(
+                        "UPDATE handshakes SET last_activity=?"
+                        " WHERE a_identity=? AND b_identity=?",
+                        (now2, ga, gb),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
             # v0.2.4: wake the recipient if they registered a nudge webhook.
             # Runs after commit, outside the db lock; best-effort only.
             maybe_notify(to)
@@ -1882,15 +2193,20 @@ class Handler(BaseHTTPRequestHandler):
             return
         with db_lock:
             row = conn.execute(
-                "SELECT exp, max_uses, uses, revoked FROM invites WHERE invite_id=?",
+                "SELECT exp, max_uses, uses, revoked, grant_handshake"
+                " FROM invites WHERE invite_id=?",
                 (invite_id,),
             ).fetchone()
         if row is None:
             self._json(404, {"error": "invite_not_found"})
             return
-        exp, max_uses, uses, revoked = row
-        if revoked or exp <= now or uses >= max_uses:
+        exp, max_uses, uses, revoked, gh = row
+        if revoked or gh or exp <= now or uses >= max_uses:
             # One error on purpose: don't leak which condition failed.
+            # v4 handshake links (grant_handshake=1) are handshake-only;
+            # legacy /v1/invites/* rejects them. (Exception:
+            # /v1/enroll/challenge allows them -- handshake redeem reuses
+            # that challenge for invite-gated enrollment.)
             self._json(410, {"error": "invite_unusable"})
             return
         nonce = secrets.token_bytes(32)
@@ -1942,14 +2258,17 @@ class Handler(BaseHTTPRequestHandler):
         with db_lock:
             inv = conn.execute(
                 """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
-                          revoked FROM invites WHERE invite_id=?""",
+                          revoked, grant_handshake FROM invites WHERE invite_id=?""",
                 (invite_id,),
             ).fetchone()
         if inv is None:
             fail("invite_not_found", 404)
             return
-        secret_hash, inviter_identity, exp, max_uses, uses, revoked = inv
-        if revoked or exp <= now or uses >= max_uses:
+        secret_hash, inviter_identity, exp, max_uses, uses, revoked, gh = inv
+        # v4 handshake links are handshake-only: /v1/handshakes/redeem
+        # consumes them. Legacy redeem rejects them as unusable (burning a
+        # link use without creating a handshake would be wrong).
+        if revoked or gh or exp <= now or uses >= max_uses:
             fail("invite_unusable", 410)
             return
         try:
@@ -2231,14 +2550,18 @@ class Handler(BaseHTTPRequestHandler):
             with db_lock:
                 inv = conn.execute(
                     """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
-                              revoked FROM invites WHERE invite_id=?""",
+                              revoked, grant_handshake FROM invites WHERE invite_id=?""",
                     (invite_id,),
                 ).fetchone()
             if inv is None:
                 fail("invite_not_found", 404)
                 return
-            secret_hash, inviter_identity, exp, max_uses, uses, revoked = inv
-            if revoked or exp <= now or uses >= max_uses:
+            secret_hash, inviter_identity, exp, max_uses, uses, revoked, gh = inv
+            # v4 handshake links are handshake-only: legacy enroll must not
+            # burn a link use without creating a handshake. (Fetching the
+            # challenge for a v4 link is still allowed -- handshake redeem
+            # consumes it.)
+            if revoked or gh or exp <= now or uses >= max_uses:
                 fail("invite_unusable", 410)
                 return
             try:
@@ -2433,6 +2756,670 @@ class Handler(BaseHTTPRequestHandler):
             conn.commit()
         self._json(200, {"invite_id": invite_id, "revoked": True})
 
+    # --- Mutual-consent handshakes (v0.2.13) ----------------------------------
+    # Consent model (spec section 2): N's authenticated+signed mint-link IS
+    # N's consent (minter identity recorded from the mint record, never from
+    # the display-only `by` fragment). Z's redeem creates a PENDING
+    # handshake; Z's signed accept (bound to redeemer_identity AND the
+    # current pair generation) activates it. Either party revokes
+    # unilaterally. The relay can never create a handshake on its own
+    # authority -- no backfill, no operator bypass.
+
+    def _resolve_handshake_peer(self, value):
+        """Resolve a peer reference (peer name or identity string) to
+        (identity, name). Returns (None, None) when unknown. Callers must
+        NOT hold db_lock."""
+        if not isinstance(value, str) or not value:
+            return None, None
+        with db_lock:
+            row = conn.execute(
+                "SELECT name, identity_pubkey FROM peers WHERE name=?", (value,)
+            ).fetchone()
+            if row:
+                return (row[1] if row[1] else row[0]), row[0]
+            row = conn.execute(
+                "SELECT name FROM peers WHERE identity_pubkey=?", (value,)
+            ).fetchone()
+            if row:
+                return value, row[0]
+        return None, None
+
+    def _handle_handshake_mint(self, peer, now):
+        body = self._read_json()
+        if not isinstance(body, dict):
+            self._json(400, {"error": "invalid_json"})
+            return
+        max_uses = body.get("max_uses", 1)
+        exp_days = body.get("exp_days", 7)
+        note = body.get("note")
+        if isinstance(max_uses, bool) or not isinstance(max_uses, int):
+            self._json(400, {"error": "bad_max_uses"})
+            return
+        if isinstance(exp_days, bool) or not isinstance(exp_days, (int, float)):
+            self._json(400, {"error": "bad_exp_days"})
+            return
+        if note is not None and (
+            not isinstance(note, str) or len(note) > HANDSHAKE_NOTE_MAX
+        ):
+            self._json(400, {"error": "bad_note"})
+            return
+        exp_secs = exp_days * 86400.0
+        if not (1 <= max_uses <= INVITE_MAX_USES_CAP):
+            self._json(400, {"error": "bad_max_uses"})
+            return
+        if not (INVITE_MIN_EXPIRY <= exp_secs <= INVITE_MAX_EXPIRY):
+            self._json(400, {"error": "bad_exp_days"})
+            return
+        ident = caller_identity(peer)
+        # Tier cap (spec section 9): count ESTABLISHED (active) handshakes
+        # in both directions at mint time. Pending handshakes don't count.
+        # At-cap response names the existing handshakes so the peer can
+        # revoke to make room.
+        if HS_MAX_PER_IDENTITY > 0 and (
+            _active_handshake_count(ident) >= HS_MAX_PER_IDENTITY
+        ):
+            self._json(
+                403,
+                {
+                    "error": "handshake_cap_reached",
+                    "handshakes": _active_handshake_list(ident),
+                },
+            )
+            return
+        link_id = str(uuid.uuid4())
+        secret = secrets.token_bytes(32)
+        exp = now + exp_secs
+        # Same atomic quota discipline as /v1/invites/mint: quota check and
+        # insert inside one BEGIN IMMEDIATE so concurrent mints cannot both
+        # pass. Handshake links share the invite quota pool (one table).
+        # A link IS an invite row with grant_handshake=1; the minter's
+        # identity is recorded in the mint record at creation.
+        with db_lock:
+            now2 = time.time()
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                active = conn.execute(
+                    """SELECT COUNT(*) FROM invites
+                       WHERE inviter_identity=? AND revoked=0 AND exp > ?
+                         AND uses < max_uses""",
+                    (ident, now2),
+                ).fetchone()[0]
+                if active >= INVITE_QUOTA_PER_IDENTITY:
+                    conn.execute("ROLLBACK")
+                    self._json(429, {"error": "invite_quota_exceeded"})
+                    return
+                conn.execute(
+                    """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
+                                           exp, max_uses, uses, revoked, created_at,
+                                           grant_handshake, note)
+                       VALUES(?,?,?,?,?,0,0,?,1,?)""",
+                    (
+                        link_id,
+                        hashlib.sha256(secret).hexdigest(),
+                        ident,
+                        exp,
+                        max_uses,
+                        now2,
+                        note,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        link = _build_handshake_link(
+            relay_base_url(relay_cfg), link_id, secret, peer, exp, max_uses
+        )
+        self._json(
+            200,
+            {"link": link, "link_id": link_id, "exp": exp, "max_uses": max_uses},
+        )
+
+    def _handle_handshake_redeem(self, now):
+        body = self._read_json()
+        if not isinstance(body, dict):
+            self._json(400, {"error": "invalid_json"})
+            return
+        h = body.get("h")
+        k = body.get("k")
+        if not isinstance(h, str) or not h:
+            self._json(400, {"error": "link_id_required"})
+            return
+        if not isinstance(k, str) or not k:
+            self._json(400, {"error": "claim_required"})
+            return
+        ip = self._client_ip()
+        # Redeem is rate-limited per IP and per link: the invite limiters.
+        if not invite_rate_ok("rip:" + ip, 30):
+            self._json(429, {"error": "rate_limited"})
+            return
+        if not invite_rate_ok("rinv:" + h, 10):
+            self._json(429, {"error": "rate_limited"})
+            return
+        if redeem_failures_blocked(h):
+            self._json(429, {"error": "invite_cooldown"})
+            return
+
+        def link_fail():
+            # IDENTICAL shape for every link-validity failure: unknown id,
+            # bad claim secret, expired/exhausted/revoked link,
+            # non-handshake (v3) link, and previously-revoked pair. No
+            # enumeration oracle. The claim secret k is never logged and
+            # never appears in error text.
+            redeem_failure_note(h)
+            self._json(403, {"error": "link_unusable"})
+
+        # Optional authentication: an already-enrolled caller redeems
+        # authenticated (bearer + signature). No Authorization header =>
+        # fresh enrollment inline below.
+        peer = None
+        if self.headers.get("Authorization"):
+            peer = self._require_auth()
+            if peer is None:
+                return
+        # Fast-path link validation. The single-UPDATE use-count inside
+        # the transaction below is the authoritative gate.
+        with db_lock:
+            inv = conn.execute(
+                """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
+                          revoked, grant_handshake
+                   FROM invites WHERE invite_id=?""",
+                (h,),
+            ).fetchone()
+        if inv is None:
+            link_fail()
+            return
+        secret_hash, minter, exp, max_uses, uses, revoked, gh = inv
+        # NOTE: the use-count is deliberately NOT checked here. A retry
+        # of a live pending whose link is at max_uses (the final-use
+        # case) must reach the idempotency branch inside the transaction
+        # below and return the same row -- not 403. Exhaustion is
+        # enforced authoritatively by the atomic UPDATE's
+        # uses < max_uses predicate, AFTER the idempotency check.
+        if gh != 1 or revoked or exp <= now:
+            link_fail()
+            return
+        try:
+            secret = b64u_decode(k)
+        except ValueError:
+            link_fail()
+            return
+        if not hmac.compare_digest(
+            hashlib.sha256(secret).hexdigest(), secret_hash
+        ):
+            link_fail()
+            return
+        # N's identity comes from the mint record. The `by` fragment field
+        # never reaches the server (URL fragments are client-side) and is
+        # display-only by construction: a forged `by` cannot change who Z
+        # handshakes with.
+        enroll = None  # (pub_b64, gate, invited_by) when enrolling inline
+        if peer is not None:
+            redeemer = caller_identity(peer)
+        else:
+            # Fresh enrollment inline (spec section 3): PoW on open relays,
+            # the link itself as the invite grant on invite-gated ones.
+            gates = _enrollment_gates()
+            if "invite" in gates:
+                gate = "invite"
+            elif "pow" in gates:
+                gate = "pow"
+            elif "open" in gates:
+                gate = "open"
+            else:
+                self._json(400, {"error": "enrollment_not_allowed"})
+                return
+            try:
+                pubkey = b64u_decode(body.get("identity_pubkey"))
+            except ValueError:
+                self._json(400, {"error": "bad_identity"})
+                return
+            if len(pubkey) != 32 or not ed25519.is_valid_pubkey(pubkey):
+                # R5: never enroll a small-order key.
+                self._json(400, {"error": "bad_identity"})
+                return
+            pub_b64 = b64u_encode(pubkey)
+            proof = body.get("proof")
+            if not isinstance(proof, dict):
+                self._json(400, {"error": "bad_proof"})
+                return
+            try:
+                presented = b64u_decode(proof.get("nonce"))
+                sig = b64u_decode(proof.get("signature"))
+            except ValueError:
+                self._json(400, {"error": "bad_proof"})
+                return
+            if len(sig) != 64:
+                self._json(400, {"error": "bad_proof"})
+                return
+            # Consume the pre-enrollment challenge at presentation:
+            # single-use, kind-bound (and invite-bound for the invite gate).
+            # The handshake flow reuses /v1/enroll/challenge: for the invite
+            # gate the client fetches it with {"invite_id": h}.
+            presented_s = b64u_encode(presented)
+            with db_lock:
+                ch = conn.execute(
+                    "SELECT kind, ref, expires_at, used FROM enroll_challenges"
+                    " WHERE nonce=?",
+                    (presented_s,),
+                ).fetchone()
+                ok = (
+                    ch is not None
+                    and ch[3] == 0
+                    and ch[2] > now
+                    and ch[0] == gate
+                    and (gate != "invite" or ch[1] == h)
+                )
+                if ok:
+                    conn.execute(
+                        "UPDATE enroll_challenges SET used=1 WHERE nonce=?",
+                        (presented_s,),
+                    )
+                    conn.commit()
+            if not ok:
+                self._json(400, {"error": "bad_challenge"})
+                return
+            if gate == "pow":
+                try:
+                    pow_nonce = b64u_decode(body.get("pow_nonce"))
+                except ValueError:
+                    self._json(400, {"error": "bad_pow"})
+                    return
+                if not (1 <= len(pow_nonce) <= 64):
+                    self._json(400, {"error": "bad_pow"})
+                    return
+                digest = hashlib.sha256(presented + pow_nonce).digest()
+                if _pow_leading_zero_bits(digest) < _pow_difficulty():
+                    self._json(400, {"error": "bad_pow"})
+                    return
+                msg = presented + pow_nonce + pubkey
+                invited_by = "pow"
+            elif gate == "open":
+                msg = presented + pubkey
+                invited_by = "open"
+            else:
+                msg = presented + h.encode("utf-8") + pubkey
+                invited_by = minter
+            if not ed25519.verify(pubkey, sig, msg):
+                self._json(400, {"error": "bad_proof"})
+                return
+            redeemer = pub_b64
+            enroll = (pub_b64, gate, invited_by)
+        if redeemer == minter:
+            self._json(400, {"error": "cannot_handshake_self"})
+            return
+        a, b = _hs_pair(minter, redeemer)
+        # All paths -- active, live pending, revoked, lapsed pending, new
+        # pair -- go through the single transaction below, which rechecks
+        # the row inside the write lock. Idempotent retries consume no
+        # link use and never extend pending_expires_at.
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        name = None
+        with db_lock:
+            now2 = time.time()  # fresh: request-start `now` may predate expiry
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute(
+                    "SELECT 1 FROM link_revocations WHERE link_id=?"
+                    " AND a_identity=? AND b_identity=?",
+                    (h, a, b),
+                ).fetchone():
+                    # This exact pair revoked a handshake created by THIS
+                    # link: the link can never resurrect it. The pair may
+                    # still re-consent over a NEW link. Identical error
+                    # shape -- no enumeration oracle.
+                    conn.execute("ROLLBACK")
+                    link_fail()
+                    return
+                # Authoritative recheck inside the write lock: a concurrent
+                # redeem may have created the row after our fast path.
+                hs2 = conn.execute(
+                    "SELECT %s FROM handshakes WHERE a_identity=? AND b_identity=?"
+                    % _HS_COLS,
+                    (a, b),
+                ).fetchone()
+                if hs2 is not None and (
+                    hs2[0] == "active"
+                    or (
+                        hs2[0] == "pending"
+                        and hs2[7] == redeemer
+                        and hs2[2] is not None
+                        and hs2[2] > now2
+                    )
+                ):
+                    # Idempotent no-op: active, or a live pending owned by
+                    # this redeemer. No link use is consumed, and the
+                    # ORIGINAL pending_expires_at is kept -- redeem NEVER
+                    # extends the deadline. (A live pending with a
+                    # different redeemer is impossible -- the pair
+                    # determines the redeemer -- and fails closed below.)
+                    if enroll is not None:
+                        # Inline-enrollment retry (proof-of-key verified
+                        # above, so this is the key holder, not an
+                        # impersonator): rotate the token so the returned
+                        # service_token works.
+                        name = _enroll_identity_locked(
+                            enroll[0],
+                            token_hash,
+                            enroll[2],
+                            None,
+                            now2,
+                            enroll_gate=enroll[1],
+                            enroll_ip=ip,
+                        )
+                elif hs2 is not None and not (
+                    hs2[0] == "revoked"
+                    or (
+                        hs2[0] == "pending"
+                        and (hs2[2] is None or hs2[2] <= now2)
+                    )
+                ):
+                    conn.execute("ROLLBACK")
+                    link_fail()
+                    return
+                else:
+                    # The single-UPDATE atomic pattern
+                    # (INVITE_RACE_FIX_v0.2.6): revalidate the link AND
+                    # consume one use in one statement. Proceed only if
+                    # exactly one row was updated -- concurrent redeems
+                    # against max_uses=N yield exactly N successes.
+                    cur = conn.execute(
+                        """UPDATE invites SET uses = uses + 1
+                           WHERE invite_id=? AND revoked=0 AND exp > ?
+                             AND uses < max_uses AND grant_handshake=1""",
+                        (h, now2),
+                    )
+                    if cur.rowcount != 1:
+                        conn.execute("ROLLBACK")
+                        link_fail()
+                        return
+                    if enroll is not None:
+                        # Find-or-create keyed by identity, in the same
+                        # transaction as the use-count.
+                        name = _enroll_identity_locked(
+                            enroll[0],
+                            token_hash,
+                            enroll[2],
+                            None,
+                            now2,
+                            enroll_gate=enroll[1],
+                            enroll_ip=ip,
+                        )
+                    pending_exp = now2 + HANDSHAKE_PENDING_WINDOW
+                    expires_at = (
+                        now2 + HS_EXPIRY_DAYS * 86400.0
+                        if HS_EXPIRY_DAYS > 0
+                        else None
+                    )
+                    if hs2 is None:
+                        conn.execute(
+                            """INSERT INTO handshakes(a_identity, b_identity, status,
+                                                      created_at, pending_expires_at,
+                                                      expires_at, last_activity,
+                                                      via_link_id, redeemer_identity,
+                                                      generation)
+                               VALUES(?,?,'pending',?,?,?,?,?,?,0)""",
+                            (a, b, now2, pending_exp, expires_at, now2, h,
+                             redeemer),
+                        )
+                    else:
+                        # Revoked or lapsed-pending row: a fresh consent
+                        # round. Generation is NOT reset (only revoke bumps
+                        # it); the deadline is fresh because the old one
+                        # lapsed -- this is a new pending, not an extension.
+                        conn.execute(
+                            """UPDATE handshakes
+                               SET status='pending', created_at=?,
+                                   pending_expires_at=?, expires_at=?,
+                                   last_activity=?, via_link_id=?,
+                                   redeemer_identity=?
+                               WHERE a_identity=? AND b_identity=?""",
+                            (now2, pending_exp, expires_at, now2, h, redeemer,
+                             a, b),
+                        )
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                redeem_failure_note(h)
+                self._json(500, {"error": "internal_error"})
+                return
+        # Cache mutation only after the transaction committed.
+        if name is not None:
+            peer_names.add(name)
+        redeem_failure_clear(h)
+        with db_lock:
+            hs3 = conn.execute(
+                "SELECT %s FROM handshakes WHERE a_identity=? AND b_identity=?"
+                % _HS_COLS,
+                (a, b),
+            ).fetchone()
+        out = _hs_public(a, b, hs3)
+        out.update(
+            {
+                "minter_identity": minter,
+                "minter_name_hint": peer_name_for_identity(minter),
+            }
+        )
+        if enroll is not None:
+            out.update(
+                {
+                    "service_token": token,
+                    "identity": enroll[0],
+                    "display_name": name,
+                    "peer_name": name,
+                    "enrollment": enroll[1],
+                    "contract_version": VERSION,
+                    "relay_identity": relay_identity_info(),
+                }
+            )
+        self._json(200, out)
+
+    def _handle_handshake_accept(self, peer, now):
+        body = self._read_json()
+        hid = body.get("handshake_id") if isinstance(body, dict) else None
+        parsed = _parse_hs_id(hid)
+        if parsed is None:
+            self._json(400, {"error": "bad_handshake_id"})
+            return
+        a, b, gen = parsed
+        me = caller_identity(peer)
+        if me != a and me != b:
+            # Not my handshake: indistinguishable from missing.
+            self._json(404, {"error": "handshake_not_found"})
+            return
+        row = None
+        accepted = False
+        with db_lock:
+            now2 = time.time()
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                # Guarded atomic accept: pending, unexpired on the SERVER
+                # clock, signed by the recorded redeemer, and bound to the
+                # CURRENT pair generation. An expired (or stale-generation)
+                # accept is denied HERE, atomically -- the row never flips.
+                # Never bound to the display-only `by` link field.
+                cur = conn.execute(
+                    """UPDATE handshakes
+                       SET status='active', pending_expires_at=NULL,
+                           redeemer_identity=NULL, last_activity=?
+                       WHERE a_identity=? AND b_identity=?
+                         AND status='pending' AND redeemer_identity=?
+                         AND pending_expires_at > ? AND generation=?""",
+                    (now2, a, b, me, now2, gen),
+                )
+                if cur.rowcount == 1:
+                    accepted = True
+                row = conn.execute(
+                    "SELECT %s FROM handshakes WHERE a_identity=? AND b_identity=?"
+                    % _HS_COLS,
+                    (a, b),
+                ).fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        if accepted:
+            self._json(200, _hs_public(a, b, row))
+            return
+        # The guarded UPDATE missed: interpret why. Status first: a
+        # revoked row reports handshake_revoked regardless of the id's
+        # generation; a stale id against a live row reports
+        # stale_generation so replays can never land post-revoke.
+        if row is None:
+            self._json(404, {"error": "handshake_not_found"})
+            return
+        if row[0] == "active":
+            if row[6] != gen:
+                self._json(409, {"error": "stale_generation"})
+                return
+            # Idempotent: accepting an already-active handshake returns it.
+            self._json(200, _hs_public(a, b, row))
+            return
+        if row[0] == "revoked":
+            self._json(410, {"error": "handshake_revoked"})
+            return
+        # Pending.
+        if row[6] != gen:
+            # Stale generation: the pair's handshake was revoked and the
+            # generation bumped since this id was issued. A replayed (or
+            # re-signed) accept for the pre-revoke pending must not land
+            # on the post-revoke row.
+            self._json(409, {"error": "stale_generation"})
+            return
+        if row[7] != me:
+            # Only the redeeming party (Z) can accept a pending
+            # handshake. N cannot accept its own link -- N already
+            # consented at mint.
+            self._json(403, {"error": "not_redeemer"})
+            return
+        # Redeemer + current generation, but the deadline lapsed on
+        # the server clock.
+        self._json(410, {"error": "handshake_expired"})
+
+    def _handle_handshake_revoke(self, peer, now):
+        # Unilateral revocation, effective immediately. Either party may
+        # revoke; the relay never needs both.
+        #
+        # DELIVERY BOUNDARY (documented limits): revocation cannot retract
+        # delivered plaintext. Messages already polled (collected) STAY
+        # delivered -- they are the recipient's; revocation can't un-ring
+        # them. Anything not yet fetched at revoke-commit time is
+        # dead-lettered with reason handshake_revoked and is NEVER
+        # delivered after. The status flip, the revocation memory, and the
+        # dead-letter sweep happen in ONE atomic transaction: a send racing
+        # the revoke either fully precedes it (its message is then
+        # dead-lettered) or fully follows it (the send gate 403s).
+        # Fail closed at the boundary.
+        body = self._read_json()
+        target = body.get("peer") if isinstance(body, dict) else None
+        t_ident, t_name = self._resolve_handshake_peer(target)
+        if t_ident is None:
+            self._json(404, {"error": "unknown_peer"})
+            return
+        me = caller_identity(peer)
+        if t_ident == me:
+            self._json(400, {"error": "cannot_revoke_self"})
+            return
+        a, b = _hs_pair(me, t_ident)
+        new_id = None
+        with db_lock:
+            now2 = time.time()
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT status, via_link_id, generation FROM handshakes"
+                    " WHERE a_identity=? AND b_identity=?",
+                    (a, b),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    self._json(404, {"error": "handshake_not_found"})
+                    return
+                if row[0] == "revoked":
+                    conn.execute("ROLLBACK")
+                    self._json(
+                        200,
+                        {
+                            "handshake_id": _hs_id(a, b, row[2]),
+                            "revoked": True,
+                        },
+                    )
+                    return
+                conn.execute(
+                    """UPDATE handshakes SET status='revoked',
+                       pending_expires_at=NULL, redeemer_identity=NULL,
+                       generation=generation+1
+                       WHERE a_identity=? AND b_identity=?""",
+                    (a, b),
+                )
+                if row[1]:
+                    # Pair-scoped revocation memory: THIS link can never
+                    # resurrect THIS pair. Other redeemers of a group link
+                    # are unaffected; fresh consent via a NEW link works.
+                    conn.execute(
+                        """INSERT OR IGNORE INTO link_revocations
+                           (link_id, a_identity, b_identity, revoked_at)
+                           VALUES(?,?,?,?)""",
+                        (row[1], a, b, now2),
+                    )
+                # Dead letters: queued but not yet fetched, both directions.
+                # (messages are keyed by peer NAME here.)
+                conn.execute(
+                    """UPDATE messages
+                       SET expires_at=?, dead_reason='handshake_revoked'
+                       WHERE ((sender=? AND recipient=?)
+                              OR (sender=? AND recipient=?))
+                         AND collected_at IS NULL AND acked_at IS NULL
+                         AND expires_at > ?""",
+                    (now2, peer, t_name, t_name, peer, now2),
+                )
+                conn.execute("COMMIT")
+                new_id = _hs_id(a, b, row[2] + 1)
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        self._json(200, {"handshake_id": new_id, "revoked": True})
+
+    def _handle_handshakes_list(self, peer):
+        me = caller_identity(peer)
+        with db_lock:
+            rows = conn.execute(
+                "SELECT a_identity, b_identity, %s FROM handshakes"
+                " WHERE a_identity=? OR b_identity=?"
+                " ORDER BY last_activity DESC" % _HS_COLS,
+                (me, me),
+            ).fetchall()
+        out = []
+        for r in rows:
+            a, b = r[0], r[1]
+            d = _hs_public(a, b, r[2:])
+            other = b if a == me else a
+            d["peer_identity"] = other
+            d["peer_name_hint"] = peer_name_for_identity(other)
+            out.append(d)
+        self._json(200, {"handshakes": out})
+
     @staticmethod
     def _validate_send(mid, to, topic, text, in_reply_to, ttl, peer):
         if not isinstance(mid, str) or not mid or len(mid) > ID_MAX_LEN:
@@ -2503,6 +3490,10 @@ def main():
     relay_cfg = cfg
     _init_reserved_names(cfg)  # strict: malformed entries refuse startup
     _init_identity_pubkeys(cfg)  # strict: malformed entries refuse startup
+    try:
+        _parse_handshake_knobs(cfg)  # strict: malformed entries refuse startup
+    except ValueError as e:
+        raise SystemExit("clack relay: invalid handshake config: %s" % e)
     load_identity_key(cfg)
     _install_signal_trap()
     port = int(cfg.get("port", 18802))

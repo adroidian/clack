@@ -34,7 +34,7 @@ import uuid
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY_PY = os.path.join(HERE, "relay.py")
 CLI = os.path.join(HERE, "relay-cli.py")
-PORT = 18995
+PORT = int(os.environ.get("CLACK_TEST_PORT", "18995"))
 BASE = "http://127.0.0.1:%d" % PORT
 
 PASS = 0
@@ -215,6 +215,34 @@ def db():
     return sqlite3.connect(os.path.join(TMPD, "relay.db"))
 
 
+def seed_handshake(a_name, b_name):
+    """White-box an ACTIVE handshake row for (a_name, b_name).
+
+    v0.2.13 gates /v1/send on mutual consent. This suite tests request
+    signing, not the handshake flow (see test-handshake.py), so the rows
+    it needs are seeded directly -- mirroring caller_identity()'s
+    resolution (identity_pubkey when present, else the peer name).
+    """
+    con = db()
+    con.execute("PRAGMA busy_timeout=5000")
+    def ident(peer):
+        r = con.execute("SELECT identity_pubkey FROM peers WHERE name=?",
+                        (peer,)).fetchone()
+        return r[0] if r and r[0] else peer
+    a, b = sorted([ident(a_name), ident(b_name)])
+    now = time.time()
+    con.execute(
+        """INSERT OR REPLACE INTO handshakes(
+               a_identity, b_identity, status, created_at,
+               pending_expires_at, expires_at, last_activity,
+               via_link_id, redeemer_identity, generation)
+           VALUES(?, ?, 'active', ?, NULL, NULL, ?, 'test-signing', NULL, 0)""",
+        (a, b, now, now),
+    )
+    con.commit()
+    con.close()
+
+
 def enroll_open(name):
     seed, pub, pub_b64 = fresh_key(name)
     code, ch = call(None, "POST", "/v1/enroll/challenge", b"{}")[:2]
@@ -378,6 +406,7 @@ def run_trusted_proxy():
 def run_round_trip():
     bob_tok, bob_peer = enroll_open("sigbob")
     check(bob_peer == "sigbob", "enroll sigbob (open gate)", bob_peer)
+    seed_handshake("sigbob", "alice")  # v0.2.13: send gate
     mid = str(uuid.uuid4())
     body = json.dumps({"id": mid, "to": "alice",
                        "text": "signed hello"}).encode()
@@ -660,6 +689,7 @@ def run_cli_round_trip():
     cfg = json.load(open(cfgp))
     peer = cfg.get("peer_name")
     check(peer == "clichat", "CLI enrolled as clichat", peer)
+    seed_handshake("clichat", "alice")  # v0.2.13: send gate
     mid = str(uuid.uuid4())
     r = subprocess.run(
         [sys.executable, CLI, "--config", cfgp, "send", "--to", "alice",
@@ -745,6 +775,7 @@ def run_rate_budget():
     """R4: unsigned garbage on a stolen bearer must not burn the peer's
     60/min budget -- the budget is charged only after signature verify."""
     bob_tok, _ = enroll_open("ratebob")
+    seed_handshake("ratebob", "alice")  # v0.2.13: send gate
     bad = 0
     for _ in range(70):
         code, _ = call(bob_tok, "GET", "/v1/peers", None)[:2]
