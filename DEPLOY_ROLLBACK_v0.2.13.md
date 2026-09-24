@@ -55,6 +55,14 @@ Before cutting any target over:
    *other* relay carries traffic before touching the target relay, or a
    tested direct channel). If the cutover goes wrong, this is how the
    team coordinates the fix — it must be proven working, not assumed.
+3. **Never strand the coordination route.** The relay that carries
+   operator↔implementer coordination is itself a cutover target:
+   verify OUR relink (or the tested independent recovery channel)
+   BEFORE cutting it over, so a failed relink cannot strand the
+   rollout team. On any failed relink: **fail closed** — the pair stays
+   disconnected until a human re-runs the link exchange. Never
+   auto-downgrade to pre-handshake code (see rollback preference
+   order).
 
 ## Rollback preference order (Zari, 2026-09-24)
 
