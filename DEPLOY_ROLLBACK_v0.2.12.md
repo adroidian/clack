@@ -1,12 +1,19 @@
 # v0.2.12 deploy / rollback runbook
 
-Status (2026-09-23): bundle built, rollback verified on scratch. Deploy
-itself awaits Aaron's go-ahead + Clingy Bear's signing key.
+Status (2026-09-23, updated post-deploy): **DEPLOYED.** Zari deployed
+v0.2.12 to the public relay (`https://relay.tryclack.com`) on 2026-09-23;
+verified live: `/health` reports `"version":"0.2.12"`, identity fingerprint
+`sha256:bdc8a616f41b4397` unchanged, PoW enrollment + signed
+send/poll/ACK round trip pass after the deploy, rollback bundle retained
+on the host. Bundle was rebuilt 2026-09-23 ~21:55 CDT from the final tree
+to include the CLI User-Agent fix (a623293) — the earlier bundle's
+`relay-cli.py` predated it and would have been 403'd by Cloudflare on the
+identity check.
 
 ## Artifacts
 
 - Deploy: `dist/clack-relay-bundle-v0.2.12.tar.gz`
-  sha256 `23c62cd5cd1f8abbbdaec9e223b951615a6beee275e398082a6960a6638f640a`
+  sha256 `ad6f5a3c0b2f095c0d2615fe31d6a997b59e875b9346b1d56b36f10be0cd1229`
   (verify with `sha256sum` before deploying; must match this file)
 - Rollback: `dist/clack-relay-bundle-v0.2.11.tar.gz` (known-good, currently
   running in production)
