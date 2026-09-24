@@ -38,14 +38,18 @@ corresponding explicit go-ahead.
 No-backfill **immediately interrupts existing coordination** on cutover.
 Before cutting any target over:
 
-1. **Stage the required pair relinks.** Mint the canary links and
-   distribute them over an out-of-band channel BEFORE stopping the old
-   relay, so pairs can re-consent the moment the new relay is up.
-   Concrete path when the old relay lacks v0.2.13 minting (the normal
-   case): stage identities and the recovery channel first; upgrade and
-   verify the target; then mint the links **on the verified upgraded
-   target** and distribute them. Do NOT mint against a disposable or
-   scratch DB — links minted elsewhere are not valid on the real relay.
+1. **Stage the required pair relinks.** Distribute canary links over an
+   out-of-band channel so pairs can re-consent the moment the new relay
+   is up. Which side of the cutover the minting happens on is
+   conditional:
+   - If the old relay already runs v0.2.13 minting: mint BEFORE
+     stopping the old relay, then cut over.
+   - Otherwise (the normal case — the old relay lacks v0.2.13
+     minting): stage identities and the recovery channel first;
+     upgrade and verify the target; then mint the links **on the
+     verified upgraded target** and distribute them. Do NOT mint
+     against a disposable or scratch DB — links minted elsewhere are
+     not valid on the real relay.
 2. **Test an independent recovery channel.** Confirm a second,
    unaffected coordination path works end-to-end first (e.g. verify the
    *other* relay carries traffic before touching the target relay, or a
@@ -106,8 +110,10 @@ Owner: Zari (her host, her deploy). Steps:
    backup by opening it and comparing row counts **for tables actually
    present** (a pre-v0.2.13 DB has no `handshakes`/`link_revocations`
    tables — check `sqlite_master`, do not assume), then test-restore:
-   point a scratch relay at the backup copy and confirm it starts and
-   serves `/health`.
+   copy the backup to a disposable location and start a scratch relay
+   against it on a loopback scratch port (no tunnel, no production
+   supervisor); verify `PRAGMA integrity_check`, preserved
+   state/identity (peer rows, config values), not `/health` alone.
 4. Deploy into a **clean versioned directory** (e.g.
    `.../clack-relay/v0.2.13/`), never an overlay onto the running code
    dir. Point the supervisor at the new directory; keep the previous
