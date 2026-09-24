@@ -1,0 +1,38 @@
+bundle-digest receipt -- v0.2.13 (REBUILT, supersedes bundle-digest-receipt-2026-09-24.txt)
+generated: 2026-09-24T06:45:00Z
+branch: v0.2.13
+
+RUNTIME BUNDLE PROVENANCE:
+  built from source commit: 8ccfa49ecbc265bbc1a0b40c3eeafae75c360c61
+  (v0.2.13: init_db unions cfg peer_hashes -- target-A hash-only peer defect fix)
+  The earlier bundle (5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d,
+  built from f05741923f027c6649ee81128e856fae45bea43c) is SUPERSEDED and must
+  NOT be published or deployed. f057419 is the historical base, not the fixed
+  deployable runtime.
+
+reproducible build recipe (run from the repo):
+  git archive 8ccfa49ecbc265bbc1a0b40c3eeafae75c360c61 --prefix=clack-relay/ \
+    CLIENT_CONTRACT.md relay-cli.py relay.py JOIN.md QUICKSTART.md \
+    README.md LICENSE ed25519.py | gzip -n > dist/clack-relay-bundle-v0.2.13.tar.gz
+  (gzip -n: no embedded timestamp/filename, byte-deterministic)
+
+bundle contents (8 files under clack-relay/):
+  CLIENT_CONTRACT.md, relay-cli.py, relay.py, JOIN.md, QUICKSTART.md,
+  README.md, LICENSE, ed25519.py
+  relay.py at this commit: VERSION "0.2.13", contains _parse_peer_hashes /
+  _init_peer_hashes (target-A fix present).
+
+sha256sum dist/clack-relay-bundle-v0.2.13.tar.gz:
+60db2a7d3f35a5c358b93a53e4dedfb83790959d2de1bc11d4e0356bcb91137a  dist/clack-relay-bundle-v0.2.13.tar.gz
+
+match: YES (this file generated immediately after the build above)
+
+test provenance bound to the same commit (deduped unique 473, scratch ports):
+  relay.sh 156 (incl. enroll phase 82 + peer-hashes phase 23), handshake 103,
+  client-security 120, enroll 82 (standalone; repeated inside relay.sh),
+  signing 81, peer-lifecycle 13
+  473 = 156 + 103 + 120 + 81 + 13. Repeated execution labeled, not added.
+
+OPEN (not claimed complete): archive availability + hash verification from the
+published location at publication time (Aaron checkpoint); Zari independent
+suite reproduction; ex-relay canary deploy + pair-relink/signed duplex tests.
