@@ -538,6 +538,21 @@ PASS=$((PASS + ${PH_PASS:-0}))
 FAIL=$((FAIL + ${PH_FAIL:-0}))
 [ "$PH_RC" = "0" ] || bad "test-peer-hashes.py exit code" "$PH_RC"
 
+# --- real supervisor-style restart (test-real-restart.py) -------------------
+# Spawns ACTUAL relay processes, SIGTERMs them like a supervisor would,
+# restarts them, and verifies hash-only peer/message/webhook retention,
+# revocation, dual-source fail-closed, and disposable restore. Scratch
+# ports 18980-18983 and scratch dirs only; never touches production.
+echo "---- real-restart phase (test-real-restart.py) ----"
+RR_RC=0
+RR_OUT="$(python3 "$HOME/workspace/clack-relay/test-real-restart.py" 2>&1)" || RR_RC=$?
+echo "$RR_OUT"
+RR_PASS="$(printf '%s\n' "$RR_OUT" | sed -n 's/^pass=\([0-9][0-9]*\) fail=.*/\1/p')"
+RR_FAIL="$(printf '%s\n' "$RR_OUT" | sed -n 's/^pass=.* fail=\([0-9][0-9]*\)/\1/p')"
+PASS=$((PASS + ${RR_PASS:-0}))
+FAIL=$((FAIL + ${RR_FAIL:-0}))
+[ "$RR_RC" = "0" ] || bad "test-real-restart.py exit code" "$RR_RC"
+
 # --- agent self-enrollment + reserved names (test-enroll.py) ------------------
 # Final phase: spins its own scratch instances (ports 18996-18999); never
 # touches this script's instance or the production relay.
