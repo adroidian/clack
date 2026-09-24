@@ -41,6 +41,11 @@ Before cutting any target over:
 1. **Stage the required pair relinks.** Mint the canary links and
    distribute them over an out-of-band channel BEFORE stopping the old
    relay, so pairs can re-consent the moment the new relay is up.
+   Concrete path when the old relay lacks v0.2.13 minting (the normal
+   case): stage identities and the recovery channel first; upgrade and
+   verify the target; then mint the links **on the verified upgraded
+   target** and distribute them. Do NOT mint against a disposable or
+   scratch DB — links minted elsewhere are not valid on the real relay.
 2. **Test an independent recovery channel.** Confirm a second,
    unaffected coordination path works end-to-end first (e.g. verify the
    *other* relay carries traffic before touching the target relay, or a
@@ -72,7 +77,15 @@ downgrade must never be wired as a self-healing action.
 - Deploy: `dist/clack-relay-bundle-v0.2.13.tar.gz`
   sha256 `5ce8eff4452cff109a369051e82ab27f84512a4e77f251a57eac1ef466efa75d`
   (verify with `sha256sum` before deploying; must match this file; see
-  `bundle-digest-receipt-2026-09-24.txt` for the recorded verification)
+  `bundle-digest-receipt-2026-09-24.txt` for the recorded verification).
+  **Provenance distinction:** the runtime bundle was built from source
+  commit `f057419`; the later commit `830b829` changed only docs, tests,
+  and receipts — the bundle is byte-identical and was NOT rebuilt. Do
+  not conflate evidence/test provenance (830b829) with runtime bundle
+  provenance (f057419).
+- Open verification tasks (operator/Zari, not claimed complete):
+  archive availability + hash verification from the published location,
+  and isolated suite reproduction on a clean checkout.
 - Rollback reference: `dist/clack-relay-bundle-v0.2.12.tar.gz`
   (known-good code; **consent enforcement OFF** — see preference order)
 
@@ -88,8 +101,13 @@ Owner: Zari (her host, her deploy). Steps:
 3. Quiesce, then back up: stop the relay by exact PID; then take the
    backup with the SQLite backup API
    (`sqlite3 relay.db ".backup 'relay-backup-<ts>.db'"`) — a live
-   data-dir copy is **not** a consistent SQLite/WAL backup. Verify the
-   backup opens and the handshakes/messages row counts match.
+   data-dir copy is **not** a consistent SQLite/WAL backup. Back up the
+   relay config and identity key material alongside the DB. Verify the
+   backup by opening it and comparing row counts **for tables actually
+   present** (a pre-v0.2.13 DB has no `handshakes`/`link_revocations`
+   tables — check `sqlite_master`, do not assume), then test-restore:
+   point a scratch relay at the backup copy and confirm it starts and
+   serves `/health`.
 4. Deploy into a **clean versioned directory** (e.g.
    `.../clack-relay/v0.2.13/`), never an overlay onto the running code
    dir. Point the supervisor at the new directory; keep the previous
@@ -123,8 +141,13 @@ clean versioned directory, restart), then:
    fingerprint. The relay's identity key is stable across upgrades; if
    the full key differs, STOP — do not proceed.
 
-   Known-good public-relay identity key (verified 2026-09-24 against
-   the pinned deploy fingerprint `sha256:bdc8a616f41b4397`):
+   Known-good public-relay identity key. Provenance: the short
+   fingerprint `sha256:bdc8a616f41b4397` was recorded at the
+   operator-verified v0.2.12 production deploy (2026-09-23, /health +
+   /v1/identity returned by the deploying operator). The full key below
+   was fetched 2026-09-24 and its recomputed fingerprint matches that
+   independently-recorded baseline — the fingerprint alone is not the
+   provenance; the operator's deploy-time record is.
    - `e`: `10001`
    - `n`: `a20e6d89c22723ba35488d615d4a76943e9bc02aca99fd94a15a5602887d76dcaed58fad598fe9c7a05b7da12071683114154e55a67cf6d1ccb4f5f8acf366fbb2d07245187091a3d836fb535a108e1f65cd641d271986883fdac2a090c791741f77214732ff7035d724b2f1143664995e7be8036e1617183f1bcfe11225fca1bb4d37cfa43cb8ad70ef2c54edafa088ca907d27792dd87847544015bce568d6eede98c70e7cd28946ab63b3509ed9d4d21ff0d33519ea2eb622be3b6f1fe010d07aa43fa80ee68baaa51dff645f0cf24ed09b149384f8b54ee1b3ea37801177db66e5f027b492af80f31deff92c159ac9cf55902cc18187ca1180f45b7e96c7`
 
