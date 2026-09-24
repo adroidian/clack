@@ -44,6 +44,21 @@ _rc = importlib.util.module_from_spec(_spec)
 sys.argv = ["relay-cli.py"]  # keep argparse at import time quiet
 _spec.loader.exec_module(_rc)
 
+# v0.2.12: the scratch relays' config peer "alice" needs a signing keypair,
+# wired into each test config via identity_pubkeys. One keypair is reused
+# for every scratch instance (the token differs per run; the key is the
+# same test identity).
+_ALICE_SEED, _ALICE_PUB = _rc.keygen()
+ALICE_PUB_B64 = _rc.b64u_encode(_ALICE_PUB)
+
+
+def _sign_tuple(seed, peer_name, pub_b64):
+    """Build the `sign` argument for api(): (seed, peer_name, pub_b64)."""
+    return (seed, peer_name, pub_b64)
+
+
+ALICE_SIGN = (_ALICE_SEED, "alice", ALICE_PUB_B64)
+
 # Expected version is whatever relay.py declares (not hardcoded here).
 _m = re.search(r'^VERSION\s*=\s*"([^"]+)"', open(RELAY_PY).read(), re.M)
 EXPECTED_VERSION = _m.group(1) if _m else "?"
@@ -135,6 +150,9 @@ def start_server(enrollment="invite,pow,open", reserved_names=None):
     cfg = {
         "port": PORT,
         "peers": {"alice": ALICE_TOKEN},
+        # v0.2.12: config peer alice must have a signing key or every
+        # authenticated call 401s with upgrade_required.
+        "identity_pubkeys": {"alice": ALICE_PUB_B64},
         "enrollment": enrollment,
         "pow_difficulty": 8,  # tiny so the harness solves fast
     }
@@ -182,7 +200,9 @@ def stop_server():
         time.sleep(0.25)
 
 
-def api(method, path, body=None, token=None, accept=None):
+def api(method, path, body=None, token=None, accept=None, sign=None):
+    """sign: optional (seed, peer_name, pub_b64) tuple -- adds the v0.2.12
+    X-Clack-* Ed25519 request-signing headers via the CLI's sign_headers."""
     url = BASE + path
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
@@ -192,6 +212,13 @@ def api(method, path, body=None, token=None, accept=None):
         r.add_header("Content-Type", "application/json")
     if accept:
         r.add_header("Accept", accept)
+    if sign is not None:
+        seed, peer_name, pub_b64 = sign
+        cfg = {"kind": _rc.IDENTITY_KIND, "peer_name": peer_name,
+               "identity_pubkey": pub_b64,
+               "identity_privkey": _rc.b64u_encode(seed)}
+        for k, v in _rc.sign_headers(cfg, method, path, data).items():
+            r.add_header(k, v)
     try:
         with urllib.request.urlopen(r, timeout=30) as resp:
             raw = resp.read().decode()
@@ -293,15 +320,19 @@ def run_http_tests():
         # --- T1: mint invite as alice
         code, mint, _ = api("POST", "/v1/invites/mint",
                             {"expiry_seconds": 3600, "max_uses": 1},
-                            token=ALICE_TOKEN)
+                            token=ALICE_TOKEN, sign=ALICE_SIGN)
         check(code == 200 and "invite_id" in mint, "T1 mint invite as alice", mint)
         link = mint.get("link", "")
         iid = mint["invite_id"]
-        check("i=%s" % iid in link and "by=alice" in link,
-              "T1 link carries invite id + inviter", link[:80])
+        # v0.2.12: provenance is identity-based (config peer alice carries
+        # an Ed25519 identity now), so by= carries alice's identity pubkey,
+        # not the mutable peer name. Human-readable inviter_name is exposed
+        # on the enroll response instead (checked in T2 below).
+        check("i=%s" % iid in link and "by=%s" % ALICE_PUB_B64 in link,
+              "T1 link carries invite id + inviter identity", link[:80])
 
         # --- T2: invite-gate enroll
-        code, out, pub_b64, _seed = enroll_agent(
+        code, out, pub_b64, seed = enroll_agent(
             name="inviteagent", gate="invite", invite_id=iid, secret="WRONG")
         # (sanity: wrong secret must fail before the real attempt)
         check(code == 400 and out.get("error") == "bad_secret",
@@ -314,13 +345,16 @@ def run_http_tests():
         check(out.get("contract_version") == EXPECTED_VERSION,
               "T2 contract_version %s" % EXPECTED_VERSION, out)
         tok = out.get("service_token")
-        code, peers, _ = api("GET", "/v1/peers", token=tok)
+        code, peers, _ = api("GET", "/v1/peers", token=tok,
+                             sign=_sign_tuple(seed, "inviteagent", pub_b64))
         check(code == 200 and "inviteagent" in peers.get("peers", []),
               "T2 token authenticates (/v1/peers)", peers)
         row = db_get("SELECT invited_by FROM peers WHERE name=?",
                      ("inviteagent",))
-        check(row and row[0] == "alice",
-              "T2 invited_by provenance = alice", row)
+        # v0.2.12: invited_by stores the inviter's stable Ed25519 identity,
+        # not the mutable peer name (names can be reassigned; see R6/R7).
+        check(row and row[0] == ALICE_PUB_B64,
+              "T2 invited_by provenance = alice identity", row)
         check(out.get("inviter_name") == "alice",
               "T2 inviter_name = alice", out.get("inviter_name"))
         uses = db_get("SELECT uses FROM invites WHERE invite_id=?", (iid,))
@@ -414,9 +448,11 @@ def run_http_tests():
               "T6 re-enroll same pubkey -> same peer name", out7)
         tok7 = out7.get("service_token")
         check(tok7 and tok7 != tok6, "T6 fresh token issued", "")
-        code, peers, _ = api("GET", "/v1/peers", token=tok7)
+        code, peers, _ = api("GET", "/v1/peers", token=tok7,
+                             sign=_sign_tuple(seed6, name6, pub_b64_6))
         check(code == 200, "T6 new token works", code)
-        code, out_old, _ = api("GET", "/v1/peers", token=tok6)
+        code, out_old, _ = api("GET", "/v1/peers", token=tok6,
+                               sign=_sign_tuple(seed6, name6, pub_b64_6))
         check(code == 401, "T6 old token dead -> 401", code)
     finally:
         stop_server()
@@ -427,7 +463,7 @@ def run_http_tests():
         # --- T8: bad secret
         code, mint, _ = api("POST", "/v1/invites/mint",
                             {"expiry_seconds": 3600, "max_uses": 1},
-                            token=ALICE_TOKEN)
+                            token=ALICE_TOKEN, sign=ALICE_SIGN)
         iid2 = mint["invite_id"]
         code, out, _, _ = enroll_agent(name="neg1", gate="invite",
                                        invite_id=iid2, secret="wrong-secret")
@@ -437,7 +473,7 @@ def run_http_tests():
         # --- T8: expired invite -> 410 at challenge time
         code, mint, _ = api("POST", "/v1/invites/mint",
                             {"expiry_seconds": 3600, "max_uses": 1},
-                            token=ALICE_TOKEN)
+                            token=ALICE_TOKEN, sign=ALICE_SIGN)
         iid3 = mint["invite_id"]
         db_exec("UPDATE invites SET exp=? WHERE invite_id=?",
                 (time.time() - 10, iid3))
@@ -511,7 +547,9 @@ def run_http_tests():
         check(code == 200 and out.get("peer_name") == "pinned-agent",
               "R2 pinned key claims reserved name -> 200 exact name", out)
         tok = out.get("service_token")
-        code, peers, _ = api("GET", "/v1/peers", token=tok)
+        code, peers, _ = api("GET", "/v1/peers", token=tok,
+                             sign=_sign_tuple(pinned_seed, "pinned-agent",
+                                              pinned_b64))
         check(code == 200 and "pinned-agent" in peers.get("peers", []),
               "R2 pinned token authenticates", peers)
 
@@ -618,6 +656,8 @@ def run_cli_tests():
         d = os.path.join(cli_tmpd, "r%d" % port)
         os.makedirs(d)
         cfg = {"port": port, "peers": {"alice": token},
+               # v0.2.12: alice needs a signing key for authed calls.
+               "identity_pubkeys": {"alice": ALICE_PUB_B64},
                "enrollment": enrollment, "pow_difficulty": 8}
         with open(os.path.join(d, "relay-config.json"), "w") as f:
             json.dump(cfg, f)
@@ -636,9 +676,16 @@ def run_cli_tests():
             time.sleep(0.25)
         raise RuntimeError("relay %d did not start" % port)
 
-    def authed(base, token, path):
+    def authed(base, cli_cfg_path, path):
+        """GET path with the CLI identity config's bearer + v0.2.12 Ed25519
+        request signature (the CLI's own sign_headers over the key file)."""
+        c = json.load(open(cli_cfg_path))
+        hdrs = _rc.sign_headers(c, "GET", path, None)
+        assert hdrs, "CLI config cannot sign: %s" % cli_cfg_path
         r = urllib.request.Request(base + path)
-        r.add_header("Authorization", "Bearer " + token)
+        r.add_header("Authorization", "Bearer " + c["service_token"])
+        for k, v in hdrs.items():
+            r.add_header(k, v)
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode())
 
@@ -655,6 +702,13 @@ def run_cli_tests():
             method="POST")
         rq.add_header("Authorization", "Bearer " + token)
         rq.add_header("Content-Type", "application/json")
+        # v0.2.12: mint is authenticated -> must be signed as alice.
+        for k, v in _rc.sign_headers(
+                {"kind": _rc.IDENTITY_KIND, "peer_name": "alice",
+                 "identity_pubkey": ALICE_PUB_B64,
+                 "identity_privkey": _rc.b64u_encode(_ALICE_SEED)},
+                "POST", "/v1/invites/mint", rq.data).items():
+            rq.add_header(k, v)
         with urllib.request.urlopen(rq, timeout=10) as resp:
             mint = json.loads(resp.read().decode())
         secret = mint["link"].split("k=")[1].split("&")[0]
@@ -670,7 +724,7 @@ def run_cli_tests():
               "CLI invite config saved with token", c1.get("peer_name"))
         check(oct(os.stat(cfg1).st_mode & 0o777) == "0o600",
               "CLI invite config mode 600", oct(os.stat(cfg1).st_mode))
-        code, peers = authed(base, c1["service_token"], "/v1/peers")
+        code, peers = authed(base, cfg1, "/v1/peers")
         check(code == 200 and "cliinvite" in peers["peers"],
               "CLI invite token authenticates", peers)
 
@@ -684,7 +738,7 @@ def run_cli_tests():
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
         check(r.returncode == 0, "CLI pow-gate enroll exit 0", r.stderr[-500:])
         c2 = json.load(open(cfg2))
-        code, peers = authed(base, c2["service_token"], "/v1/peers")
+        code, peers = authed(base, cfg2, "/v1/peers")
         check(code == 200 and "clipow" in peers["peers"],
               "CLI pow token authenticates", peers)
 
@@ -698,7 +752,7 @@ def run_cli_tests():
             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
         check(r.returncode == 0, "CLI open-gate enroll exit 0", r.stderr[-500:])
         c3 = json.load(open(cfg3))
-        code, peers = authed(base, c3["service_token"], "/v1/peers")
+        code, peers = authed(base, cfg3, "/v1/peers")
         check(code == 200 and "cliopen" in peers["peers"],
               "CLI open token authenticates", peers)
 
@@ -859,7 +913,7 @@ def _run_telemetry_tests_inner():
           "telemetry config peer gate='config'", row)
 
     # T2: open-gate enroll records gate + ip, no activity yet
-    code, out, pub_b64, _seed = enroll_agent(name="telepeer", gate="open")
+    code, out, pub_b64, seed = enroll_agent(name="telepeer", gate="open")
     check(code == 200, "telemetry enroll ok", out)
     tok = out.get("service_token")
     row = peer_row("telepeer")
@@ -871,7 +925,8 @@ def _run_telemetry_tests_inner():
           "telemetry no activity yet at enroll", row)
 
     # T3: poll records last_poll_at
-    code, msgs, _ = api("GET", "/v1/poll?timeout=1", token=tok)
+    code, msgs, _ = api("GET", "/v1/poll?timeout=1", token=tok,
+                         sign=_sign_tuple(seed, "telepeer", pub_b64))
     check(code == 200, "telemetry poll ok", code)
     row = peer_row("telepeer")
     check(row is not None and row[3],
@@ -881,7 +936,8 @@ def _run_telemetry_tests_inner():
     mid = str(uuid.uuid4())
     code, sout, _ = api("POST", "/v1/send",
                         {"id": mid, "to": "alice", "text": "telemetry ping"},
-                        token=tok)
+                        token=tok,
+                        sign=_sign_tuple(seed, "telepeer", pub_b64))
     check(code == 200 and sout.get("accepted"),
           "telemetry send ok", sout)
     row = peer_row("telepeer")

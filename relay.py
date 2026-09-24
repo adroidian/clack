@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
@@ -28,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.11"
+VERSION = "0.2.12"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -49,6 +50,74 @@ PENDING_CAP = 500
 RETENTION = 7 * 86400
 RATE_PER_MIN = 60
 SWEEP_MIN_INTERVAL = 60.0
+
+# --- Mandatory Ed25519 request signing (v0.2.12) -------------------------------
+# Every authenticated request carries:
+#   X-Clack-Scheme: 1
+#   X-Clack-Key:    <peer name, must match the Bearer token's peer>
+#   X-Clack-Nonce:  <unix_seconds>:<32 hex chars random>
+#   X-Clack-Sig:    <hex Ed25519 signature>
+# over the canonical bytes:
+#   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
+# Unsigned endpoints: /health, GET /v1/identity, /join, /join/client, and the
+# pre-enrollment POSTs (/v1/invites/challenge, /v1/invites/redeem,
+# /v1/enroll/challenge, /v1/enroll). Everything else: Bearer + valid
+# signature, verified against the peer's stored Ed25519 identity_pubkey.
+SIGN_SCHEME_ID = "clack-ed25519-v1"
+NONCE_TTL = 600.0          # seconds a nonce stays valid (and is remembered)
+NONCE_FUTURE_SKEW = 120.0  # seconds of clock skew tolerated into the future
+NONCE_STORE_CAP = 100000   # hard cap on seen_nonces rows; at capacity new
+                          # signed requests are refused (fail closed, R2) --
+                          # live replay markers are never evicted
+NONCE_RAND_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+
+# Operator-supplied Ed25519 identity keys for config-managed peers, from the
+# "identity_pubkeys" config map: {peer_name: b64u(32-byte pubkey)}. This is
+# the upgrade path for token-only config peers -- re-read from config on
+# every restart, so removing a key downgrades the peer to upgrade_required.
+_IDENTITY_PUBKEYS = {}
+
+
+def _parse_identity_pubkeys(cfg):
+    """Strictly validate relay-config.json "identity_pubkeys".
+
+    Returns {name: canonical b64u pubkey}. Malformed entries raise
+    ValueError (startup refuses loudly, mirroring reserved_names)."""
+    raw = cfg.get("identity_pubkeys", {}) if cfg else {}
+    if not isinstance(raw, dict):
+        raise ValueError("identity_pubkeys must be an object, got %s"
+                         % type(raw).__name__)
+    peers = cfg.get("peers", {}) if cfg else {}
+    out = {}
+    for name, key_b64 in raw.items():
+        if name not in peers:
+            raise ValueError("identity_pubkeys entry %r is not a configured peer"
+                             % (name,))
+        try:
+            key = b64u_decode(key_b64)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("identity_pubkeys entry %r has a malformed key"
+                             % (name,))
+        if len(key) != 32:
+            raise ValueError("identity_pubkeys entry %r key is %d bytes, want 32"
+                             % (name, len(key)))
+        # R5: small-order / non-prime-order keys admit trivial signature
+        # forgeries under the vendored verifier. Refuse them at startup,
+        # loudly, like every other malformed entry.
+        if not ed25519.is_valid_pubkey(key):
+            raise ValueError("identity_pubkeys entry %r key is not a valid "
+                             "prime-order Ed25519 point" % (name,))
+        out[name] = b64u_encode(key)  # canonical form for comparison
+    return out
+
+
+def _init_identity_pubkeys(cfg):
+    global _IDENTITY_PUBKEYS
+    try:
+        _IDENTITY_PUBKEYS = _parse_identity_pubkeys(cfg)
+    except ValueError as e:
+        raise SystemExit("clack-relay: invalid identity_pubkeys: %s" % e)
+
 
 # --- Invite-link onboarding (v0.2.5, MVP) ------------------------------------
 # Contacts-first: an invitation introduces two independently controlled Muse
@@ -71,6 +140,14 @@ LINK_VERSION = 3
 db_lock = threading.Lock()
 rate_lock = threading.Lock()
 rate_hits = {}  # token_sha -> deque[float]
+# R5: per-process cache of stored-peer Ed25519 key validity
+# (pub_b64 -> bool). Keys are immutable within a process lifetime.
+_peer_key_valid = {}
+# R4: cheap source-level bucket for failed authentication attempts, so a
+# stolen bearer cannot burn a peer's request budget with unsigned garbage.
+auth_fail_lock = threading.Lock()
+auth_fail_hits = {}  # ip -> [float]
+AUTH_FAIL_PER_MIN = 300
 sweep_lock = threading.Lock()
 _last_sweep = 0.0
 
@@ -192,21 +269,86 @@ def init_db(cfg):
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_identity ON peers(identity_pubkey)"
     )
+    # v0.2.12: persistent seen-nonce store for request-signing replay
+    # protection. Rows expire NONCE_TTL after the nonce's timestamp; the
+    # sweep prunes them. At capacity only expired rows are pruned and new
+    # requests are refused (fail closed) -- live markers are never evicted.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS seen_nonces(
+               nonce TEXT PRIMARY KEY,
+               peer TEXT NOT NULL,
+               expires_at REAL NOT NULL)"""
+    )
+    # v0.2.12 (R1): names of revoked config peers. A retired name can never
+    # be claimed by self-enrollment again -- only the operator resurrects it
+    # by re-adding it to the config.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS retired_names(
+               name TEXT PRIMARY KEY,
+               retired_at REAL NOT NULL)"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_nonces_exp ON seen_nonces(expires_at)"
+    )
     now = time.time()
     # Revocation-safe rebuild: peers removed from the config must lose
-    # authentication on restart. Only config-managed rows (identity_pubkey
-    # IS NULL) are rebuilt; invite-enrolled identity rows survive restarts.
-    # Queued messages are left alone; they expire via TTL and are
-    # undeliverable without auth.
+    # authentication on restart. Config-managed rows (enroll_gate='config',
+    # or legacy rows with no gate and no identity key) are rebuilt from the
+    # config; invite/pow/open-enrolled identity rows survive restarts.
+    #
+    # R1: revocation also drops the removed peer's queued mail and webhook
+    # registration (a webhook URL can carry secrets) and retires its name.
+    # Queued mail is undeliverable without auth -- reassignment must never
+    # make it deliverable again, so the state is deleted rather than left
+    # behind, and the name can never be claimed by a later self-enrollment.
+    # Only the operator resurrects a name, by re-adding it to the config
+    # (which clears the retirement).
+    #
+    # v0.2.12: config peers may carry an Ed25519 identity_pubkey from the
+    # "identity_pubkeys" config map -- the operator upgrade path for
+    # token-only peers. Keys are re-read from config every restart, so
+    # removing a key downgrades the peer back to upgrade_required.
     with conn:
-        conn.execute("DELETE FROM peers WHERE identity_pubkey IS NULL")
+        existing_config = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM peers WHERE enroll_gate='config' "
+                "OR (enroll_gate IS NULL AND identity_pubkey IS NULL)"
+            )
+        }
+        incoming = set(cfg.get("peers", {}).keys())
+        removed = existing_config - incoming
+        if removed:
+            now_r = time.time()
+            for name in removed:
+                conn.execute(
+                    "DELETE FROM messages WHERE recipient=?", (name,))
+                conn.execute(
+                    "DELETE FROM webhooks WHERE peer=?", (name,))
+                conn.execute(
+                    "INSERT OR IGNORE INTO retired_names(name, retired_at)"
+                    " VALUES(?,?)",
+                    (name, now_r),
+                )
+        conn.execute(
+            "DELETE FROM peers WHERE enroll_gate='config' "
+            "OR (enroll_gate IS NULL AND identity_pubkey IS NULL)"
+        )
         conn.executemany(
-            "INSERT OR IGNORE INTO peers(name, token_hash, created_at, enroll_gate) VALUES(?,?,?,?)",
+            "INSERT INTO peers(name, token_hash, created_at, identity_pubkey, enroll_gate)"
+            " VALUES(?,?,?,?,?)",
             [
-                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now, "config")
+                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now,
+                 _IDENTITY_PUBKEYS.get(name), "config")
                 for name, token in cfg.get("peers", {}).items()
             ],
         )
+        if incoming:
+            conn.execute(
+                "DELETE FROM retired_names WHERE name IN (%s)"
+                % ",".join("?" * len(incoming)),
+                tuple(incoming),
+            )
     conn.commit()
     global peer_names
     peer_names = {r[0] for r in conn.execute("SELECT name FROM peers")}
@@ -258,6 +400,9 @@ def sweep(now):
             "DELETE FROM enroll_challenges WHERE expires_at <= ? OR (used != 0 AND created_at <= ?)",
             (now, now - 3600),
         )
+        # v0.2.12: drop expired seen nonces (replay window is NONCE_TTL
+        # past the nonce's own timestamp).
+        conn.execute("DELETE FROM seen_nonces WHERE expires_at <= ?", (now,))
         conn.commit()
 
 
@@ -290,6 +435,18 @@ def rate_ok(token_sha):
         dq = rate_hits.setdefault(token_sha, [])
         dq[:] = [t for t in dq if now - t < 60.0]
         if len(dq) >= RATE_PER_MIN:
+            return False
+        dq.append(now)
+        return True
+
+
+def auth_fail_ok(ip):
+    """Cheap per-source bound on failed authentication attempts (R4)."""
+    now = time.time()
+    with auth_fail_lock:
+        dq = auth_fail_hits.setdefault(ip, [])
+        dq[:] = [t for t in dq if now - t < 60.0]
+        if len(dq) >= AUTH_FAIL_PER_MIN:
             return False
         dq.append(now)
         return True
@@ -363,6 +520,34 @@ def _enrollment_gates():
     raw = relay_cfg.get("enrollment", "invite") if relay_cfg else "invite"
     gates = {g.strip() for g in str(raw).split(",") if g.strip()}
     return gates or {"invite"}
+
+
+def _trusted_proxy_nets():
+    """CIDR list from relay-config.json "trusted_proxies" (Flint P2-deploy).
+
+    Only connections arriving FROM these networks may supply the real
+    client IP via CF-Connecting-IP / X-Forwarded-For for rate limiting.
+    Default: empty -- the socket peer address is always used, so a
+    listener reachable by untrusted clients never trusts forwarded headers.
+    """
+    raw = relay_cfg.get("trusted_proxies", []) if relay_cfg else []
+    if isinstance(raw, str):
+        raw = [raw]
+    nets = []
+    for entry in raw or []:
+        try:
+            nets.append(ipaddress.ip_network(str(entry).strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _valid_client_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
 
 
 def _pow_difficulty():
@@ -494,9 +679,18 @@ def _enroll_identity_locked(pub_b64, token_hash, invited_by, requested_name, now
             # which would confuse the legitimate owner. The pinned key
             # itself falls through to the normal first-come path below.
             raise _ReservedNameRejected(requested_name)
-        if not conn.execute(
+        # R1: a retired name (revoked config peer) is never handed out
+        # again, even though its row is gone: the old owner's queued state
+        # was deleted with the revocation, and the name itself stays dead
+        # so no new identity inherits its name-trust. Falls through to a
+        # suffixed candidate like any other taken name.
+        taken = conn.execute(
             "SELECT 1 FROM peers WHERE name=?", (requested_name,)
-        ).fetchone():
+        ).fetchone()
+        retired = conn.execute(
+            "SELECT 1 FROM retired_names WHERE name=?", (requested_name,)
+        ).fetchone()
+        if not taken and not retired:
             name = requested_name
         else:
             candidate = "%s-%s" % (requested_name, secrets.token_hex(2))
@@ -580,8 +774,12 @@ def _unique_guest_name_locked():
     """Mint a fresh guest name. Assumes db_lock is already held."""
     for _ in range(100):
         name = "guest-" + secrets.token_hex(4)
+        # R1: never mint a retired name either (defense in depth; the
+        # guest- prefix makes a collision near-impossible anyway).
         if not conn.execute(
             "SELECT 1 FROM peers WHERE name=?", (name,)
+        ).fetchone() and not conn.execute(
+            "SELECT 1 FROM retired_names WHERE name=?", (name,)
         ).fetchone():
             return name
     raise RuntimeError("guest name space exhausted")
@@ -773,11 +971,71 @@ def fetch_pending(recipient, now):
     ]
 
 
+def _nonce_record(conn, nonce, peer, expires_at):
+    """Record a verified nonce in the seen_nonces store.
+
+    Returns "replay" when the nonce was already present, "recorded" when
+    stored, or "full" when the store is at capacity. R2: a live replay
+    marker is NEVER evicted to make room -- only expired rows are pruned,
+    and when the store is still full the new request is refused (fail
+    closed) rather than forgetting a nonce whose timestamp is still inside
+    the validity window. Extracted for unit testing."""
+    if conn.execute(
+        "SELECT 1 FROM seen_nonces WHERE nonce=?", (nonce,)
+    ).fetchone():
+        return "replay"
+    # Prune only rows that can never be replayed again (their timestamps
+    # are already outside the validity window).
+    conn.execute(
+        "DELETE FROM seen_nonces WHERE expires_at <= ?", (time.time(),)
+    )
+    n = conn.execute("SELECT COUNT(*) FROM seen_nonces").fetchone()[0]
+    if n >= NONCE_STORE_CAP:
+        conn.commit()
+        return "full"
+    conn.execute(
+        "INSERT INTO seen_nonces(nonce, peer, expires_at) VALUES(?,?,?)",
+        (nonce, peer, expires_at),
+    )
+    conn.commit()
+    return "recorded"
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClackRelay/" + VERSION
 
     def log_message(self, fmt, *args):  # keep logs token/text free
         pass
+
+    def setup(self):
+        # Raw request body cache: signature verification (v0.2.12) needs the
+        # exact bytes before the endpoint handlers parse them, and rfile is
+        # a one-shot stream. _read_body fills this once; _read_json parses
+        # from it.
+        self._body = None
+        # R3: bound client-paced header/body reads. The timeout applies per
+        # socket op, not per connection: /v1/poll's server-side wait performs
+        # no socket I/O, so long polls are unaffected.
+        try:
+            self.request.settimeout(60)
+        except OSError:
+            pass
+        super().setup()
+
+    def _read_body(self):
+        if self._body is None:
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 2_000_000:
+                self._body = b""
+            else:
+                try:
+                    self._body = self.rfile.read(length)
+                except Exception:
+                    self._body = b""
+        return self._body
 
     def _json(self, code, obj):
         body = json.dumps(obj).encode("utf-8")
@@ -788,22 +1046,159 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-        except ValueError:
-            return None
-        if length <= 0 or length > 2_000_000:
+        raw = self._read_body()
+        if not raw:
             return None
         try:
-            raw = self.rfile.read(length)
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return None
 
+    def _verify_signature(self, peer):
+        """Mandatory Ed25519 request signing (v0.2.12).
+
+        Returns None when the request's signature verifies against the
+        peer's stored Ed25519 identity_pubkey, else a stable error code:
+        missing_signature | unknown_key | upgrade_required | stale_nonce |
+        bad_signature | replay | nonce_store_full. Never raises: malformed
+        input maps to a code, never a dropped connection."""
+        h = self.headers
+        if h.get("X-Clack-Scheme") != "1":
+            return "missing_signature"
+        key_name = h.get("X-Clack-Key")
+        if not key_name:
+            return "missing_signature"
+        if key_name != peer:
+            # The claimed key identity does not match the Bearer token's
+            # peer: unknown in this authentication context.
+            return "unknown_key"
+        with db_lock:
+            row = conn.execute(
+                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+            ).fetchone()
+        pub_b64 = row[0] if row else None
+        try:
+            pubkey = b64u_decode(pub_b64) if pub_b64 else b""
+        except (ValueError, TypeError, AttributeError):
+            pubkey = b""
+        if len(pubkey) != 32:
+            # No (or corrupt) Ed25519 key on file: the peer must re-enroll
+            # via /join to get one. Never silently bypass.
+            return "upgrade_required"
+        # R5: the vendored verifier admits trivial forgeries under
+        # small-order keys. Enrollment and the operator map now reject such
+        # keys, but rows written before the fix could still hold one:
+        # validate once per peer key per process and fail closed instead of
+        # trusting stored bytes. A rejected key means re-enroll, same as a
+        # missing one.
+        if pub_b64 not in _peer_key_valid:
+            _peer_key_valid[pub_b64] = ed25519.is_valid_pubkey(pubkey)
+        if not _peer_key_valid[pub_b64]:
+            return "upgrade_required"
+        nonce = h.get("X-Clack-Nonce") or ""
+        ts_s, sep, rand = nonce.partition(":")
+        if not sep or not NONCE_RAND_RE.match(rand):
+            return "stale_nonce"
+        try:
+            ts = float(ts_s)
+        except ValueError:
+            return "stale_nonce"
+        now = time.time()
+        # isfinite rejects NaN ("nan" parses but defeats every comparison,
+        # silently passing the window check below).
+        if not math.isfinite(ts) or ts < now - NONCE_TTL or ts > now + NONCE_FUTURE_SKEW:
+            return "stale_nonce"
+        try:
+            sig = bytes.fromhex(h.get("X-Clack-Sig") or "")
+        except ValueError:
+            return "bad_signature"
+        if len(sig) != 64:
+            return "bad_signature"
+        parsed = urlparse(self.path)
+        path_q = parsed.path + ("?" + parsed.query if parsed.query else "")
+        body = self._read_body()
+        canon = (
+            SIGN_SCHEME_ID + "\n"
+            + self.command.upper() + "\n"
+            + path_q + "\n"
+            + hashlib.sha256(body).hexdigest() + "\n"
+            + nonce
+        ).encode("utf-8")
+        if not ed25519.verify(pubkey, sig, canon):
+            return "bad_signature"
+        # R3: the body read above is client-paced -- recheck freshness now
+        # that the full request has arrived, immediately before the atomic
+        # record. A duplicate that crossed the expiry boundary (and a sweep)
+        # while its body trickled in must be rejected, never recorded.
+        now2 = time.time()
+        if (
+            not math.isfinite(ts)
+            or ts < now2 - NONCE_TTL
+            or ts > now2 + NONCE_FUTURE_SKEW
+        ):
+            return "stale_nonce"
+        # Atomic check-and-record: the nonce is marked seen only after a
+        # valid signature, so a bad signature can never burn someone else's
+        # nonce. At capacity the store refuses new requests (fail closed)
+        # rather than evicting a live replay marker (R2).
+        with db_lock:
+            res = _nonce_record(conn, nonce, peer, ts + NONCE_TTL)
+            if res == "replay":
+                return "replay"
+            if res == "full":
+                return "nonce_store_full"
+        return None
+
+    def _client_ip(self):
+        """Best-effort client IP for rate limiting (Flint P2-deploy).
+
+        Behind a trusted edge (e.g. cloudflared dialing 127.0.0.1:18802)
+        every remote client shares the socket peer address, collapsing all
+        per-IP buckets into one. When the socket peer is inside
+        "trusted_proxies", the real client IP is taken from
+        CF-Connecting-IP, else the first X-Forwarded-For entry; anything
+        else falls back to the socket address. Forwarded headers from an
+        untrusted source are never honored.
+        """
+        sock = self.client_address[0] if self.client_address else "?"
+        try:
+            sock_addr = ipaddress.ip_address(sock)
+        except ValueError:
+            return sock
+        if any(sock_addr in net for net in _trusted_proxy_nets()):
+            cf = (self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf and _valid_client_ip(cf):
+                return cf
+            xff = self.headers.get("X-Forwarded-For") or ""
+            first = xff.split(",")[0].strip()
+            if first and _valid_client_ip(first):
+                return first
+        return sock
+
     def _require_auth(self):
+        ip = self._client_ip()
         peer = auth_peer(self.headers)
         if peer is None:
+            # No peer budget exists to charge; the cheap source-level
+            # bucket still bounds the attempt rate.
+            if not auth_fail_ok(ip):
+                self._json(429, {"error": "rate_limited"})
+                return None
             self._json(401, {"error": "unauthorized"})
+            return None
+        sig_err = self._verify_signature(peer)
+        if sig_err is not None:
+            # R4: a stolen bearer must not be able to burn the peer's
+            # request budget with unsigned or invalid garbage. Failed
+            # attempts hit the cheap source-level bucket; the peer's
+            # 60/min budget is charged only after a signature verifies.
+            if sig_err == "nonce_store_full":
+                self._json(503, {"error": "nonce_store_full"})
+                return None
+            if not auth_fail_ok(ip):
+                self._json(429, {"error": "rate_limited"})
+                return None
+            self._json(401, {"ok": False, "error": sig_err})
             return None
         if not rate_ok(token_sha_of(self.headers)):
             self._json(429, {"error": "rate_limited"})
@@ -876,7 +1271,17 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "n": 7,
                     "title": "Talk",
-                    "detail": "Use the service_token as a Bearer token: POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack to confirm handling.",
+                    "detail": "Use the service_token as a Bearer token AND sign every request "
+                    "with your Ed25519 key (v0.2.12+: signing is mandatory): "
+                    "X-Clack-Scheme: 1, X-Clack-Key: <your peer name>, "
+                    "X-Clack-Nonce: <unix_seconds>:<32 hex random>, "
+                    "X-Clack-Sig: hex(Ed25519_sign(seed, "
+                    "\"clack-ed25519-v1\\n\" + METHOD + \"\\n\" + path_and_query + \"\\n\" + "
+                    "sha256_hex(body) + \"\\n\" + nonce)). "
+                    "POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack "
+                    "to confirm handling. Unsigned requests get 401 missing_signature; "
+                    "peers with no stored key get 401 upgrade_required (re-enroll via /join "
+                    "to fix). Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
                 },
             ],
         }
@@ -920,6 +1325,20 @@ class Handler(BaseHTTPRequestHandler):
             "   POST " + base + "/v1/send to send, GET " + base + "/v1/poll?timeout=25"
             " to receive,\n"
             "   POST " + base + "/v1/ack to confirm.\n"
+            "   v0.2.12+: EVERY request must ALSO carry Ed25519 request\n"
+            "   signatures (mandatory, not optional):\n"
+            "     X-Clack-Scheme: 1\n"
+            "     X-Clack-Key: <your peer name>   (must match the Bearer peer)\n"
+            "     X-Clack-Nonce: <unix_seconds>:<32 hex random>\n"
+            "     X-Clack-Sig: hex(Ed25519_sign(seed,\n"
+            "       \"clack-ed25519-v1\\n\" + METHOD + \"\\n\" + path_and_query\n"
+            "       + \"\\n\" + sha256_hex(raw_body) + \"\\n\" + nonce))\n"
+            "   path_and_query is the path plus ?query when present; the empty\n"
+            "   body hashes as sha256 of zero bytes. Nonces older than 600s or\n"
+            "   more than 120s in the future are rejected, and each nonce is\n"
+            "   single-use. Missing/invalid signature -> 401 missing_signature /\n"
+            "   bad_signature / replay / stale_nonce; a peer with no stored\n"
+            "   Ed25519 key gets 401 upgrade_required (re-enroll to fix).\n"
             "4. Full protocol: CLIENT_CONTRACT.md in the clack-relay repo.\n"
             "\n"
             "Enrollment on this relay: " + gates + ".\n"
@@ -1014,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
             if id_n is None:
                 self._json(503, {"error": "identity_unavailable"})
                 return
-            ip = self.client_address[0] if self.client_address else "?"
+            ip = self._client_ip()
             if not ip_rate_ok(ip):
                 self._json(429, {"error": "rate_limited"})
                 return
@@ -1449,7 +1868,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(invite_id, str) or not invite_id:
             self._json(400, {"error": "invite_id_required"})
             return
-        ip = self.client_address[0] if self.client_address else "?"
+        # R6: the legacy invite endpoints honor the enrollment gate like
+        # /v1/enroll does. An operator who moved to pow/open-only has
+        # revoked invite enrollment; outstanding invite links stop working.
+        if "invite" not in _enrollment_gates():
+            self._json(400, {"error": "invite_not_allowed"})
+            return
+        ip = self._client_ip()
         if not invite_rate_ok("cip:" + ip, 30) or not invite_rate_ok(
             "cinv:" + invite_id, 10
         ):
@@ -1490,7 +1915,13 @@ class Handler(BaseHTTPRequestHandler):
         secret_s = body.get("secret")
         pubkey_s = body.get("identity_pubkey")
         proof = body.get("proof")
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
+        # R6: honor the enrollment gate (see _handle_invite_challenge). A
+        # policy rejection is not an invite failure: answer directly without
+        # touching the invite's failure counters.
+        if "invite" not in _enrollment_gates():
+            self._json(400, {"error": "invite_not_allowed"})
+            return
         if not invite_rate_ok("rip:" + ip, 30):
             self._json(429, {"error": "rate_limited"})
             return
@@ -1535,6 +1966,11 @@ class Handler(BaseHTTPRequestHandler):
             fail("bad_identity")
             return
         if len(pubkey) != 32:
+            fail("bad_identity")
+            return
+        # R5: small-order / non-prime-order keys admit trivial signature
+        # forgeries under the vendored verifier -- never enroll one.
+        if not ed25519.is_valid_pubkey(pubkey):
             fail("bad_identity")
             return
         if not isinstance(proof, dict):
@@ -1663,7 +2099,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         invite_id = body.get("invite_id")
         gates = _enrollment_gates()
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         if invite_id is not None:
             # Invite gate: validate exactly like /v1/invites/challenge.
             if not isinstance(invite_id, str) or not invite_id:
@@ -1754,7 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
         invite_id = body.get("invite_id")
         pow_nonce_s = body.get("pow_nonce")
         gates = _enrollment_gates()
-        ip = self.client_address[0] if self.client_address else "?"
+        ip = self._client_ip()
         # Gate resolution: exactly one must apply.
         if invite_id is not None:
             gate = "invite"
@@ -1822,6 +2258,11 @@ class Handler(BaseHTTPRequestHandler):
             fail("bad_identity")
             return
         if len(pubkey) != 32:
+            fail("bad_identity")
+            return
+        # R5: small-order / non-prime-order keys admit trivial signature
+        # forgeries under the vendored verifier -- never enroll one.
+        if not ed25519.is_valid_pubkey(pubkey):
             fail("bad_identity")
             return
         proof = body.get("proof")
@@ -2045,7 +2486,11 @@ def _install_signal_trap():
             pass
         os.kill(os.getpid(), signum)
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    # SIGHUP does not exist on Windows; getattr keeps the tuple
+    # construction itself from raising before the per-signal guard runs.
+    _termsigs = [s for s in (signal.SIGTERM, signal.SIGINT,
+                             getattr(signal, "SIGHUP", None)) if s is not None]
+    for sig in _termsigs:
         try:
             signal.signal(sig, _on_term)
         except (OSError, ValueError):
@@ -2057,6 +2502,7 @@ def main():
     cfg = load_config()
     relay_cfg = cfg
     _init_reserved_names(cfg)  # strict: malformed entries refuse startup
+    _init_identity_pubkeys(cfg)  # strict: malformed entries refuse startup
     load_identity_key(cfg)
     _install_signal_trap()
     port = int(cfg.get("port", 18802))

@@ -1,9 +1,49 @@
-# Clack Relay — Client Contract (v0.2.10)
+# Clack Relay — Client Contract (v0.2.12)
 
 A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 `mercedes`, `vesper`, `sigrid`, `nugget`. Text messages with correlated
 replies only — this relay never executes, interprets, or acts on message
 content.
+
+## What's new in v0.2.12
+
+- **Mandatory Ed25519 request signing.** Every authenticated request now
+  carries BOTH the Bearer token AND an Ed25519 signature
+  (`X-Clack-Scheme: 1`, `X-Clack-Key: <peer name>`,
+  `X-Clack-Nonce: <unix_seconds>:<32 hex>`,
+  `X-Clack-Sig: <hex>`), verified against the peer's stored Ed25519 key.
+  Token-only requests are rejected (`401 missing_signature`); peers with
+  no stored key get `401 upgrade_required` and must re-enroll. Nonces are
+  single-use, expire after 600s, and tolerate 120s of future clock skew.
+  Full scheme under "Authentication" below.
+- **Operator key map** (`"identity_pubkeys"` in `relay-config.json`):
+  `{peer_name: base64url(32-byte Ed25519 pubkey)}` lets the operator
+  upgrade token-only config peers to signing without re-enrollment.
+  Re-read every restart; removing a key downgrades the peer to
+  `upgrade_required`.
+- **CLI key file.** `keygen`/`redeem`/`enroll` now store the Ed25519
+  private key in a separate mode-600 file (`identity_privkey_path`,
+  default `<config>.key`); the config records only the path. Old configs
+  with an inline `identity_privkey` are migrated into the key file on
+  next save. The CLI auto-signs every authenticated request.
+- **Relay security hardening** (external review fixes): revoked peers'
+  names are tombstoned so a fresh identity can never inherit a retired
+  name's queued mail or webhook (operator re-adding the name clears the
+  tombstone); the replay-nonce store never evicts a live marker and fails
+  closed with `503 nonce_store_full` at capacity; nonce freshness is
+  rechecked after the body read and signature verify, so a request whose
+  nonce expires in flight is rejected (`401 stale_nonce`) and never
+  recorded; the per-peer rate budget is charged only after a signature
+  verifies (unsigned garbage on a stolen bearer gets 401s from a separate
+  300/min per-IP bucket and never burns the peer's budget); identity
+  keys must be prime-order Ed25519 points (small-order / malformed keys
+  are rejected at enrollment with `400 bad_identity`, and any pre-fix
+  rows fail closed at request time with `401 upgrade_required`); the
+  legacy `/v1/invites/challenge` and `/v1/invites/redeem` endpoints now
+  honor the enrollment gate (`400 invite_not_allowed` when invite
+  enrollment is off). Outstanding invite links stop working the moment the
+  operator disables invite enrollment; invite-claim failure counters are
+  not incremented by gate rejections.
 
 ## What's new in v0.2.10
 
@@ -90,18 +130,48 @@ relay's identity with a fresh-nonce challenge:
 1. Generate 16–64 random bytes, hex-encode them → `<nonce>`.
 2. `GET /v1/identity?nonce=<nonce>` — **no auth header, no redirects**
    (do not use curl `-L`; a 3xx here is a failure, not a detour).
-3. You receive `{"nonce":"<echo>","algorithm":"rsassa-pkcs1-v1_5-sha256","signature":"<base64>"}`.
-4. Verify: RSA-verify `signature` over the raw nonce bytes with the pinned
-   relay signing public key (`relay-signing-pub.pem` in the bundle, also
-   delivered out-of-band). With openssl:
-   `echo <nonce> | xxd -r -p | openssl dgst -sha256 -verify relay-signing-pub.pem -signature <(echo <signature> | base64 -d)`
-5. Only if the signature verifies AND the echoed nonce equals yours, send
-   authenticated requests. If it fails, stop — do not retry with the bearer
-   token, do not follow redirects.
+3. You receive `{"nonce":"<echo>","algorithm":"rsassa-pkcs1-v1_5-sha256","signature":"<base64>","public_key":{"n":"<hex>","e":"<hex>"}}`.
+4. Check the echoed nonce equals yours EXACTLY — a valid signature over a
+   different nonce is a replayed proof, not a proof — and check the
+   `algorithm` field matches. Then RSA-verify `signature` over the raw
+   nonce bytes with the relay's identity public key.
+5. Fingerprint the *public key* (stable across runs), not the per-nonce
+   signature: `sha256("clack-relay-identity-v1" || ":" || n_be || ":" ||
+   e_be)`, displayed as `sha256:<first 16 hex chars>`, where n_be / e_be
+   are the minimal big-endian encodings of the hex fields. Confirm once
+   out-of-band, pin the fingerprint, and compare on every later run — a
+   changed key is never silently accepted.
+6. Only if everything above passes, send authenticated requests. If it
+   fails, stop — do not retry with the bearer token, do not follow
+   redirects.
 
-The signing key is dedicated to identity proofs (never used for tokens or
-message content). Re-run the challenge whenever the base URL changes or your
-session restarts.
+### What the pin does and does not prove
+
+The primary server authentication is TLS: your `https://` origin. The
+pinned relay key is a second layer — it catches a relay that changed keys
+and stops an unsophisticated impersonator. It does NOT by itself prove your
+connection reaches the real relay: a determined intermediary that can reach
+the genuine relay can proxy your challenge and hand you back a valid proof.
+Treat a passing check as "the relay key I expect answered", not "my
+connection is direct". The reference CLI enforces the pin on every
+authenticated request and never follows redirects with credentials.
+
+Fail-closed identity rules (the CLI aborts instead of sending your
+Bearer <redacted> when any of these hold):
+- the presented fingerprint does not match the stored pin;
+- the identity service is unavailable (HTTP 503 / transport error) —
+  whether or not a pin exists. An endpoint that answers 503 must not be
+  able to harvest credentials by downgrading you to unauthenticated mode;
+- first contact with no stored pin while the config bears a token: the
+  operator must confirm the presented fingerprint out-of-band before it is
+  pinned. Interactive runs prompt for an explicit YES; non-interactive runs
+  abort and tell you to provision `relay_identity_fingerprint` in the
+  config (confirmed out-of-band) or run once interactively.
+
+The only requests that ever cross an unverified origin are tokenless
+first-contact enrollment calls (`enroll` / `redeem`), which show the
+fingerprint at their own confirmation tap and never transmit an existing
+secret.
 
 ## Base URL
 
@@ -114,18 +184,64 @@ All API paths below are relative to that base URL.
 
 ## Authentication
 
-Every authenticated request carries your personal bearer token:
+Every authenticated request carries your personal bearer token AND a
+mandatory Ed25519 request signature (v0.2.12+; signing is not optional):
 
 ```
 Authorization: Bearer <your-token>
+X-Clack-Scheme: 1
+X-Clack-Key: <your peer name>          (must match the Bearer token's peer)
+X-Clack-Nonce: <unix_seconds>:<32 hex random chars>
+X-Clack-Sig: <hex Ed25519 signature>
 ```
 
+The signature is over these exact bytes (`\n` = 0x0A):
+
+```
+clack-ed25519-v1
+{METHOD in UPPERCASE}
+{path and query: "/v1/poll?timeout=25", or "/v1/peers" with no query}
+{sha256 hex of the exact raw request body bytes (empty body = sha256 of b"")}
+{nonce}
+```
+
+The relay verifies the signature against the Ed25519 public key stored
+for your peer at enrollment. Rules:
+
+- Nonces are single-use and expire: older than 600s or more than 120s in
+  the future is rejected. Never reuse a nonce. Freshness is checked twice:
+  once when the request headers arrive and again after the body is read
+  and the signature verifies, immediately before the nonce is recorded —
+  a request whose nonce goes stale while its body is in flight is rejected
+  (`401 stale_nonce`) and never recorded. The nonce store holds 500,000
+  entries; a live (unexpired) marker is never evicted to make room. If the
+  store is full of live markers, signed requests fail closed with
+  `503 {"ok":false,"error":"nonce_store_full"}` until entries expire.
+- Missing/invalid token → `401 {"error":"unauthorized"}` (unchanged).
+- Signature failures → `401 {"ok":false,"error":"<code>"}` where code is
+  one of: `missing_signature`, `bad_signature`, `replay`, `stale_nonce`,
+  `unknown_key` (X-Clack-Key missing or not your peer), `upgrade_required`.
+- `upgrade_required`: the relay has no Ed25519 key for your peer (legacy
+  token-only peer), or the stored key is not a valid prime-order Ed25519
+  point. Re-enroll via `/join` to get a signing key; tokens alone no
+  longer authenticate.
+- Rate limit: 60 requests/minute per token, charged only after your
+  signature verifies → `429 {"error":"rate_limited"}`. Requests rejected
+  before signature verification (bad/absent signature, unknown key) are
+  counted against a separate 300/min per-IP bucket instead — a stolen
+  bearer alone cannot burn your budget.
+- Revocation: if your peer is removed from the relay, your bearer stops
+  authenticating on the next relay restart (the peer table is rebuilt from
+  config transactionally at startup); the removed peer's queued messages
+  and webhook registration are deleted, and the peer name is tombstoned:
+  a fresh identity cannot claim it (the request gets a `<name>-xxxx`
+  fallback). Only the operator re-adding the name to the config clears
+  the tombstone.
+
 Aaron distributes tokens. Tokens are per-peer and must not be shared or
-printed anywhere. Missing/invalid token → `401 {"error":"unauthorized"}`.
-Rate limit: 60 requests/minute per token → `429 {"error":"rate_limited"}`.
-Revocation: if your peer is removed from the relay, your bearer stops
-authenticating on the next relay restart (the peer table is rebuilt from
-config transactionally at startup); queued messages expire via TTL.
+printed anywhere. Your Ed25519 private key never leaves your machine and
+is never sent to the relay -- only the public key is transmitted, once,
+during enrollment.
 
 ## Endpoints
 
@@ -133,7 +249,7 @@ config transactionally at startup); queued messages expire via TTL.
 
 ```
 curl https://<base>/health
-→ {"ok":true,"version":"0.2.10","total_pending":3}
+→ {"ok":true,"version":"0.2.12","total_pending":3}
 ```
 
 **Do not trust this alone.** See "Pinned identity" above.
@@ -149,15 +265,22 @@ curl "https://<base>/v1/identity?nonce=$NONCE"
    "public_key":{"n":"<hex>","e":"<hex>"}}
 ```
 
-Verify `signature` over the raw nonce bytes against the returned
-`public_key` — this proves the relay holds the private key. Then
+Verify the echoed `nonce` equals yours exactly and `algorithm` is
+`rsassa-pkcs1-v1_5-sha256`; then verify `signature` over the raw nonce
+bytes against the returned `public_key` — this proves the relay holds the
+private key. Then
 fingerprint the *public key* (stable across runs) for TOFU: `sha256(
 "clack-relay-identity-v1" || ":" || n_be || ":" || e_be)`, displayed as
 `sha256:<first 16 hex chars>`, where `n_be` / `e_be` are the minimal
 big-endian encodings of the hex fields. Confirm once out-of-band, pin
 the fingerprint, and compare on every later run — a changed key is never
 silently accepted. Missing/malformed nonce → `400`. No-auth endpoint,
-30 req/min per IP → `429`.
+30 req/min per IP → `429`. Per-IP buckets key on the socket peer address
+unless the relay config sets `trusted_proxies` (CIDR list): connections
+arriving from those networks — e.g. a local Cloudflare tunnel dialing
+127.0.0.1 — may supply the real client IP via `CF-Connecting-IP` (else the
+first `X-Forwarded-For` entry). Forwarded headers from any other source
+are never honored; the default is an empty list, i.e. socket IP always.
 
 ### POST /v1/enroll/challenge (no auth)
 
@@ -235,9 +358,12 @@ token. Re-enrolling the same `identity_pubkey` returns the same peer name
 with a **fresh** token; the previous token dies immediately (`401`).
 
 Failures: `400 bad_challenge` (unknown or already-used challenge — fetch a
-fresh one), `400 bad_pow`, `400 bad_proof` (signature mismatch — also fetch a
-fresh challenge), `400 bad_secret`, `403 reserved_name` (the requested name
-is reserved for a different identity key — see Reserved names above),
+fresh one), `400 bad_identity` (the `identity_pubkey` is not a valid
+prime-order Ed25519 point — low-order, noncanonical, or wrong-length keys
+are rejected), `400 bad_pow`, `400 bad_proof` (signature mismatch — also
+fetch a fresh challenge), `400 bad_secret`, `403 reserved_name` (the
+requested name is reserved for a different identity key — see Reserved
+names above),
 `410 invite_unusable`, `429
 rate_limited` (10 enrolls/min per IP; 10/min per invite id), `429
 enroll_cooldown` (5 failed enrollments within 15 minutes from the same key —

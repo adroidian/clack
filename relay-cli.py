@@ -6,8 +6,12 @@ Two config flavors (auto-detected):
   legacy:   relay-config.json style {"peers": {"nugget": "<token>"}, ...}
             -- existing commands keep working exactly as before.
   identity: {"kind": "clack-identity-v1", "relay_url": ..., "identity_pubkey":
-            ..., "identity_privkey": ..., "service_token": ..., "peer_name": ...}
-            -- created by `keygen` / `redeem`, used by every command.
+            ..., "identity_privkey_path": ..., "service_token": ..., "peer_name": ...}
+            -- created by `keygen` / `redeem`, used by every command. The
+            private key lives in a separate mode-600 key file
+            (identity_privkey_path, default <config>.key); older configs may
+            still carry an inline identity_privkey, which is migrated into
+            the key file on the next save.
 
 Invite-link onboarding (v0.2.5 MVP):
   keygen                     create an ed25519 identity (mode 600)
@@ -23,6 +27,12 @@ Agent self-enrollment (v0.2.9):
                              (invite/pow/open); --invite-id/--secret select
                              the invite gate explicitly.
 
+Mandatory request signing (v0.2.12): every authenticated request carries
+BOTH the Bearer token AND Ed25519 signatures, added automatically:
+  X-Clack-Scheme: 1, X-Clack-Key: <peer name>, X-Clack-Nonce: <ts>:<32hex>,
+  X-Clack-Sig: hex(Ed25519_sign(seed, "clack-ed25519-v1\n"+METHOD+"\n"+
+  path_and_query+"\n"+sha256_hex(raw_body)+"\n"+nonce))
+
 Never print a token or private key.
 """
 import argparse
@@ -31,6 +41,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,9 +58,23 @@ and wrapped in a small friendly API.
 
 Vendored (not a new dependency) because the relay is stdlib-only by design
 and neither `cryptography` nor PyNaCl is guaranteed on every machine that
-runs it (verified absent 2026-09-21). Pure-Python signing costs ~50-200ms
-per operation -- fine for invite flows, which are rare. Do NOT use this for
-high-throughput signing; that is out of scope for the relay.
+runs it (verified absent 2026-09-21).
+
+Security posture: this is the DJB reference implementation, which is not
+constant-time (double-and-add branches on secret scalar bits). That matches
+the reference and is acceptable here: the relay only ever verifies
+(all inputs public), and signing happens on the key owner's own machine.
+Do not use this module where a local timing adversary is in scope.
+
+v0.2.12 performance rework (2026-09-23): the original affine formulas
+inverted twice per point addition -- each inversion a full 255-bit modular
+exponentiation in pure Python -- costing ~3.1s per sign/verify on this VM.
+The group law below uses extended coordinates (Hisilop-Wong-Carter-Dawson):
+additions/doublings need only multiplications, with a single inversion when
+converting back to affine. Measured tens of ms per operation after the
+rework. Signatures are deterministic, so the rework is verified
+byte-identical against the old affine implementation on random inputs
+(see test-signing.py).
 """
 
 import hashlib
@@ -64,59 +89,102 @@ def _H(m):
     return hashlib.sha512(m).digest()
 
 
-def _expmod(base, exp, mod):
-    if exp == 0:
-        return 1
-    t = _expmod(base, exp // 2, mod) ** 2 % mod
-    if exp & 1:
-        t = (t * base) % mod
-    return t
-
-
 def _inv(x):
-    return _expmod(x, q - 2, q)
+    # C-speed builtin; the old recursive pure-Python _expmod was the
+    # dominant cost of every point operation (~3s per sign/verify).
+    return pow(x, q - 2, q)
 
 
-_d = -121665 * _inv(121666)
-_I = _expmod(2, (q - 1) // 4, q)
+_d = (-121665 * _inv(121666)) % q
+_2d = (2 * _d) % q
+_I = pow(2, (q - 1) // 4, q)
 
 
 def _xrecover(y):
-    xx = (y * y - 1) * _inv(_d * y * y + 1)
-    x = _expmod(xx, (q + 3) // 8, q)
+    xx = (y * y - 1) * _inv(_d * y * y + 1) % q
+    x = pow(xx, (q + 3) // 8, q)
     if (x * x - xx) % q != 0:
         x = (x * _I) % q
-    if x % 2 != 0:
+    if x & 1:
         x = q - x
     return x
 
 
-_By = 4 * _inv(5)
-_Bx = _xrecover(_By)
-_B = [_Bx % q, _By % q]
+# --- Extended-coordinate group law ---------------------------------------
+# A point is (X, Y, Z, T) with affine x = X/Z, y = Y/Z. Addition and
+# doubling use only multiplications; _to_affine inverts once at the end.
+# Formulas: Hisilop-Wong-Carter-Dawson, "Twisted Edwards Curves Revisited"
+# (addition), with a = -1 for Ed25519.
+
+_IDENT = (0, 1, 1, 0)
 
 
-def _edwards(P, Q):
-    # Twisted Edwards addition for a*x^2 + y^2 = 1 + d*x^2*y^2 with a = -1
-    # (Ed25519). NOTE the y-numerator is (y1*y2 + x1*x2): the "- a*x1*x2"
-    # term becomes "+" when a = -1. Getting this sign wrong produces a
-    # self-consistent-but-wrong group law that fails the l*B == identity
-    # check -- which is exactly how the bug was caught (2026-09-21).
-    x1, y1 = P[0], P[1]
-    x2, y2 = Q[0], Q[1]
-    x3 = (x1 * y2 + x2 * y1) * _inv(1 + _d * x1 * x2 * y1 * y2)
-    y3 = (y1 * y2 + x1 * x2) * _inv(1 - _d * x1 * x2 * y1 * y2)
-    return [x3 % q, y3 % q]
+def _to_ext_affine(x, y):
+    return (x % q, y % q, 1, (x * y) % q)
+
+
+def _to_affine(P):
+    X, Y, Z, _T = P
+    iz = _inv(Z)
+    return (X * iz % q, Y * iz % q)
+
+
+def _point_eq(P, Q):
+    # Projective equality without inverting: X1/Z1 == X2/Z2 and
+    # Y1/Z1 == Y2/Z2  <=>  cross-multiplied differences are 0 mod q.
+    X1, Y1, Z1, _t1 = P
+    X2, Y2, Z2, _t2 = Q
+    return (X1 * Z2 - X2 * Z1) % q == 0 and (Y1 * Z2 - Y2 * Z1) % q == 0
+
+
+def _edwards_add(P, Q):
+    X1, Y1, Z1, T1 = P
+    X2, Y2, Z2, T2 = Q
+    A = (Y1 - X1) * (Y2 - X2) % q
+    B = (Y1 + X1) * (Y2 + X2) % q
+    C = T1 * _2d % q * T2 % q
+    D = (2 * Z1 % q) * Z2 % q
+    E = (B - A) % q
+    F = (D - C) % q
+    G = (D + C) % q
+    H = (B + A) % q
+    return (E * F % q, G * H % q, F * G % q, E * H % q)
+
+
+def _edwards_dbl(P):
+    X1, Y1, Z1, _T1 = P
+    A = X1 * X1 % q
+    B = Y1 * Y1 % q
+    C = 2 * Z1 * Z1 % q
+    D = (-A) % q  # a = -1 for Ed25519
+    E = ((X1 + Y1) * (X1 + Y1) - A - B) % q
+    G = (D + B) % q
+    F = (G - C) % q
+    H = (D - B) % q
+    return (E * F % q, G * H % q, F * G % q, E * H % q)
 
 
 def _scalarmult(P, e):
-    if e == 0:
-        return [0, 1]
-    Q = _scalarmult(P, e // 2)
-    Q = _edwards(Q, Q)
-    if e & 1:
-        Q = _edwards(Q, P)
+    # NB: scalars here can be up to 512 bits (r and h in _signature /
+    # _checkvalid are full _Hint outputs). Must iterate every bit --
+    # truncating to 256 silently produces wrong points.
+    Q = _IDENT
+    for i in range(max(b, e.bit_length()) - 1, -1, -1):
+        Q = _edwards_dbl(Q)
+        if (e >> i) & 1:
+            Q = _edwards_add(Q, P)
     return Q
+
+
+# --- Base point (extended) -------------------------------------------------
+
+_By = (4 * _inv(5)) % q
+_Bx = _xrecover(_By)
+_B = (_Bx, _By, 1, _Bx * _By % q)
+
+
+def _bit(h, i):
+    return (h[i // 8] >> (i % 8)) & 1
 
 
 def _encodeint(y):
@@ -134,28 +202,29 @@ def _encodepoint(P):
     )
 
 
-def _bit(h, i):
-    return (h[i // 8] >> (i % 8)) & 1
-
-
-def _publickey(sk):
-    h = _H(sk)
-    a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
-    return _encodepoint(_scalarmult(_B, a))
-
-
 def _Hint(m):
     h = _H(m)
     return sum(2**i * _bit(h, i) for i in range(2 * b))
+
+
+def _publickey_point(sk):
+    h = _H(sk)
+    a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
+    return _scalarmult(_B, a)
+
+
+def _publickey(sk):
+    return _encodepoint(_to_affine(_publickey_point(sk)))
 
 
 def _signature(m, sk, pk):
     h = _H(sk)
     a = 2 ** (b - 2) + sum(2**i * _bit(h, i) for i in range(3, b - 2))
     r = _Hint(h[b // 8 : b // 4] + m)
-    R = _scalarmult(_B, r)
-    S = (r + _Hint(_encodepoint(R) + pk + m) * a) % l
-    return _encodepoint(R) + _encodeint(S)
+    Rext = _scalarmult(_B, r)
+    Renc = _encodepoint(_to_affine(Rext))
+    S = (r + _Hint(Renc + pk + m) * a) % l
+    return Renc + _encodeint(S)
 
 
 def _isoncurve(P):
@@ -173,7 +242,7 @@ def _decodepoint(s):
     x = _xrecover(y)
     if x & 1 != sign:
         x = q - x
-    P = [x, y]
+    P = (x, y)
     if not _isoncurve(P):
         raise ValueError("decoding point that is not on curve")
     return P
@@ -189,8 +258,8 @@ def _checkvalid(s, m, pk):
     S = _decodeint(s[b // 8 : b // 4])
     h = _Hint(_encodepoint(R) + pk + m)
     v1 = _scalarmult(_B, S)
-    v2 = _edwards(R, _scalarmult(A, h))
-    return v1 == v2
+    v2 = _edwards_add(_to_ext_affine(*R), _scalarmult(_to_ext_affine(*A), h))
+    return _point_eq(v1, v2)
 
 
 # --- Friendly API -----------------------------------------------------------
@@ -266,23 +335,320 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.9"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.12"
+
+
+# --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
+# Mirrors relay.py: every authenticated request carries
+#   X-Clack-Scheme: 1
+#   X-Clack-Key: <peer name, must match the Bearer token's peer>
+#   X-Clack-Nonce: <unix_seconds>:<32 hex chars random>
+#   X-Clack-Sig: hex(Ed25519_sign(seed, canonical))
+# with canonical bytes
+#   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
+# Signs only when the config carries an identity seed AND a peer_name (i.e.
+# post-enrollment). The pre-enrollment calls (challenge/enroll/redeem) have
+# no peer_name yet, so they stay unsigned; the relay's unsigned endpoints
+# accept them. Legacy token configs have no seed and are never signed --
+# the relay answers those 401s; upgrade the client and re-enroll.
+SIGN_SCHEME_ID = "clack-ed25519-v1"
+
+
+def signing_seed(cfg):
+    """Return the 32-byte Ed25519 seed for an identity config, or None.
+
+    Preferred: identity_privkey_path (a separate mode-600 key file holding
+    the b64u seed). Legacy: inline identity_privkey (b64u). Never prints or
+    logs the seed."""
+    if not is_identity_cfg(cfg):
+        return None
+    path = cfg.get("identity_privkey_path")
+    if path:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read().strip()
+        except OSError:
+            return None
+        if len(raw) == 32:
+            return raw
+        try:
+            seed = b64u_decode(raw.decode("ascii"))
+        except Exception:
+            return None
+        return seed if len(seed) == 32 else None
+    inline = cfg.get("identity_privkey")
+    if not inline:
+        return None
+    try:
+        seed = b64u_decode(inline)
+    except Exception:
+        return None
+    return seed if len(seed) == 32 else None
+
+
+def sign_headers(cfg, method, path, body_bytes):
+    """Build the X-Clack-* signing headers for one request, or {} when the
+    config cannot sign yet (no seed or no peer_name). Pure function of its
+    inputs apart from the fresh random nonce."""
+    seed = signing_seed(cfg)
+    peer = cfg.get("peer_name") if is_identity_cfg(cfg) else None
+    if seed is None or not peer:
+        return {}
+    nonce = "%d:%s" % (int(time.time()), _secrets.token_hex(16))
+    canon = (
+        SIGN_SCHEME_ID + "\n"
+        + method.upper() + "\n"
+        + path + "\n"
+        + hashlib.sha256(body_bytes or b"").hexdigest() + "\n"
+        + nonce
+    ).encode("utf-8")
+    return {
+        "X-Clack-Scheme": "1",
+        "X-Clack-Key": peer,
+        "X-Clack-Nonce": nonce,
+        "X-Clack-Sig": sign(seed, canon).hex(),
+    }
+
+
+def _write_key_file(path, seed):
+    """Write the b64u seed to path with mode 600. Private key material:
+    never printed, never transmitted."""
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(b64u_encode(seed) + "\n")
+
+
+def _save_identity_config(path, cfg, seed, key_path=None):
+    """Persist an identity config (mode 600) with the private key in a
+    separate mode-600 key file. cfg records identity_privkey_path; any
+    legacy inline identity_privkey is migrated into the file."""
+    kp = key_path or cfg.get("identity_privkey_path") or (path + ".key")
+    cfg.pop("identity_privkey", None)
+    cfg["identity_privkey_path"] = kp
+    _write_key_file(kp, seed)
+    d = os.path.dirname(os.path.abspath(path))
+    if d:
+        os.makedirs(d, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+
+
+# --- Fail-closed transport (v0.2.12, Flint review F1/F2/F5) -------------------
+# F2: the CLI never follows redirects. urllib's default opener would resend
+# the bearer token and X-Clack-* signing headers to the redirect target,
+# crossing the configured origin boundary -- so a 3xx on an authenticated
+# or identity request is a failure, not a detour.
+# F1: the relay's identity is verified BEFORE any bearer token, secret, or
+# message body is transmitted, on every origin, including --base-url
+# overrides. The check lives in req(), the single choke point for all
+# API traffic, not just in the enrollment flows.
+# F5: TLS is the primary server-authentication boundary. The pinned relay
+# key is a second layer (catches key changes, stops unsophisticated
+# impersonators); it does not by itself prove the connection is direct --
+# a determined intermediary that can reach the genuine relay can proxy the
+# challenge and return a valid proof. The CLI enforces the pin and refuses
+# redirects; it does not claim the challenge authenticates the channel.
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code,
+            "refusing redirect (%s -> %s): the Clack CLI never follows "
+            "redirects with credentials" % (req.full_url, newurl),
+            headers, fp)
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+def _open(req, timeout):
+    """urlopen through the no-redirect opener. A 3xx raises HTTPError."""
+    return _opener.open(req, timeout=timeout)
+
+
+_verified_origins = {}  # origin -> "pinned" | "confirmed"
+# Only positive verdicts are cached. A "tofu"/"unverified" verdict is never
+# cached because a pin can be established mid-process (redeem/enroll TOFU):
+# the next request must re-evaluate the now-pinned config instead of serving
+# a stale negative verdict and refusing to send. As a bonus, the pin is
+# re-validated against the live identity on every request until it is pinned.
+_config_path = None         # set by main(); TOFU pin persistence target
+
+
+def _is_loopback_url(url):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _persist_tofu_pin(cfg, fingerprint):
+    """Persist a first-contact TOFU pin so later runs enforce it (F1). The
+    private key is untouched (it lives in its own mode-600 key file); only
+    the JSON config gains relay_identity_fingerprint."""
+    cfg["relay_identity_fingerprint"] = fingerprint
+    path = _config_path
+    if not path:
+        return
+    try:
+        d = os.path.dirname(os.path.abspath(path))
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        # O_CREAT mode applies only on create; the config holds bearer
+        # tokens, so enforce 0600 on rewrite too.
+        os.chmod(path, 0o600)
+    except OSError as e:
+        print("warning: could not save relay identity pin to %s: %s"
+              % (path, e), file=sys.stderr)
+
+
+def _ensure_origin_verified(origin, cfg):
+    """Verify the relay identity for `origin` before any secret crosses it.
+
+    Returns the verification level: "pinned" (stored pin matched),
+    "confirmed" (fingerprint interactively confirmed this session), "tofu"
+    (first-contact TOFU, tokenless configs only), or "unverified" (relay
+    has no identity key and the config bears no token).
+
+    Fail-closed (Flint review P1/P2): a config that bears a Bearer <redacted>
+    NEVER sends it unless the origin is "pinned" or "confirmed".
+      - pin mismatch, or identity unavailable (503) while a pin exists,
+        aborts (existing F1/F4 behavior);
+      - identity unavailable with no pin but an existing token aborts: a
+        hostile endpoint must not harvest credentials by answering 503 (P1);
+      - first contact with no pin and an existing token requires the
+        operator to confirm the presented fingerprint out-of-band before it
+        is pinned and any request is sent (P2). Non-interactive sessions
+        abort with instructions instead of silently pinning.
+    Tokenless configs (fresh enroll/redeem) keep the explicit enrollment
+    path, which shows the fingerprint at its own confirmation tap and never
+    transmits an existing secret.
+    """
+    if origin in _verified_origins:
+        return _verified_origins[origin]
+    if (urllib.parse.urlsplit(origin).scheme == "http"
+            and not _is_loopback_url(origin)):
+        # Without TLS there is no server-authentication boundary at all;
+        # say so loudly rather than letting the pin imply safety.
+        print("WARNING: relay URL is cleartext %s -- Bearer <redacted> and "
+              "message bodies travel unencrypted" % origin, file=sys.stderr)
+    token = auth_token(cfg)
+    try:
+        fingerprint, _pubkey = fetch_relay_identity(origin, cfg)
+    except Exception as e:
+        print("could not verify relay identity for %s: %s" % (origin, e),
+              file=sys.stderr)
+        sys.exit(1)
+    pinned = (cfg or {}).get("relay_identity_fingerprint")
+    if fingerprint is None:
+        # Relay has no identity key (503). Never downgrade an existing pin
+        # to unauthenticated operation (F4), and never let an unavailable
+        # identity launder an existing Bearer <redacted> (P1).
+        if pinned:
+            print("relay identity unavailable for %s but this config pins %s;"
+                  " aborting rather than sending credentials unauthenticated"
+                  % (origin, pinned), file=sys.stderr)
+            sys.exit(1)
+        if token:
+            print("relay identity unavailable for %s and this config bears "
+                  "credentials; aborting rather than sending them "
+                  "unauthenticated (an endpoint that answers 503 could be "
+                  "harvesting tokens)" % origin, file=sys.stderr)
+            sys.exit(1)
+        print("WARNING: relay at %s has no identity key; continuing without "
+              "relay authentication (no pin established)" % origin,
+              file=sys.stderr)
+        # Not cached: a pin established later in this process must take
+        # effect on the next request (see _verified_origins comment).
+        return "unverified"
+    if pinned and pinned != fingerprint:
+        print("RELAY IDENTITY CHANGED: config pins %s but %s presents %s"
+              % (pinned, origin, fingerprint), file=sys.stderr)
+        print("aborting: verify out-of-band before proceeding. If you moved "
+              "relays intentionally, update relay_identity_fingerprint in "
+              "the config (or re-enroll).", file=sys.stderr)
+        sys.exit(1)
+    if pinned:
+        _verified_origins[origin] = "pinned"
+        return "pinned"
+    if token:
+        # P2: first contact while bearing a token. Silent TOFU would let a
+        # stolen/reassigned endpoint become the stored pin and receive the
+        # first Bearer <redacted> The operator must confirm the fingerprint
+        # out-of-band before it is pinned.
+        if not sys.stdin.isatty():
+            print("relay at %s presents identity %s, but this config has no "
+                  "stored pin and bears credentials."
+                  % (origin, fingerprint), file=sys.stderr)
+            print("aborting: confirm the fingerprint out-of-band, then add "
+                  "\"relay_identity_fingerprint\": \"%s\" to the config, "
+                  "or run once interactively to confirm and pin it."
+                  % fingerprint, file=sys.stderr)
+            sys.exit(1)
+        print("FIRST CONTACT: relay at %s presents identity" % origin)
+        print("  fingerprint: %s" % fingerprint)
+        print("Confirm this fingerprint out-of-band (relay operator, invite "
+              "material, or the relay's published identity page) before any "
+              "credential is sent.")
+        ans = input("Type YES to pin this relay identity and continue: "
+                    ).strip()
+        if ans != "YES":
+            print("aborted: relay identity not confirmed", file=sys.stderr)
+            sys.exit(1)
+        _persist_tofu_pin(cfg, fingerprint)
+        _verified_origins[origin] = "confirmed"
+        return "confirmed"
+    print("pinned relay identity %s for %s (TOFU, first contact)"
+          % (fingerprint, origin), file=sys.stderr)
+    _persist_tofu_pin(cfg, fingerprint)
+    # Not cached: the pin is now in cfg, so the next request re-evaluates
+    # and lands on "pinned" (a stale "tofu" here broke redeem/enroll hellos).
+    return "tofu"
 
 
 def req(cfg, method, path, body=None, base=None):
-    url = (base or base_url(cfg)) + path
+    origin = (base or base_url(cfg)).rstrip("/")
     token = auth_token(cfg)
+    level = _ensure_origin_verified(origin, cfg)
+    if token and level not in ("pinned", "confirmed"):
+        # Defense in depth (Flint P1): a Bearer <redacted> only crosses a
+        # pin-matched or explicitly confirmed origin. _ensure_origin_verified
+        # already aborts in these cases; the invariant is stated here too so
+        # no future caller can bypass it.
+        print("refusing to send credentials to %s: relay identity %s"
+              % (origin, level), file=sys.stderr)
+        sys.exit(1)
+    url = origin + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(url, data=data, method=method)
     if token:
         r.add_header("Authorization", "Bearer " + token)
     r.add_header("User-Agent", user_agent(cfg))
+    for k, v in sign_headers(cfg, method, path, data).items():
+        r.add_header(k, v)
     if data is not None:
         r.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(r, timeout=130) as resp:
+        with _open(r, timeout=130) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            # _NoRedirect raises for 3xx: never treat as a normal response.
+            loc = e.headers.get("Location") if e.headers else None
+            print("refusing redirect from relay: HTTP %d%s"
+                  % (e.code, (" -> " + loc) if loc else ""),
+                  file=sys.stderr)
+            sys.exit(1)
         try:
             payload = json.loads(e.read().decode("utf-8"))
         except Exception:
@@ -297,6 +663,15 @@ def req(cfg, method, path, body=None, base=None):
 # construction is: sha256("clack-relay-identity-v1" || ":" || n_be || ":"
 # || e_be), displayed as "sha256:<first 16 hex chars>", where n_be / e_be
 # are the minimal big-endian encodings of the "n" / "e" hex fields.
+#
+# Trust boundary (Flint review F5): TLS is the primary server
+# authentication -- your https:// origin. The pinned key is a second
+# layer: it catches a relay that changed keys and stops unsophisticated
+# impersonators, but it does not by itself prove the connection is direct.
+# A determined intermediary that can reach the genuine relay can proxy the
+# challenge and return a valid proof. The CLI enforces the pin on every
+# authenticated request and never follows redirects with credentials; it
+# does not claim the nonce challenge authenticates the channel.
 
 _IDENTITY_FP_DOMAIN = b"clack-relay-identity-v1"
 
@@ -329,27 +704,56 @@ def relay_identity_verify(pubkey, nonce_hex, signature_b64):
     return em == expect
 
 
-def fetch_relay_identity(relay_url):
+def fetch_relay_identity(relay_url, cfg=None):
     """Fetch and verify the relay's identity.
+
+    Strict (Flint review F3): the proof must answer OUR challenge -- the
+    echoed nonce must equal the locally generated one exactly, the
+    algorithm field must be the expected value, and the signature is
+    verified over the local nonce bytes, not the echoed value. A recorded
+    valid proof for a different challenge is rejected even though its
+    signature is genuine.
+
+    The configured user_agent is sent (default ClackRelay-CLI/0.2.12):
+    Cloudflare-fronted relays 403 Python-urllib's default signature, so a
+    bare _open() fails closed before any normal operation can run.
 
     Returns (fingerprint, pubkey). Raises on transport/HTTP errors other
     than 503 (relay has no identity key), in which case returns (None, None)
-    and the caller must warn loudly.
+    and the caller must fail closed when a pin exists (F4).
     """
     nonce = os.urandom(32).hex()
+    id_req = urllib.request.Request(relay_url + "/v1/identity?nonce=" + nonce)
+    id_req.add_header("User-Agent", user_agent(cfg or {}))
     try:
-        with urllib.request.urlopen(
-            relay_url + "/v1/identity?nonce=" + nonce, timeout=30
-        ) as resp:
+        with _open(id_req, timeout=30) as resp:
             ident = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 503:
             return None, None
         raise
+    if not isinstance(ident, dict):
+        raise ValueError("relay identity response is not a JSON object")
+    if ident.get("nonce") != nonce:
+        raise ValueError("relay identity proof answers a different challenge")
+    if ident.get("algorithm") != "rsassa-pkcs1-v1_5-sha256":
+        raise ValueError("relay identity uses unexpected algorithm %r"
+                         % (ident.get("algorithm"),))
     pubkey = ident.get("public_key")
-    if not pubkey or "n" not in pubkey or "e" not in pubkey:
+    if not isinstance(pubkey, dict):
         raise ValueError("relay identity response has no public_key")
-    if not relay_identity_verify(pubkey, ident["nonce"], ident["signature"]):
+    for field in ("n", "e"):
+        try:
+            val = int(pubkey[field], 16)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("relay identity public_key has bad %r field"
+                             % field)
+        if val <= 0:
+            raise ValueError("relay identity public_key has non-positive %r"
+                             % field)
+    if not ident.get("signature"):
+        raise ValueError("relay identity response has no signature")
+    if not relay_identity_verify(pubkey, nonce, ident["signature"]):
         raise ValueError("relay identity signature verification failed")
     return relay_identity_fingerprint(pubkey), pubkey
 
@@ -360,11 +764,12 @@ def check_relay_identity(relay_url, cfg):
     Fetches the relay's stable identity key, verifies the nonce signature
     against it, and enforces the pinned fingerprint when the config already
     has one. Returns the fingerprint (or None when the relay has no
-    identity key). Aborts the process on pin mismatch -- a changed relay
-    key is never silently accepted.
+    identity key and no pin is stored). Aborts the process on pin mismatch
+    -- a changed relay key is never silently accepted -- and when the
+    identity service is unavailable but a pin exists (F4: no downgrade).
     """
     try:
-        fingerprint, _pubkey = fetch_relay_identity(relay_url)
+        fingerprint, _pubkey = fetch_relay_identity(relay_url, cfg)
     except urllib.error.HTTPError as e:
         print("could not verify relay identity: HTTP Error %d" % e.code,
               file=sys.stderr)
@@ -373,6 +778,14 @@ def check_relay_identity(relay_url, cfg):
         print("could not verify relay identity: %s" % e, file=sys.stderr)
         sys.exit(1)
     if fingerprint is None:
+        # Relay has no identity key (503). A stored pin is never silently
+        # downgraded to unauthenticated onboarding (Flint review F4).
+        pinned = (cfg or {}).get("relay_identity_fingerprint")
+        if pinned:
+            print("relay identity unavailable (no identity key) but this "
+                  "config pins %s; aborting rather than downgrading to "
+                  "unauthenticated onboarding" % pinned, file=sys.stderr)
+            sys.exit(1)
         return None
     pinned = (cfg or {}).get("relay_identity_fingerprint")
     if pinned and pinned != fingerprint:
@@ -393,17 +806,85 @@ def cmd_keygen(args):
         "kind": IDENTITY_KIND,
         "relay_url": args.relay_url,
         "identity_pubkey": b64u_encode(pub),
-        "identity_privkey": b64u_encode(seed),
     }
     if args.user_agent:
         cfg["user_agent"] = args.user_agent
     os.makedirs(os.path.dirname(os.path.abspath(args.config)) or ".", exist_ok=True)
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    _save_identity_config(args.config, cfg, seed, key_path=args.key_path)
     print("identity created: %s" % args.config)
+    print("private key:      %s (mode 600; never leaves this machine)" % cfg["identity_privkey_path"])
     print("pubkey: %s" % cfg["identity_pubkey"])
+    return 0
+
+
+def cmd_attach_key(args, cfg):
+    """Attach a fresh Ed25519 signing key to an existing client config.
+
+    Legacy token-only configs (no "kind") are converted to identity
+    configs (kind == IDENTITY_KIND) so the CLI auto-signs every request;
+    identity configs that lost their key file get a fresh keypair. The
+    operator must register the printed pubkey in the relay's
+    "identity_pubkeys" map before the relay will accept signed requests.
+    Idempotent: a config that already has a usable seed is left alone.
+    """
+    if is_identity_cfg(cfg) and signing_seed(cfg) is not None:
+        pub = b64u_decode(cfg["identity_pubkey"])
+        print("already has a signing key: %s" % args.config)
+        print("pubkey: %s" % b64u_encode(pub))
+        return 0
+
+    if is_identity_cfg(cfg):
+        # Identity config whose key file is missing/unreadable: fresh
+        # keypair, keep everything else (relay_url, peer_name, token...).
+        new_cfg = dict(cfg)
+        peer_name = new_cfg.get("peer_name")
+        if not peer_name:
+            print("identity config has no peer_name; cannot attach a key",
+                  file=sys.stderr)
+            return 1
+    else:
+        # Legacy token config: pick the peer, carry token + URL forward.
+        peers = cfg.get("peers") or {}
+        peer_name = args.peer
+        if peer_name and peer_name not in peers:
+            print("peer %r not in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        if not peer_name:
+            if len(peers) == 1:
+                peer_name = next(iter(peers))
+            else:
+                print("config has %d peers; pass --peer <name>" % len(peers),
+                      file=sys.stderr)
+                return 1
+        token = peers.get(peer_name)
+        if not token:
+            print("no token for peer %r in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        relay_url = (cfg.get("base_url") or cfg.get("relay_url")
+                     or "http://127.0.0.1:%d" % cfg.get("port", 18802))
+        new_cfg = {
+            "kind": IDENTITY_KIND,
+            "relay_url": relay_url.rstrip("/"),
+            "peer_name": peer_name,
+            "service_token": token
+        }
+        if cfg.get("user_agent"):
+            new_cfg["user_agent"] = cfg["user_agent"]
+        if cfg.get("relay_identity_fingerprint"):
+            new_cfg["relay_identity_fingerprint"] = \
+                cfg["relay_identity_fingerprint"]
+
+    seed, pub = keygen()
+    new_cfg["identity_pubkey"] = b64u_encode(pub)
+    _save_identity_config(args.config, new_cfg, seed,
+                          key_path=getattr(args, "key_path", None))
+    print("signing key attached: %s (peer %s)" % (args.config, peer_name))
+    print("private key: %s (mode 600; never leaves this machine)"
+          % new_cfg["identity_privkey_path"])
+    print("pubkey for the relay operator's identity_pubkeys map:")
+    print(b64u_encode(pub))
     return 0
 
 
@@ -488,10 +969,15 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "identity_privkey": b64u_encode(seed),
-            "user_agent": "ClackRelay-CLI/0.2.9",
+            "user_agent": "ClackRelay-CLI/0.2.12",
         }
-    seed = b64u_decode(cfg["identity_privkey"])
+        # Persist the private key immediately (mode 600 key file): the relay
+        # never sees it, and nothing below may proceed without it on disk.
+        _save_identity_config(args.config, cfg, seed)
+    seed = signing_seed(cfg)
+    if seed is None:
+        print("config has no usable identity private key", file=sys.stderr)
+        return 1
     pub = b64u_decode(cfg["identity_pubkey"])
 
     # Challenge -> sign(nonce || invite_id || pubkey) -> redeem.
@@ -517,17 +1003,17 @@ def cmd_redeem(args):
     cfg["display_name"] = out["display_name"]
     if relay_fp:
         cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
+    # Same config-save path as keygen: private key stays in its 0600 file.
+    _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s...)" % (out["peer_name"], out["identity"][:12]))
 
     # Greeting exchange: hello to the inviter. Onboarding succeeds when the
     # invitee receives AND acknowledges the inviter's reply (checked by the
     # inviter via /v1/receipts -> acked).
+    # P1: the hello bears the fresh token, so it only goes to a
+    # pin-verified origin -- never to a relay with no identity key.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -539,6 +1025,9 @@ def cmd_redeem(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     else:
         print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
@@ -628,10 +1117,15 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "identity_privkey": b64u_encode(seed),
-            "user_agent": "ClackRelay-CLI/0.2.9",
+            "user_agent": "ClackRelay-CLI/0.2.12",
         }
-    seed = b64u_decode(cfg["identity_privkey"])
+        # Persist the private key immediately (mode 600 key file): the relay
+        # never sees it, and nothing below may proceed without it on disk.
+        _save_identity_config(args.config, cfg, seed)
+    seed = signing_seed(cfg)
+    if seed is None:
+        print("config has no usable identity private key", file=sys.stderr)
+        return 1
     pub = b64u_decode(cfg["identity_pubkey"])
 
     # Challenge -> (solve PoW when the gate is pow) -> sign -> enroll.
@@ -670,24 +1164,22 @@ def cmd_enroll(args):
         print("enroll failed: %s" % json.dumps(out), file=sys.stderr)
         return 1
 
-    # Same config-save path as redeem: same file, same mode 600.
+    # Same config-save path as redeem: private key stays in its 0600 file.
     cfg["relay_url"] = relay_url
     cfg["service_token"] = out["service_token"]
     cfg["peer_name"] = out["peer_name"]
     cfg["display_name"] = out["display_name"]
     if relay_fp:
         cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
-    fd = os.open(args.config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
+    _save_identity_config(args.config, cfg, seed)
     print("enrolled as %s (identity %s..., via %s gate)"
           % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
 
     # Greeting exchange, mirroring redeem: hello to the inviter when the
-    # invite gate names one.
+    # invite gate names one. P1: token-bearing, so only to a pin-verified
+    # origin -- never to a relay with no identity key.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
         code, sent = req(cfg, "POST", "/v1/send", {
             "id": hello_id,
@@ -699,6 +1191,9 @@ def cmd_enroll(args):
             print("hello sent to %s (id %s)" % (inviter, hello_id))
         else:
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     print("config saved: %s" % args.config)
     return 0
 
@@ -754,7 +1249,16 @@ def main():
     k = sub.add_parser("keygen", help="create an ed25519 identity config")
     k.add_argument("--relay-url", required=True, help="relay base URL, e.g. http://127.0.0.1:18998")
     k.add_argument("--force", action="store_true", help="overwrite existing config")
+    k.add_argument("--key-path", default=None,
+                   help="private key file path (mode 600; default: <config>.key)")
     k.add_argument("--user-agent", default=None)
+
+    ak = sub.add_parser("attach-key",
+                        help="attach an ed25519 signing key to a legacy "
+                             "token config (prints the pubkey for the relay "
+                             "operator's identity_pubkeys map)")
+    ak.add_argument("--key-path", default=None,
+                    help="private key file path (mode 600; default: <config>.key)")
 
     m = sub.add_parser("mint-invite", help="mint a shareable join link")
     m.add_argument("--max-uses", type=int, default=1)
@@ -777,8 +1281,10 @@ def main():
     rv.add_argument("invite_id")
 
     args = ap.parse_args()
-    global _selected_peer
+    global _selected_peer, _config_path
     _selected_peer = args.peer
+    # TOFU pin persistence target for _ensure_origin_verified (F1).
+    _config_path = args.config
 
     if args.cmd in ("keygen", "redeem", "enroll"):
         # These manage the identity config file itself; no prior config needed.
@@ -828,6 +1334,8 @@ def main():
         return cmd_invite_list(args, cfg)
     elif args.cmd == "invite-revoke":
         return cmd_invite_revoke(args, cfg)
+    elif args.cmd == "attach-key":
+        return cmd_attach_key(args, cfg)
 
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if 200 <= code < 300 else 1
