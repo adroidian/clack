@@ -523,6 +523,21 @@ CODE="$(req GET /v1/peers "$TZ")"
 [ "$(req GET /v1/peers "$TA")" = "200" ] && ok "surviving peer still authenticates" \
   || bad "surviving peer" "$(cat "$BODY")"
 
+# --- peer_hashes regression (test-peer-hashes.py) ---------------------------
+# Hash-only config peers (protected provisioning) must survive the
+# init_db config rebuild: no revocation, no message/webhook loss, no
+# name retirement. Spins no relay; exercises init_db directly on
+# scratch DBs. Never touches production.
+echo "---- peer-hashes phase (test-peer-hashes.py) ----"
+PH_RC=0
+PH_OUT="$(python3 "$HOME/workspace/clack-relay/test-peer-hashes.py" 2>&1)" || PH_RC=$?
+echo "$PH_OUT"
+PH_PASS="$(printf '%s\n' "$PH_OUT" | sed -n 's/^pass=\([0-9][0-9]*\) fail=.*/\1/p')"
+PH_FAIL="$(printf '%s\n' "$PH_OUT" | sed -n 's/^pass=.* fail=\([0-9][0-9]*\)/\1/p')"
+PASS=$((PASS + ${PH_PASS:-0}))
+FAIL=$((FAIL + ${PH_FAIL:-0}))
+[ "$PH_RC" = "0" ] || bad "test-peer-hashes.py exit code" "$PH_RC"
+
 # --- agent self-enrollment + reserved names (test-enroll.py) ------------------
 # Final phase: spins its own scratch instances (ports 18996-18999); never
 # touches this script's instance or the production relay.

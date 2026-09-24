@@ -88,9 +88,10 @@ def _parse_identity_pubkeys(cfg):
         raise ValueError("identity_pubkeys must be an object, got %s"
                          % type(raw).__name__)
     peers = cfg.get("peers", {}) if cfg else {}
+    hashes = cfg.get("peer_hashes", {}) if cfg else {}
     out = {}
     for name, key_b64 in raw.items():
-        if name not in peers:
+        if name not in peers and name not in hashes:
             raise ValueError("identity_pubkeys entry %r is not a configured peer"
                              % (name,))
         try:
@@ -117,6 +118,52 @@ def _init_identity_pubkeys(cfg):
         _IDENTITY_PUBKEYS = _parse_identity_pubkeys(cfg)
     except ValueError as e:
         raise SystemExit("clack-relay: invalid identity_pubkeys: %s" % e)
+
+
+# Operator-supplied token hashes for config-managed peers, from the
+# "peer_hashes" config map: {peer_name: hex(sha256(token))}. This is the
+# protected provisioning path (e.g. Sigrid's hash-only provisioning):
+# the relay authenticates the peer by hashing the presented bearer
+# token, but the plaintext token is never stored in config or DB.
+# Strictly validated at startup; malformed entries refuse startup.
+_PEER_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_PEER_HASHES = {}
+
+
+def _parse_peer_hashes(cfg):
+    """Strictly validate relay-config.json "peer_hashes".
+
+    Returns {name: 64-char lowercase hex sha256}. Malformed entries
+    raise ValueError (startup refuses loudly, mirroring
+    identity_pubkeys)."""
+    raw = cfg.get("peer_hashes", {}) if cfg else {}
+    if not isinstance(raw, dict):
+        raise ValueError("peer_hashes must be an object, got %s"
+                         % type(raw).__name__)
+    out = {}
+    for name, h in raw.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("peer_hashes has an invalid peer name %r"
+                             % (name,))
+        if not isinstance(h, str) or not _PEER_HASH_RE.match(h):
+            raise ValueError("peer_hashes entry %r is not a 64-char "
+                             "lowercase hex sha256" % (name,))
+        out[name] = h
+    return out
+
+
+def _init_peer_hashes(cfg):
+    global _PEER_HASHES
+    try:
+        _PEER_HASHES = _parse_peer_hashes(cfg)
+    except ValueError as e:
+        raise SystemExit("clack-relay: invalid peer_hashes: %s" % e)
+    overlap = set(cfg.get("peers") or {}) & set(_PEER_HASHES)
+    if overlap:
+        raise SystemExit(
+            "clack-relay: peer(s) in both 'peers' and 'peer_hashes' "
+            "(ambiguous identity source, refusing startup): %s"
+            % ", ".join(sorted(overlap)))
 
 
 # --- Mutual-consent handshakes (v0.2.13) ---------------------------------------
@@ -517,6 +564,15 @@ def init_db(cfg):
     # "identity_pubkeys" config map -- the operator upgrade path for
     # token-only peers. Keys are re-read from config every restart, so
     # removing a key downgrades the peer back to upgrade_required.
+    #
+    # v0.2.13: config peers may ALSO be provisioned hash-only via the
+    # "peer_hashes" config map ({name: hex(sha256(token))}), for protected
+    # provisioning where the plaintext token must never be stored. Both
+    # sources union into the config-managed identity set: a peer listed
+    # in either map is config-managed, and only a peer listed in NEITHER
+    # map is revoked on restart. Hash-only rows keep their stored hash
+    # verbatim -- the plaintext is never present, never derived, never
+    # logged.
     with conn:
         existing_config = {
             r[0]
@@ -525,7 +581,7 @@ def init_db(cfg):
                 "OR (enroll_gate IS NULL AND identity_pubkey IS NULL)"
             )
         }
-        incoming = set(cfg.get("peers", {}).keys())
+        incoming = set(cfg.get("peers", {}).keys()) | set(_PEER_HASHES)
         removed = existing_config - incoming
         if removed:
             now_r = time.time()
@@ -550,6 +606,12 @@ def init_db(cfg):
                 (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now,
                  _IDENTITY_PUBKEYS.get(name), "config")
                 for name, token in cfg.get("peers", {}).items()
+            ] + [
+                # Hash-only peers: the token hash comes straight from the
+                # validated peer_hashes map. The plaintext token is never
+                # present on this host -- nothing to derive, nothing to log.
+                (name, token_hash, now, _IDENTITY_PUBKEYS.get(name), "config")
+                for name, token_hash in _PEER_HASHES.items()
             ],
         )
         if incoming:
@@ -3490,6 +3552,7 @@ def main():
     relay_cfg = cfg
     _init_reserved_names(cfg)  # strict: malformed entries refuse startup
     _init_identity_pubkeys(cfg)  # strict: malformed entries refuse startup
+    _init_peer_hashes(cfg)  # strict: malformed entries refuse startup
     try:
         _parse_handshake_knobs(cfg)  # strict: malformed entries refuse startup
     except ValueError as e:
