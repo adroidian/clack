@@ -29,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.14"
+VERSION = "0.2.15"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -1560,7 +1560,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "n": 6,
                     "title": "Redeem the handshake link, then accept",
-                    "detail": "POST /v1/handshakes/redeem with {\"h\": h, \"k\": k, \"identity_pubkey\": base64url(public_key), \"proof\": {\"nonce\": ..., \"signature\": ...}, \"pow_nonce\": ...} enrolls inline (fresh identity) and returns {\"service_token\", \"peer_name\", \"handshake_id\", ...}. Then POST /v1/handshakes/accept with {\"handshake_id\"} (authenticated) activates the handshake. The link use is consumed atomically (single-use).",
+                    "detail": "POST /v1/handshakes/redeem with {\"h\": h, \"k\": k, \"identity_pubkey\": base64url(public_key), \"requested_name\": \"desired-name\" (optional, v0.2.15+), \"proof\": {\"nonce\": ..., \"signature\": ...}, \"pow_nonce\": ...} enrolls inline (fresh identity) and returns {\"service_token\", \"peer_name\", \"handshake_id\", ...}. Then POST /v1/handshakes/accept with {\"handshake_id\"} (authenticated) activates the handshake. The link use is consumed atomically (single-use).",
                 },
                 {
                     "n": 7,
@@ -2955,6 +2955,13 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(k, str) or not k:
             self._json(400, {"error": "claim_required"})
             return
+        # Optional requested peer name (v0.2.15): the redeemer may choose
+        # their own name instead of receiving a guest- assignment. Invalid
+        # names are rejected here, not silently replaced.
+        requested_name = body.get("requested_name")
+        if requested_name is not None and not _valid_requested_name(requested_name):
+            self._json(400, {"error": "bad_requested_name"})
+            return
         ip = self._client_ip()
         # Redeem is rate-limited per IP and per link: the invite limiters.
         if not invite_rate_ok("rip:" + ip, 30):
@@ -3172,7 +3179,7 @@ class Handler(BaseHTTPRequestHandler):
                             enroll[0],
                             token_hash,
                             enroll[2],
-                            None,
+                            requested_name,
                             now2,
                             enroll_gate=enroll[1],
                             enroll_ip=ip,
@@ -3210,7 +3217,7 @@ class Handler(BaseHTTPRequestHandler):
                             enroll[0],
                             token_hash,
                             enroll[2],
-                            None,
+                            requested_name,
                             now2,
                             enroll_gate=enroll[1],
                             enroll_ip=ip,

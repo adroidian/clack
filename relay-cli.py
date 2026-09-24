@@ -335,7 +335,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.14"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.15"
 
 
 # --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
@@ -730,7 +730,7 @@ def fetch_relay_identity(relay_url, cfg=None):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
-    The configured user_agent is sent (default ClackRelay-CLI/0.2.14):
+    The configured user_agent is sent (default ClackRelay-CLI/0.2.15):
     Cloudflare-fronted relays 403 Python-urllib's default signature, so a
     bare _open() fails closed before any normal operation can run.
 
@@ -990,7 +990,7 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.14",
+            "user_agent": "ClackRelay-CLI/0.2.15",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -1067,6 +1067,21 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
     h = f["h"]
     k = f["k"]
 
+    # v0.2.15: let the redeemer choose their peer name (lowercase
+    # alphanumeric, _ and - allowed, 1-31 chars, may not start with
+    # "guest-"). Empty input = server assigns a guest name.
+    import re as _re
+    _name_re = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+    requested_name = None
+    while True:
+        ans = input("Choose your peer name (lowercase, or Enter for guest): ").strip()
+        if not ans:
+            break
+        if _name_re.match(ans) and not ans.startswith("guest-"):
+            requested_name = ans
+            break
+        print("  invalid name: use lowercase letters, digits, _ or -, 1-31 chars", file=sys.stderr)
+
     # Enrollment challenge. The relay prefers the invite gate when enabled
     # (challenge bound to this link id); otherwise PoW or open. Only fall
     # back past {"invite_id": h} when the invite gate itself is disabled --
@@ -1081,6 +1096,8 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
         return 1
     gate = ch.get("gate")
     body = {"h": h, "k": k, "identity_pubkey": b64u_encode(pub)}
+    if requested_name:
+        body["requested_name"] = requested_name
     if gate == "pow":
         chal_raw = b64u_decode(ch["challenge"])
         difficulty = int(ch.get("difficulty", 20))
@@ -1236,7 +1253,7 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.14",
+            "user_agent": "ClackRelay-CLI/0.2.15",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
