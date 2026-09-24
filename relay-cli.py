@@ -335,7 +335,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.12"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.14"
 
 
 # --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
@@ -730,7 +730,7 @@ def fetch_relay_identity(relay_url, cfg=None):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
-    The configured user_agent is sent (default ClackRelay-CLI/0.2.12):
+    The configured user_agent is sent (default ClackRelay-CLI/0.2.14):
     Cloudflare-fronted relays 403 Python-urllib's default signature, so a
     bare _open() fails closed before any normal operation can run.
 
@@ -916,9 +916,11 @@ def parse_link(link):
     frag = link.split("#", 1)[1]
     q = urllib.parse.parse_qs(frag, keep_blank_values=True)
     get = lambda k: (q.get(k) or [None])[0]
-    fields = {k: get(k) for k in ("r", "i", "k", "v", "by", "exp")}
-    if not fields["r"] or not fields["i"] or not fields["k"]:
-        raise ValueError("link missing r/i/k fields")
+    fields = {k: get(k) for k in ("r", "i", "h", "k", "v", "by", "exp", "max")}
+    if not fields["r"] or not fields["k"]:
+        raise ValueError("link missing r/k fields")
+    if not fields["i"] and not fields["h"]:
+        raise ValueError("link missing i (v3 invite) or h (v4 handshake) id")
     return fields
 
 
@@ -988,7 +990,7 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.12",
+            "user_agent": "ClackRelay-CLI/0.2.14",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -998,6 +1000,12 @@ def cmd_redeem(args):
         print("config has no usable identity private key", file=sys.stderr)
         return 1
     pub = b64u_decode(cfg["identity_pubkey"])
+
+    # v0.2.13+: handshake links (v=4, h= link id). v3 invite links (i=)
+    # keep the legacy flow below.
+    if f.get("h"):
+        return _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp,
+                                    seed, pub)
 
     # Challenge -> sign(nonce || invite_id || pubkey) -> redeem.
     code, ch = req(cfg, "POST", "/v1/invites/challenge",
@@ -1047,6 +1055,102 @@ def cmd_redeem(args):
             print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
     else:
         print("note: inviter has no messageable peer name; skipping hello")
+    print("config saved: %s" % args.config)
+    return 0
+
+
+def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
+    """Redeem a v4 handshake link: inline enrollment (invite/PoW/open gate)
+    via POST /v1/handshakes/redeem, then accept the pending handshake via
+    POST /v1/handshakes/accept. The minter already consented at mint time;
+    the redeemer consents by accepting."""
+    h = f["h"]
+    k = f["k"]
+
+    # Enrollment challenge. The relay prefers the invite gate when enabled
+    # (challenge bound to this link id); otherwise PoW or open. Only fall
+    # back past {"invite_id": h} when the invite gate itself is disabled --
+    # a bad link must fail here, not silently switch gates.
+    code, ch = req(cfg, "POST", "/v1/enroll/challenge",
+                   {"invite_id": h}, base=relay_url)
+    if code == 400 and ch.get("error") == "invite_not_allowed":
+        code, ch = req(cfg, "POST", "/v1/enroll/challenge", {},
+                       base=relay_url)
+    if not (200 <= code < 300):
+        print("challenge failed: %s" % json.dumps(ch), file=sys.stderr)
+        return 1
+    gate = ch.get("gate")
+    body = {"h": h, "k": k, "identity_pubkey": b64u_encode(pub)}
+    if gate == "pow":
+        chal_raw = b64u_decode(ch["challenge"])
+        difficulty = int(ch.get("difficulty", 20))
+        print("solving proof-of-work (difficulty %d bits)..." % difficulty)
+        pow_nonce = None
+        while pow_nonce is None:
+            cand = os.urandom(16)
+            if _pow_lead_zero(hashlib.sha256(chal_raw + cand).digest()) >= difficulty:
+                pow_nonce = cand
+        body["pow_nonce"] = b64u_encode(pow_nonce)
+        sig = sign(seed, chal_raw + pow_nonce + pub)
+    elif gate == "invite":
+        chal_raw = b64u_decode(ch["nonce"])
+        sig = sign(seed, chal_raw + h.encode("utf-8") + pub)
+    elif gate == "open":
+        chal_raw = b64u_decode(ch["nonce"])
+        sig = sign(seed, chal_raw + pub)
+    else:
+        print("unknown enrollment gate: %r" % gate, file=sys.stderr)
+        return 1
+    body["proof"] = {"nonce": b64u_encode(chal_raw),
+                     "signature": b64u_encode(sig)}
+    code, out = req(cfg, "POST", "/v1/handshakes/redeem", body,
+                    base=relay_url)
+    if not (200 <= code < 300):
+        print("redeem failed: %s" % json.dumps(out), file=sys.stderr)
+        return 1
+
+    cfg["service_token"] = out["service_token"]
+    cfg["peer_name"] = out["peer_name"]
+    cfg["display_name"] = out["display_name"]
+    if relay_fp:
+        cfg["relay_identity_fingerprint"] = relay_fp  # TOFU pin
+    # Same config-save path as keygen: private key stays in its 0600 file.
+    _save_identity_config(args.config, cfg, seed)
+    print("enrolled as %s (identity %s..., via %s gate)"
+          % (out["peer_name"], out["identity"][:12], out.get("enrollment")))
+    print("handshake: %s (status %s)"
+          % (out.get("handshake_id"), out.get("status")))
+
+    # The redeemer consents by accepting. Authenticated: the fresh token
+    # and signing key prove key possession.
+    code, acc = req(cfg, "POST", "/v1/handshakes/accept",
+                    {"handshake_id": out["handshake_id"]}, base=relay_url)
+    if not (200 <= code < 300):
+        print("accept failed: %s" % json.dumps(acc), file=sys.stderr)
+        return 1
+    print("handshake active with %s"
+          % (out.get("minter_name_hint") or acc.get("peer") or "peer"))
+
+    # Greeting exchange: hello to the minter. The handshake is active now,
+    # so the send is authorized.
+    minter = out.get("minter_name_hint")
+    if minter and cfg.get("relay_identity_fingerprint"):
+        hello_id = str(uuid.uuid4())
+        code, sent = req(cfg, "POST", "/v1/send", {
+            "id": hello_id,
+            "to": minter,
+            "topic": "introductions",
+            "text": "hello %s -- joined via your handshake link (Clack onboarding)" % minter,
+        }, base=relay_url)
+        if 200 <= code < 300:
+            print("hello sent to %s (id %s)" % (minter, hello_id))
+        else:
+            print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+    elif minter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
+    else:
+        print("note: minter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
     return 0
 
@@ -1132,7 +1236,7 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.12",
+            "user_agent": "ClackRelay-CLI/0.2.14",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.

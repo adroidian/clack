@@ -29,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.13"
+VERSION = "0.2.14"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -1526,16 +1526,16 @@ class Handler(BaseHTTPRequestHandler):
             "relay_url": base,
             "client_url": base + "/join/client",
             "protocol_version": VERSION,
-            "link_version": LINK_VERSION,
-            "link_format": "https://<relay>/join#v=3&r=<base64url relay url>&i=<invite id>&k=<claim secret>&by=<inviter>&exp=<expiry epoch>",
-            "fragment_params": ["r", "i", "k", "v", "by", "exp"],
-            "fragment_note": "The URL fragment (after #) is never sent to the server. Parse it locally. The claim secret (k) travels only inside the POST /v1/invites/redeem body.",
+            "link_version": HANDSHAKE_LINK_VERSION,
+            "link_format": "https://<relay>/join#v=4&r=<base64url relay url>&h=<handshake link id>&k=<claim secret>&by=<minter>&exp=<expiry epoch>&max=<max uses>",
+            "fragment_params": ["r", "h", "k", "v", "by", "exp", "max"],
+            "fragment_note": "The URL fragment (after #) is never sent to the server. Parse it locally. The claim secret (k) travels only inside the POST /v1/handshakes/redeem body. Legacy v3 invite links used i=<invite id> instead of h and redeemed via /v1/invites/*; the relay now mints v4 handshake links.",
             "security_note": "Recommended before redeeming: GET /v1/identity?nonce=<16-64 random bytes as hex> and confirm the relay's signature fingerprint out-of-band (TOFU).",
             "steps": [
                 {
                     "n": 1,
-                    "title": "Parse the invite link fragment locally",
-                    "detail": "Split the link on '#'; parse the fragment as query parameters. r = base64url relay URL, i = invite id, k = base64url claim secret, v = link version, by = inviter name, exp = expiry unix epoch.",
+                    "title": "Parse the handshake link fragment locally",
+                    "detail": "Split the link on '#'; parse the fragment as query parameters. r = base64url relay URL, h = handshake link id, k = base64url claim secret, v = link version (4), by = minter name, exp = expiry unix epoch, max = max uses.",
                 },
                 {
                     "n": 2,
@@ -1549,18 +1549,18 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 {
                     "n": 4,
-                    "title": "Fetch a challenge nonce",
-                    "detail": "POST /v1/invites/challenge with {\"invite_id\": i} returns {\"nonce\"} (base64url, single-use, 5-minute expiry, bound to the invite).",
+                    "title": "Fetch an enrollment challenge",
+                    "detail": "POST /v1/enroll/challenge with {\"invite_id\": h} (invite gate) or {} (PoW/open gate) returns the challenge. The handshake flow reuses the enrollment challenge; for the invite gate it is bound to this link id.",
                 },
                 {
                     "n": 5,
                     "title": "Sign the proof",
-                    "detail": "signature = Ed25519_sign(seed, nonce_bytes || invite_id.encode(\"utf-8\") || public_key_bytes).",
+                    "detail": "signature = Ed25519_sign(seed, challenge_bytes || link_id.encode(\"utf-8\") || public_key_bytes) for the invite gate; for the PoW gate solve the proof-of-work first and sign (challenge || pow_nonce || public_key_bytes).",
                 },
                 {
                     "n": 6,
-                    "title": "Redeem the invite",
-                    "detail": "POST /v1/invites/redeem with {\"invite_id\": i, \"secret\": k, \"identity_pubkey\": base64url(public_key), \"proof\": {\"nonce\": nonce, \"signature\": base64url(signature)}} returns {\"service_token\", \"peer_name\", ...}. The invite is consumed atomically (single-use).",
+                    "title": "Redeem the handshake link, then accept",
+                    "detail": "POST /v1/handshakes/redeem with {\"h\": h, \"k\": k, \"identity_pubkey\": base64url(public_key), \"proof\": {\"nonce\": ..., \"signature\": ...}, \"pow_nonce\": ...} enrolls inline (fresh identity) and returns {\"service_token\", \"peer_name\", \"handshake_id\", ...}. Then POST /v1/handshakes/accept with {\"handshake_id\"} (authenticated) activates the handshake. The link use is consumed atomically (single-use).",
                 },
                 {
                     "n": 7,
