@@ -27,6 +27,7 @@ Env:   CLACK_RELAY_PY overrides the relay under test (default: ./relay.py).
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -38,6 +39,9 @@ import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RELAY_PY = os.environ.get("CLACK_RELAY_PY", os.path.join(HERE, "relay.py"))
+# Expected version is whatever relay.py declares (not hardcoded here).
+_m = re.search(r'^VERSION\s*=\s*"([^"]+)"', open(RELAY_PY).read(), re.M)
+EXPECTED_VERSION = _m.group(1) if _m else "?"
 ROOT = "/tmp/clack-real-restart"
 PORTS = {"s1": 18980, "s2": 18981, "s4": 18982, "s5": 18983}
 
@@ -170,7 +174,7 @@ write_config(d1, {"port": PORTS["s1"], "bind": "127.0.0.1",
 p1 = start(d1, PORTS["s1"])
 h = wait_health(PORTS["s1"])
 check("s1 relay starts (real process)", h is not None, repr(h))
-check("s1 version is 0.2.13", (h or {}).get("version") == "0.2.13", repr(h))
+check("s1 version is %s" % EXPECTED_VERSION, (h or {}).get("version") == EXPECTED_VERSION, repr(h))
 mid = seed_message(d1, "sender", "migrator", "hello migrator")
 check("s1 pre-restart message queued", mid is not None)
 seed_webhook(d1, "migrator")

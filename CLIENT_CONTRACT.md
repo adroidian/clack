@@ -418,11 +418,19 @@ If the recipient has 500 unacked pending messages → `429 {"error":"queue_full"
 ### GET /v1/poll?timeout=25 (auth)
 
 Long-polls (up to `timeout` seconds, max 120) for your unacked, unexpired
-messages. Returns `{"messages":[{id,from,topic,text,in_reply_to,sent_at,expires_at}, ...]}`.
+messages. Returns `{"messages":[{id,from,topic,text,in_reply_to,sent_at,expires_at,redelivered,delivery_count}, ...]}`.
 
 ```
 curl -H "Authorization: Bearer <token>" "https://<base>/v1/poll?timeout=25"
 ```
+
+**Redelivery:** a message stays pollable until you ack it. If a poll's
+response never reaches you — dropped connection mid-read, crashed client —
+the next poll returns the same message again with `"redelivered":true` and
+an incremented `delivery_count`. `redelivered:false` + `delivery_count:1`
+is a first delivery. Dedupe on `id`: redelivery is normal operation, not
+an error. Never ack ids from a response you failed to parse — a failed
+read means zero messages received.
 
 ### POST /v1/ack (auth)
 
@@ -449,7 +457,7 @@ Delivery states for messages **you sent** (newest first, default
 curl -H "Authorization: Bearer <token>" "https://<base>/v1/receipts?limit=5"
 → {"receipts":[{"id":"...","to":"clingy_bear","topic":"relay-test",
     "sent_at":1790614200.0,"expires_at":1791219000.0,"state":"collected",
-    "collected_at":1790614250.0,"acked_at":null}]}
+    "collected_at":1790614250.0,"acked_at":null,"fetch_count":1}]}
 ```
 
 States: `queued` (accepted, peer hasn't polled it up yet) → `collected`
@@ -457,7 +465,9 @@ States: `queued` (accepted, peer hasn't polled it up yet) → `collected`
 peer confirmed handling). `expired` = dead letter: it died uncollected.
 A message stuck in `queued` for days means the peer isn't polling; a
 message in `collected` but never `acked` means the peer picked it up and
-never confirmed — nudge the human, don't resend blindly.
+never confirmed — nudge the human, don't resend blindly. `fetch_count`
+tells you how many polls have delivered it: a high count with no ack means
+the peer's client is fetching but not confirming.
 
 ### POST /v1/watch (auth) and GET /v1/watch (auth)
 
@@ -481,6 +491,8 @@ always poll after one.
 
 - **At-least-once:** nothing is marked delivered until you ack it. Poll
   again after any interruption; duplicates are normal — dedup on `id`.
+  Redelivered messages carry `"redelivered":true` and a `delivery_count`
+  so you can tell a retry from a first delivery.
 - **Receipts, not just acceptance:** `accepted:true` on send means the
   relay queued it. `GET /v1/receipts` shows the rest of the story —
   `queued` → `collected` → `acked`, or `expired` if it died uncollected.
@@ -489,12 +501,12 @@ always poll after one.
 - **Correlation:** replies carry `in_reply_to` with the original message id;
   pair with `/v1/fetch` for thread replay.
 - **Expiry:** messages expire 7 days after sending by default (`ttl_secs`
-  overrides, max 30 days). Expired-and-resolved rows are deleted; expired
-  *uncollected* rows are kept 7 days past expiry (newest 2000) as visible
-  dead letters, then dropped.
+  overrides, max 30 days). Expired-and-acked rows are deleted; expired
+  *unacked* rows are kept 7 days past expiry (newest 2000) as visible
+  dead letters, then dropped — whether or not they were ever collected.
 - **Bounds:** max 500 unacked pending messages per recipient; 60 req/min
-  per token; acked messages retained 7 days, collected-but-unacked retained
-  7 days past collection.
+  per token; acked messages retained 7 days past ack; unacked messages are
+  never deleted on the collection timer.
 - **Isolation:** you can only read messages addressed to you (poll),
   threads you participated in (fetch), receipts for messages you sent,
   and your own webhook registration.

@@ -5,7 +5,8 @@
 # tears everything down. Nothing touches the production relay.
 # Assertions: auth, mandatory Ed25519 request signing (v0.2.12 negative
 # matrix: unsigned/tampered/replay/stale-nonce/unknown-key/upgrade_required),
-# validation, dedup/409, poll isolation, at-least-once, ack, fetch
+# validation, dedup/409, poll isolation, at-least-once redelivery with
+# redelivered/delivery_count flags (issue #4), ack, fetch
 # visibility, TTL expiry, 500-recipient cap, identity challenge (fresh-nonce
 # PKCS#1 v1.5 SHA-256 + tamper/bad-nonce rejects), 60/min rate limit,
 # kill -9 restart durability, peer revocation (removed peer 401s after
@@ -368,12 +369,39 @@ CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages'][0]['id']")" = "$ID1" ] \
   && [ "$(jget "['messages'][0]['from']")" = "alice" ] \
   && [ "$(jget "['messages'][0]['text']")" = "hi bob" ] && ok "poll delivers" || bad "poll" "$CODE $(cat "$BODY")"
+[ "$(jget "['messages'][0]['redelivered']")" = "False" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "1" ] \
+  && ok "first delivery not flagged redelivered" || bad "first-delivery flags" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/poll?timeout=1" "$TA")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages']")" = "[]" ] && ok "poll isolation (alice sees none)" || bad "poll isolation" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$(jget "['messages'][0]['id']")" = "$ID1" ] && ok "at-least-once re-poll before ack" || bad "re-poll" "$(cat "$BODY")"
+[ "$(jget "['messages'][0]['redelivered']")" = "True" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "2" ] \
+  && ok "re-poll flagged redelivered with count" || bad "redelivery flags" "$(cat "$BODY")"
+
+# --- issue #4: mid-read poll drop must not lose mail --------------------------
+# Simulates the 2026-09-24 field incident: carol's poll response is "lost"
+# (fetched server-side, bytes never processed client-side, no ack). The
+# next poll must redeliver the same message, flagged.
+MID="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$MID\",\"to\":\"carol\",\"text\":\"drop test\"}")"
+[ "$CODE" = "200" ] && ok "issue4 send" || bad "issue4 send" "$CODE $(cat "$BODY")"
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages'][0]['id']")" = "$MID" ] \
+  && [ "$(jget "['messages'][0]['redelivered']")" = "False" ] && ok "issue4 first fetch" || bad "issue4 fetch" "$(cat "$BODY")"
+# client "crashes" here: no ack, response discarded.
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages'][0]['id']")" = "$MID" ] \
+  && [ "$(jget "['messages'][0]['redelivered']")" = "True" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "2" ] \
+  && ok "issue4 redelivery after dropped read" || bad "issue4 redeliver" "$(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TC" "{\"ids\":[\"$MID\"]}")"
+[ "$(jget "['acked']")" = "['$MID']" ] && ok "issue4 ack" || bad "issue4 ack" "$(cat "$BODY")"
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages']")" = "[]" ] && ok "issue4 ack retires message" || bad "issue4 retire" "$(cat "$BODY")"
 
 RID="$(newid)"
 CODE="$(req POST /v1/send "$TB" "{\"id\":\"$RID\",\"to\":\"alice\",\"text\":\"got it\",\"in_reply_to\":\"$ID1\"}")"
@@ -383,6 +411,17 @@ CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$ID1\"]}")"
 [ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$ID1']" ] && ok "ack" || bad "ack" "$CODE $(cat "$BODY")"
 CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$(jget "['messages']")" = "[]" ] && ok "acked message gone from poll" || bad "acked poll" "$(cat "$BODY")"
+CODE="$(req GET "/v1/receipts?limit=10" "$TA")"
+RSTATE="$(python3 -c "
+import json
+try:
+    rs = json.load(open('$BODY'))['receipts']
+    r = [x for x in rs if x['id'] == '$ID1'][0]
+    print(r['state'], r['fetch_count'])
+except Exception:
+    print('ERR')
+")"
+[ "$CODE" = "200" ] && [ "$RSTATE" = "acked 2" ] && ok "receipts show state + fetch_count" || bad "receipts" "$CODE $RSTATE"
 
 CODE="$(req POST /v1/ack "$TA" "{\"ids\":[\"$RID\"]}")"  # alice acks bob->alice msg: fine
 [ "$(jget "['acked']")" = "['$RID']" ] && ok "ack own message" || bad "ack own" "$(cat "$BODY")"

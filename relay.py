@@ -29,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.15"
+VERSION = "0.2.16"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -389,12 +389,17 @@ def init_db(cfg):
                created_at REAL NOT NULL,
                expires_at REAL NOT NULL,
                acked_at REAL,
-               collected_at REAL)"""
+               collected_at REAL,
+               fetch_count INTEGER NOT NULL DEFAULT 0)"""
     )
     # v0.2.4 migration: databases created before collected_at existed.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
     if "collected_at" not in cols:
         conn.execute("ALTER TABLE messages ADD COLUMN collected_at REAL")
+    # v0.2.16 migration: fetch_count counts poll deliveries per message for
+    # at-least-once redelivery observability (issue #4).
+    if "fetch_count" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN fetch_count INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS webhooks(
                peer TEXT PRIMARY KEY,
@@ -632,32 +637,34 @@ def sweep(now):
             return
         _last_sweep = now
     with db_lock:
-        # Expired and already resolved (acked or collected): drop promptly.
+        # Expired and acked: truly resolved, drop promptly. (v0.2.16: an
+        # expired collected-but-unacked message is NOT resolved -- its poll
+        # response may never have arrived -- so it is no longer dropped here.)
         conn.execute(
-            "DELETE FROM messages WHERE expires_at <= ? AND (acked_at IS NOT NULL OR collected_at IS NOT NULL)",
+            "DELETE FROM messages WHERE expires_at <= ? AND acked_at IS NOT NULL",
             (now,),
         )
         # Retention windows keep sender-visible receipts around:
-        # acked -> 7d after ack; collected-but-unacked -> 7d after collection.
+        # acked -> 7d after ack.
         conn.execute(
             "DELETE FROM messages WHERE acked_at IS NOT NULL AND acked_at <= ?",
             (now - RETENTION,),
         )
+        # v0.2.16: unacked mail is NEVER pruned on the collection timer. A
+        # collected-but-unacked message is unconfirmed by definition --
+        # deleting it is silent loss (issue #4: a poll response that never
+        # arrives must not become a deletion 7 days later). Unacked rows,
+        # collected or not, live until RETENTION past expiry, then go as
+        # dead letters so senders can see them via /v1/receipts.
         conn.execute(
-            "DELETE FROM messages WHERE collected_at IS NOT NULL AND acked_at IS NULL AND collected_at <= ?",
+            "DELETE FROM messages WHERE acked_at IS NULL AND expires_at <= ?",
             (now - RETENTION,),
-        )
-        # Dead letters: expired, never collected. Kept RETENTION past expiry
-        # so senders can see them via /v1/receipts instead of wondering.
-        conn.execute(
-            "DELETE FROM messages WHERE expires_at <= ? AND collected_at IS NULL AND acked_at IS NULL AND expires_at <= ?",
-            (now, now - RETENTION),
         )
         # Bound dead-letter storage: keep the newest 2000 globally.
         conn.execute(
             """DELETE FROM messages WHERE id IN (
                    SELECT id FROM messages
-                   WHERE expires_at <= ? AND collected_at IS NULL AND acked_at IS NULL
+                   WHERE expires_at <= ? AND acked_at IS NULL
                    ORDER BY created_at DESC LIMIT -1 OFFSET 2000)""",
             (now,),
         )
@@ -1245,7 +1252,8 @@ def ip_rate_ok(ip):
 def fetch_pending(recipient, now):
     with db_lock:
         rows = conn.execute(
-            """SELECT id, sender, topic, text, in_reply_to, created_at, expires_at
+            """SELECT id, sender, topic, text, in_reply_to, created_at, expires_at,
+                      collected_at, fetch_count
                FROM messages
                WHERE recipient=? AND acked_at IS NULL AND expires_at > ?
                ORDER BY created_at""",
@@ -1260,6 +1268,13 @@ def fetch_pending(recipient, now):
             "in_reply_to": r[4],
             "sent_at": r[5],
             "expires_at": r[6],
+            # v0.2.16: at-least-once redelivery markers (issue #4).
+            # redelivered=True means this message was fetched before but
+            # never acked -- the earlier delivery presumably never arrived
+            # (dropped connection mid-read, crashed client). Dedupe on id;
+            # redelivery is normal, not an error.
+            "redelivered": r[7] is not None,
+            "delivery_count": (r[8] or 0) + 1,
         }
         for r in rows
     ]
@@ -1811,10 +1826,15 @@ class Handler(BaseHTTPRequestHandler):
                 # v0.2.4: record collection. This is the "relay handed it to
                 # the peer" receipt -- distinct from the peer's ack ("handled
                 # it"). Lets senders see queued -> collected -> acked.
+                # v0.2.16: collected_at keeps the FIRST fetch time (COALESCE)
+                # and fetch_count counts every poll delivery. collected_at is
+                # telemetry, NOT a delivery guarantee -- only ack retires a
+                # message (issue #4: a poll response that never arrives must
+                # not retire the mail).
                 collected_at = time.time()
                 with db_lock:
                     conn.executemany(
-                        "UPDATE messages SET collected_at=? WHERE id=? AND recipient=? AND collected_at IS NULL",
+                        "UPDATE messages SET collected_at=COALESCE(collected_at,?), fetch_count=fetch_count+1 WHERE id=? AND recipient=?",
                         [(collected_at, m["id"], peer) for m in msgs],
                     )
                     conn.commit()
@@ -1878,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
             with db_lock:
                 rows = conn.execute(
                     """SELECT id, recipient, topic, created_at, expires_at,
-                              collected_at, acked_at, dead_reason
+                              collected_at, acked_at, dead_reason, fetch_count
                        FROM messages WHERE sender=? AND created_at >= ?
                        ORDER BY created_at DESC LIMIT ?""",
                     (peer, since, limit),
@@ -1906,6 +1926,10 @@ class Handler(BaseHTTPRequestHandler):
                         "collected_at": r[5],
                         "acked_at": r[6],
                         "dead_reason": r[7],
+                        # v0.2.16: how many times the relay handed this
+                        # message to the recipient's polls. High count +
+                        # never acked = the peer's client isn't confirming.
+                        "fetch_count": r[8] or 0,
                     }
                 )
             self._json(200, {"receipts": out})
