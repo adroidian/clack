@@ -2010,19 +2010,39 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ids = [i for i in body["ids"] if isinstance(i, str)][:1000]
             if not ids:
-                self._json(200, {"acked": []})
+                self._json(200, {"acked": [], "already_acked": [], "unknown": []})
                 return
+            # v0.2.16: per-id outcomes so a retry after a dropped connection
+            # is unambiguous. acked = newly acked by this call;
+            # already_acked = this recipient already acked it (a prior call
+            # applied -- the dropped-connection case); unknown = no such
+            # message for this recipient (never existed, or swept). Ack is
+            # idempotent AND queryable: retry after any drop and reconcile
+            # without guessing (issue: ack-time RemoteDisconnected).
             acked = []
+            already_acked = []
+            unknown = []
             with db_lock:
                 for mid in ids:
-                    cur = conn.execute(
-                        "UPDATE messages SET acked_at=? WHERE id=? AND recipient=? AND acked_at IS NULL",
-                        (now, mid, peer),
-                    )
-                    if cur.rowcount:
+                    row = conn.execute(
+                        "SELECT acked_at FROM messages WHERE id=? AND recipient=?",
+                        (mid, peer),
+                    ).fetchone()
+                    if row is None:
+                        unknown.append(mid)
+                    elif row[0] is not None:
+                        already_acked.append(mid)
+                    else:
+                        conn.execute(
+                            "UPDATE messages SET acked_at=? WHERE id=? AND recipient=? AND acked_at IS NULL",
+                            (now, mid, peer),
+                        )
                         acked.append(mid)
                 conn.commit()
-            self._json(200, {"acked": acked})
+            self._json(
+                200,
+                {"acked": acked, "already_acked": already_acked, "unknown": unknown},
+            )
             return
         if parsed.path == "/v1/watch":
             # v0.2.4: register (or clear) your wake-nudge webhook.

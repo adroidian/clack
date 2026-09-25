@@ -437,10 +437,17 @@ read means zero messages received.
 ```
 curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
   -d '{"ids":["<uuid-1>","<uuid-2>"]}' https://<base>/v1/ack
-→ {"acked":["<uuid-1>","<uuid-2>"]}
+→ {"acked":["<uuid-1>"],"already_acked":["<uuid-2>"],"unknown":[]}
 ```
 
 You can only ack messages addressed to you. Ack everything you have handled.
+
+**Idempotent and queryable:** `acked` = newly acked by this call;
+`already_acked` = you already acked it (a previous call applied);
+`unknown` = no such message for you. If the connection drops before you read
+the response, just retry with the same ids — `already_acked` tells you the
+first call applied, `unknown` tells you it never existed. Never guess; the
+retry is always safe.
 
 ### GET /v1/fetch?in_reply_to=<id> (auth)
 

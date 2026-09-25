@@ -426,7 +426,41 @@ except Exception:
 CODE="$(req POST /v1/ack "$TA" "{\"ids\":[\"$RID\"]}")"  # alice acks bob->alice msg: fine
 [ "$(jget "['acked']")" = "['$RID']" ] && ok "ack own message" || bad "ack own" "$(cat "$BODY")"
 CODE="$(req POST /v1/ack "$TC" "{\"ids\":[\"$RID\"]}")"  # carol acks others' msg: no-op
-[ "$(jget "['acked']")" = "[]" ] && ok "cross-peer ack no-op" || bad "cross-peer ack" "$(cat "$BODY")"
+[ "$(jget "['acked']")" = "[]" ] && [ "$(jget "['unknown']")" = "['$RID']" ] && ok "cross-peer ack no-op (unknown, not acked)" || bad "cross-peer ack" "$(cat "$BODY")"
+
+# --- BUG-002: ack outcomes must be idempotent and queryable -------------------
+# Simulates the field incident: ack applies, connection drops before the
+# client reads the response. The retry must distinguish "already applied"
+# from "never existed" without an extra poll.
+AID="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$AID\",\"to\":\"bob\",\"text\":\"ack-outcome\"}")"
+[ "$CODE" = "200" ] && ok "bug2 setup send" || bad "bug2 setup" "$CODE $(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$AID\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$AID']" ] \
+  && [ "$(jget "['already_acked']")" = "[]" ] \
+  && [ "$(jget "['unknown']")" = "[]" ] \
+  && ok "ack first call: acked" || bad "ack first" "$(cat "$BODY")"
+# client "loses" the response here; retry with the same ids.
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$AID\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "[]" ] \
+  && [ "$(jget "['already_acked']")" = "['$AID']" ] \
+  && [ "$(jget "['unknown']")" = "[]" ] \
+  && ok "ack retry after drop: already_acked (not ambiguous)" || bad "ack retry" "$(cat "$BODY")"
+NOPE="$(newid)"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$NOPE\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "[]" ] \
+  && [ "$(jget "['already_acked']")" = "[]" ] \
+  && [ "$(jget "['unknown']")" = "['$NOPE']" ] \
+  && ok "ack unknown id: unknown (not silent empty)" || bad "ack unknown" "$(cat "$BODY")"
+# mixed batch: one new, one already-acked, one unknown.
+BID2="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$BID2\",\"to\":\"bob\",\"text\":\"mixed\"}")"
+[ "$CODE" = "200" ] || bad "bug2 setup2" "$CODE $(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$BID2\",\"$AID\",\"$NOPE\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$BID2']" ] \
+  && [ "$(jget "['already_acked']")" = "['$AID']" ] \
+  && [ "$(jget "['unknown']")" = "['$NOPE']" ] \
+  && ok "ack mixed batch: per-id outcomes" || bad "ack mixed" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/fetch?in_reply_to=$ID1" "$TA")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages'][0]['id']")" = "$RID" ] && ok "fetch thread (participant)" || bad "fetch" "$CODE $(cat "$BODY")"
