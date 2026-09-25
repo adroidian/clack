@@ -39,6 +39,18 @@ connections, and revocation now fails closed on delivery.
   handshake keep the old behavior). Non-revoked recovery is untouched:
   acked-but-unexpired thread history stays fetchable.
 
+### Private-relay serving adapter (serve_relay.py, new in release path)
+
+- **Staged v0.2.15 adapter fixes merged (Path B cutover):** the bounded
+  serving adapter (24-slot semaphore, binds the tailnet address) now lives
+  in the release path. It sets `relay.relay_cfg` before init (handshake
+  mint-link needs it for `base_url`) and runs the full `_init_*` startup
+  sequence mirroring `main()` — including `_init_peer_hashes`, which
+  skipping would silently revoke hash-only peers (e.g. sigrid) on startup.
+  Verified against v0.2.16 `relay.py`: all init entry points present;
+  canaried on Omni scratch port (5/5 peers incl. sigrid, signed auth,
+  mint-link, signed poll).
+
 ## v0.2.13 — handshake release (2026-09-24)
 
 Mutual-consent handshakes gate all messaging; client transport release gate
