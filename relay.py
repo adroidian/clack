@@ -29,7 +29,7 @@ from urllib.parse import urlparse, parse_qs
 
 import ed25519  # vendored pure-stdlib Ed25519 (see ed25519.py)
 
-VERSION = "0.2.16"
+VERSION = "0.2.17"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -118,6 +118,83 @@ def _init_identity_pubkeys(cfg):
         _IDENTITY_PUBKEYS = _parse_identity_pubkeys(cfg)
     except ValueError as e:
         raise SystemExit("clack-relay: invalid identity_pubkeys: %s" % e)
+
+
+# Ed25519 SPKI DER prefix: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING }.
+# A 44-byte DER body with this prefix holds the 32-byte raw key last.
+_ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def _normalize_pubkey_input(s):
+    """Accept a raw 43-char base64url Ed25519 pubkey OR a PEM SPKI block.
+
+    Returns the canonical b64u form. Raises ValueError on anything else:
+    non-string input, undecodable base64, wrong length, non-Ed25519 DER, or
+    a non-prime-order point (R5 small-order forgery guard)."""
+    if not isinstance(s, str):
+        raise ValueError("pubkey is not a string")
+    t = s.strip()
+    if "BEGIN PUBLIC KEY" in t:
+        # PEM SPKI (what openssl / stock tooling exports): strip the armor,
+        # decode the DER, extract the trailing 32-byte key.
+        b64 = "".join(
+            line.strip()
+            for line in t.splitlines()
+            if line.strip() and "-----" not in line
+        )
+        try:
+            der = base64.b64decode(b64)
+        except Exception:
+            raise ValueError("bad PEM body")
+        if len(der) != 44 or not der.startswith(_ED25519_SPKI_PREFIX):
+            raise ValueError("not an Ed25519 SPKI")
+        key = der[12:]
+    else:
+        try:
+            key = b64u_decode(t)
+        except (ValueError, TypeError, AttributeError):
+            raise ValueError("bad base64url")
+    if len(key) != 32:
+        raise ValueError("want 32 bytes, got %d" % len(key))
+    # R5: never accept a small-order / non-prime-order key -- the vendored
+    # verifier admits trivial forgeries under such keys.
+    if not ed25519.is_valid_pubkey(key):
+        raise ValueError("not a valid prime-order Ed25519 point")
+    return b64u_encode(key)
+
+
+def _persist_identity_pubkey(peer, pub_b64):
+    """Write one identity_pubkeys entry through to relay-config.json.
+
+    Atomic (tmp file + os.replace) and mode-preserving, so a crash or
+    kill between the DB update and this write cannot corrupt the config.
+    The in-memory relay_cfg is updated only AFTER the disk write
+    succeeds, so a failed write never leaves memory ahead of disk.
+    Raises OSError on failure -- callers fail the request loudly rather
+    than reporting a registration that a restart would lose."""
+    cfg = relay_cfg
+    # Write from a copy: mutate in-memory state only on success.
+    new_cfg = dict(cfg)
+    pubkeys = new_cfg.get("identity_pubkeys")
+    if not isinstance(pubkeys, dict):
+        pubkeys = {}
+        new_cfg["identity_pubkeys"] = pubkeys
+    else:
+        pubkeys = dict(pubkeys)
+        new_cfg["identity_pubkeys"] = pubkeys
+    pubkeys[peer] = pub_b64
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        st_mode = os.stat(CONFIG_PATH).st_mode
+    except OSError:
+        st_mode = None
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(new_cfg, f, indent=2)
+        f.write("\n")
+    if st_mode is not None:
+        os.chmod(tmp, st_mode & 0o7777)
+    os.replace(tmp, CONFIG_PATH)
+    cfg["identity_pubkeys"] = pubkeys
 
 
 # Operator-supplied token hashes for config-managed peers, from the
@@ -1391,14 +1468,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, AttributeError):
             pubkey = b""
         if len(pubkey) != 32:
-            # No (or corrupt) Ed25519 key on file: the peer must re-enroll
-            # via /join to get one. Never silently bypass.
+            # No (or corrupt) Ed25519 key on file: the peer registers one
+            # via POST /v1/register-key. Never silently bypass.
             return "upgrade_required"
         # R5: the vendored verifier admits trivial forgeries under
         # small-order keys. Enrollment and the operator map now reject such
         # keys, but rows written before the fix could still hold one:
         # validate once per peer key per process and fail closed instead of
-        # trusting stored bytes. A rejected key means re-enroll, same as a
+        # trusting stored bytes. A rejected key means register-key, same as a
         # missing one.
         if pub_b64 not in _peer_key_valid:
             _peer_key_valid[pub_b64] = ed25519.is_valid_pubkey(pubkey)
@@ -1514,6 +1591,78 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return peer
 
+    def _require_token_auth(self):
+        """Bearer-token auth WITHOUT the Ed25519 signature mandate.
+
+        Used only by POST /v1/register-key -- the upgrade path for
+        token-only peers, who by definition cannot sign yet. The bearer
+        token is the existing auth factor; binding a key to one's own peer
+        name grants nothing the token doesn't already grant. Missing /
+        invalid token -> 401 like _require_auth."""
+        ip = self._client_ip()
+        peer = auth_peer(self.headers)
+        if peer is None:
+            if not auth_fail_ok(ip):
+                self._json(429, {"error": "rate_limited"})
+                return None
+            self._json(401, {"error": "unauthorized"})
+            return None
+        if not rate_ok(token_sha_of(self.headers)):
+            self._json(429, {"error": "rate_limited"})
+            return None
+        return peer
+
+    def _handle_register_key(self, peer, now):
+        """v0.2.17: self-service Ed25519 key registration.
+
+        Bearer-token authenticated, signature-exempt (it IS the upgrade
+        path). Body: {"pubkey": "<raw 43-char b64u | PEM SPKI>"}. The key
+        takes effect immediately (peers.identity_pubkey, which
+        _verify_signature reads) and is persisted: config-managed peers
+        via relay-config.json's identity_pubkeys map (init_db rebuilds
+        their rows from it on restart), self-enrolled peers via their DB
+        row (init_db preserves non-config rows). Rotation allowed --
+        token auth proves ownership."""
+        body = self._read_json()
+        if not isinstance(body, dict) or not isinstance(body.get("pubkey"), str):
+            self._json(400, {"error": "pubkey_required"})
+            return
+        try:
+            pub_b64 = _normalize_pubkey_input(body["pubkey"])
+        except ValueError:
+            self._json(400, {"error": "bad_pubkey"})
+            return
+        with db_lock:
+            row = conn.execute(
+                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+            ).fetchone()
+        old = row[0] if row else None
+        rotated = old is not None and old != pub_b64
+        cfg = relay_cfg
+        config_managed = bool(
+            cfg
+            and (peer in (cfg.get("peers") or {}) or peer in _PEER_HASHES)
+        )
+        if config_managed:
+            # Persist the config FIRST: if the process dies between the
+            # two writes, the restart converges via init_db re-reading
+            # the map (rather than losing a reported registration).
+            try:
+                _persist_identity_pubkey(peer, pub_b64)
+            except OSError:
+                self._json(500, {"error": "persist_failed"})
+                return
+            _IDENTITY_PUBKEYS[peer] = pub_b64
+        with db_lock:
+            conn.execute(
+                "UPDATE peers SET identity_pubkey=? WHERE name=?",
+                (pub_b64, peer),
+            )
+            conn.commit()
+        self._json(
+            200, {"registered": True, "peer": peer, "rotated": rotated}
+        )
+
     # --- Self-contained onboarding (v0.2.8) --------------------------------
     # GET /join and GET /join/client are PUBLIC (no auth). They serve only
     # generic bootstrap material: the relay's own URL, where to fetch the
@@ -1575,7 +1724,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "n": 6,
                     "title": "Redeem the handshake link, then accept",
-                    "detail": "POST /v1/handshakes/redeem with {\"h\": h, \"k\": k, \"identity_pubkey\": base64url(public_key), \"requested_name\": \"desired-name\" (optional, v0.2.15+), \"proof\": {\"nonce\": ..., \"signature\": ...}, \"pow_nonce\": ...} enrolls inline (fresh identity) and returns {\"service_token\", \"peer_name\", \"handshake_id\", ...}. Then POST /v1/handshakes/accept with {\"handshake_id\"} (authenticated) activates the handshake. The link use is consumed atomically (single-use).",
+                    "detail": "POST /v1/handshakes/redeem with {\"h\": h, \"k\": k, \"identity_pubkey\": base64url(public_key), \"pubkey\": base64url(public_key) (optional v0.2.17+ alternative to identity_pubkey -- the proof binds whichever key you send; both present must agree), \"requested_name\": \"desired-name\" (optional, v0.2.15+), \"proof\": {\"nonce\": ..., \"signature\": ...}, \"pow_nonce\": ...} enrolls inline (fresh identity) and returns {\"service_token\", \"peer_name\", \"handshake_id\", ...}. Then POST /v1/handshakes/accept with {\"handshake_id\"} (authenticated) activates the handshake. The link use is consumed atomically (single-use).",
                 },
                 {
                     "n": 7,
@@ -1589,8 +1738,8 @@ class Handler(BaseHTTPRequestHandler):
                     "sha256_hex(body) + \"\\n\" + nonce)). "
                     "POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack "
                     "to confirm handling. Unsigned requests get 401 missing_signature; "
-                    "peers with no stored key get 401 upgrade_required (re-enroll via /join "
-                    "to fix). Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
+                    "peers with no stored key get 401 upgrade_required (register via "
+                    "POST /v1/register-key to fix). Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
                 },
             ],
         }
@@ -1647,7 +1796,8 @@ class Handler(BaseHTTPRequestHandler):
             "   more than 120s in the future are rejected, and each nonce is\n"
             "   single-use. Missing/invalid signature -> 401 missing_signature /\n"
             "   bad_signature / replay / stale_nonce; a peer with no stored\n"
-            "   Ed25519 key gets 401 upgrade_required (re-enroll to fix).\n"
+            "   Ed25519 key gets 401 upgrade_required (POST /v1/register-key\n"
+            "   to fix).\n"
             "4. Full protocol: CLIENT_CONTRACT.md in the clack-relay repo.\n"
             "\n"
             "Enrollment on this relay: " + gates + ".\n"
@@ -2032,6 +2182,16 @@ class Handler(BaseHTTPRequestHandler):
             # for enrolled ones -- the handler decides from the
             # Authorization header.
             self._handle_handshake_redeem(now)
+            return
+        if parsed.path == "/v1/register-key":
+            # v0.2.17: self-service Ed25519 key registration. Bearer-token
+            # authenticated but SIGNATURE-EXEMPT -- it is the upgrade path
+            # for token-only peers, who cannot sign yet. The handler does
+            # its own token-only auth.
+            peer = self._require_token_auth()
+            if peer is None:
+                return
+            self._handle_register_key(peer, now)
             return
         peer = self._require_auth()
         if peer is None:
@@ -3135,16 +3295,36 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(400, {"error": "enrollment_not_allowed"})
                 return
-            try:
-                pubkey = b64u_decode(body.get("identity_pubkey"))
-            except ValueError:
+            # v0.2.17: the redeem may carry an optional `pubkey` field (raw
+            # 43-char b64u or PEM SPKI, same normalization as
+            # /v1/register-key) as an alternative to `identity_pubkey`.
+            # Either way the key is bound at enrollment -- new peers enroll
+            # with signing ready in one flow. If BOTH are present they must
+            # agree (fail closed on mismatch -- silently preferring one
+            # would mask a confused client or a key-substitution attempt).
+            supplied = body.get("pubkey")
+            legacy = body.get("identity_pubkey")
+            pub_b64 = None
+            if isinstance(supplied, str) and supplied.strip():
+                try:
+                    pub_b64 = _normalize_pubkey_input(supplied)
+                except ValueError:
+                    self._json(400, {"error": "bad_identity"})
+                    return
+            if (isinstance(legacy, str) and legacy.strip()):
+                try:
+                    legacy_b64 = _normalize_pubkey_input(legacy)
+                except ValueError:
+                    self._json(400, {"error": "bad_identity"})
+                    return
+                if pub_b64 is not None and legacy_b64 != pub_b64:
+                    self._json(400, {"error": "key_mismatch"})
+                    return
+                pub_b64 = legacy_b64
+            if pub_b64 is None:
                 self._json(400, {"error": "bad_identity"})
                 return
-            if len(pubkey) != 32 or not ed25519.is_valid_pubkey(pubkey):
-                # R5: never enroll a small-order key.
-                self._json(400, {"error": "bad_identity"})
-                return
-            pub_b64 = b64u_encode(pubkey)
+            pubkey = b64u_decode(pub_b64)
             proof = body.get("proof")
             if not isinstance(proof, dict):
                 self._json(400, {"error": "bad_proof"})

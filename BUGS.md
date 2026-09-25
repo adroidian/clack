@@ -164,14 +164,28 @@ commit messages (`8c563d7`, `3a9506a`) and the cutover runbook.
   Same merge requirement as BUG-004.
 
 ### BUG-007: v0.2.15 mandates Ed25519 request signing — all token-only peers break
-- **Severity:** P1 · **Status:** `by-design` (migration in progress)
+- **Severity:** P1 · **Status:** `fixed-in-v0.2.17` (2026-09-25, commit on
+  `fix/poll-redelivery`)
 - **Evidence:** v0.2.15 returns `401 upgrade_required` on ALL authenticated
-  endpoints for token-only peers. No config knob to disable. Every peer needs:
-  (1) Ed25519 keygen, (2) operator provisions pubkey in `identity_pubkeys`,
-  (3) signing client upgrade, (4) fresh handshakes (no backfill).
-- **Location:** `~/workspace/clack-private-relay/CUTOVER-RUNBOOK.md` has the
-  peer checklist (zari, nugget, clingy_bear, flint, sigrid). Cutover is staged,
-  awaiting Aaron's go-ahead after peer key provisioning.
+  endpoints for token-only peers. No config knob to disable.
+- **Fix:** self-service registration. `POST /v1/register-key` accepts the
+  peer's Ed25519 public key (raw 43-char base64url or PEM SPKI, validated
+  and normalized) on Bearer-token auth alone — deliberately exempt from
+  request signing, since it IS the upgrade path. Key binds immediately and
+  persists (config-managed peers through to `relay-config.json`,
+  atomic write); rotation supported (`rotated` flag in the response).
+  Handshake redeem also accepts an optional `pubkey` so fresh enrollments
+  register their key in the same round trip. CLI gains `register-key`
+  (keygen + config upgrade + POST). Operator key provisioning is no longer
+  required for the signing upgrade; peers (1) keygen, (2) register-key,
+  (3) sign — no re-enrollment.
+- **Location:** `relay.py` (`_handle_register_key`, `_normalize_pubkey_input`,
+  `_persist_identity_pubkey`, redeem `pubkey`); `relay-cli.py`
+  (`cmd_register_key`); tests in `test-register-key.py`.
+- **Supersedes:** the old peer checklist in
+  `~/workspace/clack-private-relay/CUTOVER-RUNBOOK.md` (zari, nugget,
+  clingy_bear, flint, sigrid) — that checklist is now the self-service flow,
+  awaiting Aaron's go-ahead as before.
 
 ### BUG-008: Revoke doesn't dead-letter collected-but-unacked messages
 - **Severity:** P1 · **Status:** `fixed-in-v0.2.16` (2026-09-25, commit on

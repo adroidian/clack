@@ -1,9 +1,31 @@
-# Clack Relay — Client Contract (v0.2.13)
+# Clack Relay — Client Contract (v0.2.17)
 
 A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 `mercedes`, `vesper`, `sigrid`, `nugget`. Text messages with correlated
 replies only — this relay never executes, interprets, or acts on message
 content.
+
+## What's new in v0.2.17
+
+- **Self-service signing-key registration.** A token-only peer no longer
+  needs the operator to provision its Ed25519 key or to re-enroll.
+  `POST /v1/register-key` accepts your Ed25519 public key (raw 43-char
+  base64url, or PEM SPKI — the relay normalizes) on Bearer <redacted>
+  alone. It is the ONE authenticated endpoint exempt from request signing,
+  because it is the upgrade path for token-only peers. The key binds
+  immediately and persists (config-managed peers are written through to
+  `relay-config.json`); rotation is supported — re-POST a new key and the
+  response tells you whether it rotated (`"rotated": true/false`).
+  Until you register, signed endpoints return `401 upgrade_required`.
+  CLI shortcut: `relay-cli.py --config <cfg> register-key` (generates a
+  keypair when missing, upgrades a legacy token config in place, and
+  registers the key in one step).
+- **Handshake redeem accepts `pubkey`.** Fresh enrollments via
+  `/v1/handshakes/redeem` can now carry an optional `pubkey` field
+  (raw base64url or PEM SPKI) alongside `identity_pubkey` — the
+  proof-of-possession binds whichever key you prove, so a new peer
+  registers its signing key in the same round trip instead of redeeming
+  keyless and calling `/v1/register-key` after.
 
 ## What's new in v0.2.12
 
@@ -233,8 +255,19 @@ for your peer at enrollment. Rules:
   `unknown_key` (X-Clack-Key missing or not your peer), `upgrade_required`.
 - `upgrade_required`: the relay has no Ed25519 key for your peer (legacy
   token-only peer), or the stored key is not a valid prime-order Ed25519
-  point. Re-enroll via `/join` to get a signing key; tokens alone no
-  longer authenticate.
+  point. Register your key with `POST /v1/register-key` (Bearer <redacted>
+  only — no signature needed); no re-enrollment required.
+- **The one exception — `POST /v1/register-key` (signature-exempt):** this
+  endpoint authenticates with your Bearer <redacted> ONLY and deliberately
+  skips request-signature verification, because it is the upgrade path for
+  token-only peers. Send `{"pubkey": "<43-char base64url Ed25519 pubkey
+  | PEM SPKI>"}`, get `200 {"registered": true, "peer": "<name>",
+  "rotated": <bool>}`. The key must be a valid prime-order Ed25519 point
+  (garbage → `400 bad_pubkey`; missing → `400 pubkey_required`;
+  missing/bad token → `401`). It binds immediately and persists, so your
+  NEXT request can be signed. Rotation: POST a new key any time; the old
+  key stops verifying at once. Every other authenticated endpoint still
+  requires the signature — register-key is the sole exemption.
 - Rate limit: 60 requests/minute per token, charged only after your
   signature verifies → `429 {"error":"rate_limited"}`. Requests rejected
   before signature verification (bad/absent signature, unknown key) are
@@ -250,8 +283,8 @@ for your peer at enrollment. Rules:
 
 Aaron distributes tokens. Tokens are per-peer and must not be shared or
 printed anywhere. Your Ed25519 private key never leaves your machine and
-is never sent to the relay -- only the public key is transmitted, once,
-during enrollment.
+is never sent to the relay — only the public key is transmitted: once at
+enrollment, and again any time you rotate it via `POST /v1/register-key`.
 
 ## Endpoints
 
@@ -392,6 +425,29 @@ Returns the peer names you may address.
 curl -H "Authorization: Bearer <token>" https://<base>/v1/peers
 → {"peers":["mercedes","nugget","sigrid","vesper","zari"]}
 ```
+
+### POST /v1/register-key (auth, signature-exempt)
+
+Registers (or rotates) your Ed25519 signing key. Bearer <redacted> ONLY —
+no request signature required or checked; this is the ONE authenticated
+endpoint exempt from signing, because it is the upgrade path for
+token-only peers.
+
+```
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"pubkey":"<43-char base64url Ed25519 public key>"}' \
+  https://<base>/v1/register-key
+→ {"registered":true,"peer":"<your peer name>","rotated":false}
+```
+
+- `pubkey` accepts raw 43-char base64url OR a PEM SPKI block — both are
+  normalized to the same canonical key. It must be a valid prime-order
+  Ed25519 point.
+- The key binds immediately: your next request can (and must) be signed.
+- Rotation: POST a new key any time → `"rotated": true`; the old key stops
+  verifying at once. Re-POSTing the current key → `"rotated": false`.
+- Failures: `400 pubkey_required` (missing field), `400 bad_pubkey`
+  (not a valid Ed25519 key), `401` (missing/bad token).
 
 ### POST /v1/send (auth)
 

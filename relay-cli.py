@@ -335,7 +335,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.15"
+    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.17"
 
 
 # --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
@@ -730,7 +730,7 @@ def fetch_relay_identity(relay_url, cfg=None):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
-    The configured user_agent is sent (default ClackRelay-CLI/0.2.15):
+    The configured user_agent is sent (default ClackRelay-CLI/0.2.17):
     Cloudflare-fronted relays 403 Python-urllib's default signature, so a
     bare _open() fails closed before any normal operation can run.
 
@@ -909,6 +909,87 @@ def cmd_attach_key(args, cfg):
     return 0
 
 
+def cmd_register_key(args, cfg):
+    """Self-service Ed25519 key registration (v0.2.17).
+
+    Ensures the identity file carries a signing keypair (generating one
+    when missing, like attach-key), then POSTs the public key to
+    /v1/register-key with bearer-token auth. The endpoint is
+    signature-exempt -- it IS the upgrade path for token-only peers --
+    so this works before the client can sign. Reports whether the relay
+    recorded a fresh registration or a rotation.
+    """
+    if is_identity_cfg(cfg):
+        peer_name = cfg.get("peer_name")
+        if not peer_name:
+            print("identity config has no peer_name; cannot register a key",
+                  file=sys.stderr)
+            return 1
+        if not cfg.get("service_token"):
+            print("no service_token in %s" % args.config, file=sys.stderr)
+            return 1
+        new_cfg = dict(cfg)
+    else:
+        peers = cfg.get("peers") or {}
+        peer_name = args.peer
+        if peer_name and peer_name not in peers:
+            print("peer %r not in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        if not peer_name:
+            if len(peers) == 1:
+                peer_name = next(iter(peers))
+            else:
+                print("config has %d peers; pass --peer <name>" % len(peers),
+                      file=sys.stderr)
+                return 1
+        token = peers.get(peer_name)
+        if not token:
+            print("no token for peer %r in %s" % (peer_name, args.config),
+                  file=sys.stderr)
+            return 1
+        relay_url = (cfg.get("base_url") or "http://127.0.0.1:%d"
+                     % cfg.get("port", 18802)).rstrip("/")
+        new_cfg = {
+            "kind": IDENTITY_KIND,
+            "relay_url": relay_url,
+            "peer_name": peer_name,
+            "service_token": token,
+        }
+        if cfg.get("user_agent"):
+            new_cfg["user_agent"] = cfg["user_agent"]
+        if cfg.get("relay_identity_fingerprint"):
+            new_cfg["relay_identity_fingerprint"] = \
+                cfg["relay_identity_fingerprint"]
+
+    seed = signing_seed(new_cfg)
+    if seed is None:
+        seed, pub = keygen()
+        new_cfg["identity_pubkey"] = b64u_encode(pub)
+        _save_identity_config(args.config, new_cfg, seed,
+                              key_path=getattr(args, "key_path", None))
+        print("generated signing keypair; private key: %s (mode 600; never "
+              "leaves this machine)" % new_cfg["identity_privkey_path"])
+    elif not new_cfg.get("identity_pubkey"):
+        # Seed without a recorded pubkey: derive it and persist.
+        new_cfg["identity_pubkey"] = b64u_encode(_publickey(seed))
+        _save_identity_config(args.config, new_cfg, seed,
+                              key_path=getattr(args, "key_path", None))
+    cfg = new_cfg
+    pub_b64 = new_cfg["identity_pubkey"]
+
+    code, out = req(cfg, "POST", "/v1/register-key", {"pubkey": pub_b64},
+                    base=args.base_url)
+    if code == 200 and out.get("registered"):
+        print("registered signing key for peer %r%s"
+              % (peer_name, " (rotated)" if out.get("rotated") else ""))
+        print("pubkey: %s" % pub_b64)
+        return 0
+    print("register-key failed: HTTP %d %s" % (code, json.dumps(out)),
+          file=sys.stderr)
+    return 1
+
+
 def parse_link(link):
     link = link.strip()
     if "#" not in link:
@@ -990,7 +1071,7 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.15",
+            "user_agent": "ClackRelay-CLI/0.2.17",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -1253,7 +1334,7 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.15",
+            "user_agent": "ClackRelay-CLI/0.2.17",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -1396,6 +1477,14 @@ def main():
     ak.add_argument("--key-path", default=None,
                     help="private key file path (mode 600; default: <config>.key)")
 
+    rk = sub.add_parser("register-key",
+                        help="self-service Ed25519 key registration: "
+                             "generate a signing key if needed, then register "
+                             "its pubkey with the relay (token auth, no "
+                             "operator involvement)")
+    rk.add_argument("--key-path", default=None,
+                    help="private key file path (mode 600; default: <config>.key)")
+
     m = sub.add_parser("mint-invite", help="mint a shareable join link")
     m.add_argument("--max-uses", type=int, default=1)
     m.add_argument("--expiry-hours", type=float, default=24.0)
@@ -1472,6 +1561,8 @@ def main():
         return cmd_invite_revoke(args, cfg)
     elif args.cmd == "attach-key":
         return cmd_attach_key(args, cfg)
+    elif args.cmd == "register-key":
+        return cmd_register_key(args, cfg)
 
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if 200 <= code < 300 else 1

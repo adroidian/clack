@@ -1,5 +1,52 @@
 # Clack relay changelog
 
+## v0.2.17 — self-service Ed25519 key registration (unreleased, in development)
+
+The `401 upgrade_required` break from v0.2.15 is now self-healing: a
+token-only peer registers its own Ed25519 public key with just its Bearer
+token — no operator provisioning, no re-enrollment.
+
+### Server (relay.py)
+
+- **`POST /v1/register-key` (new):** Bearer-token authenticated, intentionally
+  **exempt from request signing** (it is the upgrade path for token-only
+  peers). Body `{"pubkey": <raw 43-char b64u | PEM SPKI>}`. The key is
+  validated as a real prime-order Ed25519 key, normalized to canonical raw
+  base64url, bound to the authenticated peer immediately, and persisted —
+  config-managed peers are written through to `relay-config.json`
+  (`identity_pubkeys`), atomic temp-file + `os.replace`. Self-enrolled peers
+  persist in the DB row (config re-read preserves non-config rows).
+  Rotation is supported: response
+  `{"registered": true, "peer": "<name>", "rotated": <bool>}`.
+- **Handshake redeem accepts optional `pubkey`:** a fresh enrollment can now
+  carry `{"pubkey": <raw|PEM>}` alongside `identity_pubkey` — the proof-of-key
+  binds whichever key the peer proved, so new peers register their key in the
+  same round trip instead of redeeming keyless and calling register-key after.
+  `identity_pubkey` remains the proof-of-possession anchor; the new field is
+  strictly additive (redeem without either still 400s).
+- All other auth-path behavior unchanged: wrong/missing pubkey → 400
+  `bad_pubkey` / `pubkey_required`; missing/bad token → 401; register-key is
+  the ONLY authenticated endpoint exempt from signing.
+
+### CLI (relay-cli.py)
+
+- **`register-key` subcommand:** for a token-only peer — generates a keypair
+  when missing (mode-600 private key file, never leaves the machine),
+  upgrades a legacy token config to an identity config in place, and POSTs
+  the public key to `/v1/register-key`. Reports `registered signing key`
+  vs `rotated signing key`.
+- BUG-007 is now `fixed-in-v0.2.17`: token-only peers self-register;
+  operator key provisioning is no longer required for the signing upgrade.
+
+### Tests
+
+- New `test-register-key.py` (31 checks): token-only register 200
+  signature-exempt; 400s on missing/garbage/wrong-length/malformed-PEM keys;
+  401s on missing/bad token; rotation overwrite + `rotated` flag; old key
+  rejected after rotation; PEM normalization; config persistence +
+  restart survival; signed requests work post-registration; handshake redeem
+  with `pubkey` (PEM) binds at enrollment; CLI `register-key` round trip.
+
 ## v0.2.16 — at-least-once durability (unreleased, in development)
 
 Message-durability release: the relay no longer loses mail to dropped
