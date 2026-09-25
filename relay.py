@@ -1833,9 +1833,15 @@ class Handler(BaseHTTPRequestHandler):
                 # not retire the mail).
                 collected_at = time.time()
                 with db_lock:
+                    # v0.2.16: never mark a row that died between the fetch
+                    # and this UPDATE (a revoke committing in between
+                    # dead-letters with expires_at<=now + dead_reason set).
+                    # fetch_pending just returned these rows alive, so the
+                    # extra predicates only skip rows that died in the gap.
                     conn.executemany(
-                        "UPDATE messages SET collected_at=COALESCE(collected_at,?), fetch_count=fetch_count+1 WHERE id=? AND recipient=?",
-                        [(collected_at, m["id"], peer) for m in msgs],
+                        "UPDATE messages SET collected_at=COALESCE(collected_at,?), fetch_count=fetch_count+1 WHERE id=? AND recipient=? AND expires_at > ? AND dead_reason IS NULL",
+                        [(collected_at, m["id"], peer, collected_at)
+                         for m in msgs],
                     )
                     conn.commit()
             self._json(200, {"messages": msgs})
@@ -1907,12 +1913,17 @@ class Handler(BaseHTTPRequestHandler):
             for r in rows:
                 if r[6] is not None:
                     state = "acked"
+                elif r[7]:
+                    # v0.2.13/v0.2.16: revoked handshakes dead-letter the
+                    # pair's unacked mail -- including collected-but-unacked
+                    # (BUG-008). A dead letter is never deliverable again,
+                    # so it reports "dead" even when collected_at is set.
+                    # The reason is exposed for the sender.
+                    state = "dead"
                 elif r[5] is not None:
                     state = "collected"
                 elif r[4] <= now:
-                    # v0.2.13: revoked handshakes dead-letter queued
-                    # messages; the reason is exposed for the sender.
-                    state = "dead" if r[7] else "expired"
+                    state = "expired"
                 else:
                     state = "queued"
                 out.append(
@@ -3430,15 +3441,21 @@ class Handler(BaseHTTPRequestHandler):
         # revoke; the relay never needs both.
         #
         # DELIVERY BOUNDARY (documented limits): revocation cannot retract
-        # delivered plaintext. Messages already polled (collected) STAY
-        # delivered -- they are the recipient's; revocation can't un-ring
-        # them. Anything not yet fetched at revoke-commit time is
-        # dead-lettered with reason handshake_revoked and is NEVER
-        # delivered after. The status flip, the revocation memory, and the
-        # dead-letter sweep happen in ONE atomic transaction: a send racing
-        # the revoke either fully precedes it (its message is then
-        # dead-lettered) or fully follows it (the send gate 403s).
-        # Fail closed at the boundary.
+        # plaintext already written to the client's socket, and it cannot
+        # un-ack an ack. Everything else is dead-lettered with reason
+        # handshake_revoked and is NEVER delivered after revoke-commit --
+        # INCLUDING messages collected (fetched) but never acked. Rationale:
+        # since v0.2.16 "collected" is telemetry, not a delivery guarantee
+        # (a poll response can drop mid-read; only ack retires a message),
+        # so collected-but-unacked mail may never have reached the client
+        # and must die with the consent. A poll response already in flight
+        # at revoke-commit may still carry bytes fetched pre-revoke; that is
+        # the physical limit, same as acked mail. No NEW fetch after
+        # revoke-commit can return the pair's mail. The status flip, the
+        # revocation memory, and the dead-letter sweep happen in ONE atomic
+        # transaction: a send racing the revoke either fully precedes it
+        # (its message is then dead-lettered) or fully follows it (the send
+        # gate 403s). Fail closed at the boundary.
         body = self._read_json()
         target = body.get("peer") if isinstance(body, dict) else None
         t_ident, t_name = self._resolve_handshake_peer(target)
@@ -3493,14 +3510,19 @@ class Handler(BaseHTTPRequestHandler):
                            VALUES(?,?,?,?)""",
                         (row[1], a, b, now2),
                     )
-                # Dead letters: queued but not yet fetched, both directions.
-                # (messages are keyed by peer NAME here.)
+                # Dead letters: ALL unacked mail between the pair, both
+                # directions, regardless of collection state. (messages are
+                # keyed by peer NAME here.) Since v0.2.16, "collected" is
+                # telemetry, not a delivery guarantee -- a poll response can
+                # drop mid-read, so collected-but-unacked mail may never have
+                # reached the client and MUST die with the consent. Only
+                # acked mail is beyond the boundary (the peer confirmed it).
                 conn.execute(
                     """UPDATE messages
                        SET expires_at=?, dead_reason='handshake_revoked'
                        WHERE ((sender=? AND recipient=?)
                               OR (sender=? AND recipient=?))
-                         AND collected_at IS NULL AND acked_at IS NULL
+                         AND acked_at IS NULL
                          AND expires_at > ?""",
                     (now2, peer, t_name, t_name, peer, now2),
                 )

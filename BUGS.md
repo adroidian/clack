@@ -174,16 +174,24 @@ commit messages (`8c563d7`, `3a9506a`) and the cutover runbook.
   awaiting Aaron's go-ahead after peer key provisioning.
 
 ### BUG-008: Revoke doesn't dead-letter collected-but-unacked messages
-- **Severity:** P1 · **Status:** `open`
-- **Evidence (code read):** the revoke dead-letter sweep only touches rows with
-  `collected_at IS NULL`. Pre-v0.2.16 "collected" meant "delivered," but under
-  v0.2.16 at-least-once semantics a collected-but-unacked message may never
-  have reached the client — and it stays pollable after revoke, violating
-  "never delivered after revocation" (`relay.py` revoke handler).
-- **Fix direction:** dead-letter ALL unacked messages between the pair on
-  revoke (drop the `collected_at IS NULL` condition), update the documented
-  "already-polled messages stay delivered" semantic in `CLIENT_CONTRACT.md`
-  and `CHANGELOG.md`, extend `test-handshake.py` / `test-relay.sh`.
+- **Severity:** P1 · **Status:** `fixed-in-v0.2.16` (2026-09-25, commit on
+  `fix/poll-redelivery`)
+- **Evidence (code read):** the revoke dead-letter sweep only touched rows
+  with `collected_at IS NULL`. Pre-v0.2.16 "collected" meant "delivered,"
+  but under v0.2.16 at-least-once semantics a collected-but-unacked message
+  may never have reached the client — and it stayed pollable after revoke,
+  violating "never delivered after revocation" (`relay.py` revoke handler).
+- **Fix:** dead-letter sweep now covers ALL unacked mail between the pair
+  (dropped the `collected_at IS NULL` condition); new delivery boundary —
+  revocation can't retract bytes already on the wire or un-ack an ack, but
+  everything else dies with the consent. Receipts report such rows as
+  `dead` even when `collected_at` is set (state machine now checks
+  `dead_reason` before `collected_at`). Poll collection marking skips rows
+  that died between fetch and marking. Docs: `CHANGELOG.md` v0.2.16,
+  `relay.py` revoke-handler boundary comment. Tests: new phase 5c
+  (collect → revoke → no redelivery, DB dead-lettered with collected_at
+  set, receipt "dead") and phase 12 race invariant rewritten
+  (always dead-lettered, never re-fetched) in `test-handshake.py`.
 
 ### BUG-009: Stale origin-verdict cache broke redeem/enroll hello
 - **Severity:** P1 · **Status:** `fixed-in-v0.2.12` (`b13d698`)
@@ -281,8 +289,8 @@ commit messages (`8c563d7`, `3a9506a`) and the cutover runbook.
 | BUG-003 send idempotency | mitigated (UUID dedup + `duplicate:true`) |
 | BUG-004 adapter peer wipe | fixed in staged adapter (must merge before cutover) |
 | BUG-005 sweep pruning | fixed in `aa98987` (parked) |
+| BUG-008 revoke vs redelivery | fixed in v0.2.16 BUG-008 patch (this session) |
 
-The durability gate is clear when: `aa98987` + the BUG-002 ack patch + the two
-staged adapter fixes are all in the cutover build, and the suites below are
-green. BUG-008 (revoke vs redelivery) is P1 consent semantics, not message
-loss — it should be fixed but does not lose mail.
+The durability gate is clear when: `aa98987` + the BUG-002 ack patch + the
+BUG-008 revoke patch + the two staged adapter fixes are all in the cutover
+build, and the suites below are green.

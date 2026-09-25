@@ -32,17 +32,26 @@ plus the Zari canary amendments:
           untouched; stale accepts and old links still cannot resurrect
           the pair.
         - poll/revoke concurrent ordering: across raced iterations the
-          invariant holds that a message is delivered by a poll IFF it
-          was collected (fetched pre-revoke-commit); otherwise it is
-          dead-lettered with handshake_revoked and never delivered.
+          invariant holds that every unacked message is dead-lettered
+          with handshake_revoked at revoke-commit, whether or not a poll
+          fetched it first; no poll fetch running after revoke-commit
+          can ever return the pair's mail (a response already in flight
+          may still carry pre-revoke bytes -- the physical boundary).
+  A7. BUG-008 (2026-09-25): revoke dead-letters ALL unacked mail between
+      the pair, including collected-but-unacked (v0.2.16 at-least-once
+      redelivery kept those pollable post-revoke). Phase 5c proves:
+      collect (no ack) -> revoke -> repeated polls return nothing, the
+      row carries dead_reason=handshake_revoked WITH collected_at set,
+      and receipts report "dead" (not "collected") for it.
 
 Documented delivery boundary (also in relay.py's revoke handler):
-revocation cannot retract delivered plaintext. Messages already polled
-(collected) STAY delivered. Anything not yet fetched at revoke-commit
-time is dead-lettered with reason handshake_revoked and never delivered
-after. The status flip, revocation memory, and dead-letter sweep happen
-in ONE atomic transaction; a send racing revoke either fully precedes it
-(its message is then dead-lettered) or fully follows it (403).
+revocation cannot retract plaintext already written to the client's
+socket, and cannot un-ack an ack. Everything else -- including
+collected-but-unacked mail -- is dead-lettered with reason
+handshake_revoked and never delivered after revoke-commit. The status
+flip, revocation memory, and dead-letter sweep happen in ONE atomic
+transaction; a send racing revoke either fully precedes it (its message
+is then dead-lettered) or fully follows it (403).
 
 Runs its relay on port 18805 (scratch port; never touches 18802).
 """
@@ -647,6 +656,69 @@ try:
             retry_duplicate=True, new_send_403=True,
             dead_reason=dl6[0] if dl6 else None, passed=True)
 
+    # ------- phase 5c: revoke kills collected-but-unacked (BUG-008)
+    print("== phase 5c: revoke vs collected-unacked ==")
+    Z7_IDENT = Ident(TMPD, "z7")
+    _, frag7 = mint_link(N, max_uses=1, exp_days=7)
+    code, red7 = redeem_fresh(Z7_IDENT, frag7)
+    check("z7 redeem 200", code == 200, (code, red7))
+    Z7 = Client(red7["peer_name"], Z7_IDENT, red7["service_token"])
+    code, _ = Z7.req("POST", "/v1/handshakes/accept",
+                     {"handshake_id": red7["handshake_id"]})
+    check("z7 accept 200", code == 200, code)
+    Z7_NAME = red7["peer_name"]
+    MID_C = str(uuid.uuid4())
+    code, _ = N.req("POST", "/v1/send",
+                    {"id": MID_C, "to": Z7_NAME,
+                     "text": "collected never acked"})
+    check("send pre-collect 200", code == 200, code)
+    code, pol = Z7.req("GET", "/v1/poll?timeout=1")
+    got_c = [m for m in pol.get("messages", []) if m["id"] == MID_C]
+    check("first poll collects the message (no ack)",
+          code == 200 and len(got_c) == 1, (code, pol))
+    # Deliberately NO ack: the poll stands in for a dropped read. Under
+    # v0.2.16 at-least-once this row stays pollable -- revoke must still
+    # kill it (BUG-008: the old sweep only dead-lettered uncollected).
+    code, _ = N.req("POST", "/v1/handshakes/revoke", {"peer": Z7_NAME})
+    check("z7 revoke 200", code == 200, code)
+    c = db()
+    rowc = c.execute(
+        "SELECT collected_at, acked_at, dead_reason, expires_at"
+        " FROM messages WHERE id=?", (MID_C,)).fetchone()
+    c.close()
+    check("dead letter row exists", rowc is not None)
+    dlc_ok = (rowc is not None
+              and rowc["dead_reason"] == "handshake_revoked"
+              and rowc["collected_at"] is not None
+              and rowc["acked_at"] is None
+              and rowc["expires_at"] <= time.time())
+    check("collected-but-unacked dead-lettered", dlc_ok,
+          dict(rowc) if rowc else None)
+    # No redelivery: repeated fresh polls return nothing for the peer.
+    NODELIV = True
+    for attempt in range(3):
+        code, pol2 = Z7.req("GET", "/v1/poll?timeout=1")
+        got2 = [m for m in pol2.get("messages", []) if m["id"] == MID_C]
+        ok2 = (code == 200 and len(got2) == 0)
+        if not ok2:
+            NODELIV = False
+        check("no redelivery after revoke (poll %d)" % attempt, ok2,
+              (code, pol2))
+    # Sender-side receipts surface "dead", not "collected", for it.
+    code, rcp = N.req("GET", "/v1/receipts?limit=100")
+    dl_rcp = [r for r in rcp.get("receipts", []) if r["id"] == MID_C]
+    check("receipt shows dead (not collected) for collected-unacked",
+          len(dl_rcp) == 1 and dl_rcp[0]["state"] == "dead"
+          and dl_rcp[0]["dead_reason"] == "handshake_revoked"
+          and dl_rcp[0]["collected_at"] is not None, dl_rcp)
+    receipt(test="revoke_kills_collected_unacked",
+            dead_reason=rowc["dead_reason"] if rowc else None,
+            collected_at_set=(rowc["collected_at"] is not None
+                              if rowc else None),
+            redelivered_after_revoke=(not NODELIV),
+            receipt_state=dl_rcp[0]["state"] if dl_rcp else None,
+            passed=(dlc_ok and NODELIV))
+
     # ------- phase 6: old links can't resurrect; replayed accepts can't land
     print("== phase 6: generation binding ==")
     # The phase-1 link is spent/revoked-memory: redeem must fail with the
@@ -1032,26 +1104,37 @@ try:
         delivered = ([m["id"] for m in pol.get("messages", [])]
                      if isinstance(pol, dict) else [])
         c = db()
-        row = c.execute("SELECT collected_at, dead_reason FROM messages"
-                        " WHERE id=?", (mid,)).fetchone()
+        row = c.execute("SELECT collected_at, dead_reason, expires_at"
+                        " FROM messages WHERE id=?", (mid,)).fetchone()
         c.close()
         was_delivered = mid in delivered
-        collected = row is not None and row[0] is not None
+        # New invariant (BUG-008): the revoke ALWAYS dead-letters the
+        # unacked message, whether or not a poll fetched it first. A poll
+        # whose fetch ran pre-revoke may still carry the bytes (physical
+        # boundary -- cannot retract a response already built), but the
+        # row is dead and no later fetch can return it.
         dead = (row is not None and row[1] == "handshake_revoked"
-                and row[0] is None)
-        # Invariant: delivered IFF collected (fetched pre-revoke-commit);
-        # otherwise dead-lettered, uncollected, and never delivered.
-        ok = (pcode == 200 and was_delivered == collected
-              and (collected or dead))
+                and row[2] <= time.time())
+        ok = (pcode == 200 and dead)
         if not ok:
             ORDER_OK = False
             ORDER_DETAIL.append(
-                (i, pcode, was_delivered, collected, dead,
+                (i, pcode, was_delivered, dead,
                  dict(row) if row else None))
-    check("12 poll/revoke races: delivery iff collected, else dead-lettered",
+        else:
+            # After the race settles, a fresh poll must return nothing:
+            # the revoked peer receives nothing further.
+            code2, pol2 = RX.req("GET", "/v1/poll?timeout=1")
+            got2 = ([m["id"] for m in pol2.get("messages", [])]
+                    if isinstance(pol2, dict) else [])
+            if not (code2 == 200 and mid not in got2):
+                ORDER_OK = False
+                ORDER_DETAIL.append((i, "redelivered_post_revoke",
+                                     code2, got2))
+    check("12 poll/revoke races: always dead-lettered, never re-fetched",
           ORDER_OK and not ORDER_DETAIL, ORDER_DETAIL[:3])
     receipt(test="poll_revoke_ordering", iterations=12,
-            invariant="delivered_iff_collected_else_dead_lettered",
+            invariant="always_dead_lettered_never_refetched",
             violations=len(ORDER_DETAIL), passed=ORDER_OK)
 
     # --------------------------------- phase 10: at-cap names handshakes

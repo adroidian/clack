@@ -1,5 +1,35 @@
 # Clack relay changelog
 
+## v0.2.16 — at-least-once durability (unreleased, in development)
+
+Message-durability release: the relay no longer loses mail to dropped
+connections, and revocation now fails closed on delivery.
+
+### Server (relay.py)
+
+- **At-least-once poll redelivery (issue #4):** poll responses carry
+  `redelivered` + `delivery_count` per message so clients can tell a retry
+  from a first delivery; dedupe on `id` as before. `collected_at` keeps the
+  first-fetch time (`COALESCE`); new `fetch_count` column (with migration)
+  counts every poll delivery, exposed on `/v1/receipts`. `collected_at` is
+  telemetry, not a delivery guarantee: **only ack retires a message**. A
+  poll response that never arrives no longer risks the mail. The sweep no
+  longer prunes collected-but-unacked rows on the collection timer; unacked
+  rows (collected or not) live until 7d past expiry, then go as dead
+  letters visible via `/v1/receipts`.
+- **BUG-002 — ack queryability:** `/v1/ack` returns per-id outcomes
+  (`acked` / `already_acked` / `unknown`), making ack retries idempotent
+  and queryable after dropped connections.
+- **BUG-008 — revoke dead-letters collected-but-unacked:** the revoke
+  sweep no longer requires `collected_at IS NULL` — ALL unacked mail
+  between the pair dies with the consent, because under at-least-once
+  "collected" no longer means delivered. New delivery boundary:
+  revocation cannot retract bytes already on the wire and cannot un-ack
+  an ack; everything else is dead-lettered with `handshake_revoked` and
+  never delivered after revoke-commit. Receipts report such rows as
+  `dead` (not `collected`). The poll collection marking skips rows that
+  died between fetch and marking (revoke committing in the gap).
+
 ## v0.2.13 — handshake release (2026-09-24)
 
 Mutual-consent handshakes gate all messaging; client transport release gate
