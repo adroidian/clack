@@ -43,6 +43,14 @@ plus the Zari canary amendments:
       collect (no ack) -> revoke -> repeated polls return nothing, the
       row carries dead_reason=handshake_revoked WITH collected_at set,
       and receipts report "dead" (not "collected") for it.
+  A8. Fetch revocation filter (2026-09-25, Aaron's call: revocation =
+      revocation). Acked mail survives the dead-letter sweep, and
+      /v1/fetch has no ack filter by design (the recovery handle) --
+      so fetch must consult the handshake status too. Phase 5d proves:
+      pre-revoke fetch returns the acked thread history for both
+      participants; post-revoke fetch with the known in_reply_to
+      returns nothing for BOTH sides; a still-active pair's fetch is
+      unaffected. Dead-lettered rows are excluded at the SQL layer.
 
 Documented delivery boundary (also in relay.py's revoke handler):
 revocation cannot retract plaintext already written to the client's
@@ -718,6 +726,94 @@ try:
             redelivered_after_revoke=(not NODELIV),
             receipt_state=dl_rcp[0]["state"] if dl_rcp else None,
             passed=(dlc_ok and NODELIV))
+
+    # ------- phase 5d: revoke blocks /v1/fetch thread history
+    # (Aaron's call: revocation = revocation). Acked mail survives the
+    # dead-letter sweep, so fetch -- which has no ack filter by design
+    # (the recovery handle) -- must consult the handshake status too.
+    print("== phase 5d: revoke vs fetch thread history ==")
+    Z8_IDENT = Ident(TMPD, "z8")
+    _, frag8 = mint_link(N, max_uses=1, exp_days=7)
+    code, red8 = redeem_fresh(Z8_IDENT, frag8)
+    check("z8 redeem 200", code == 200, (code, red8))
+    Z8 = Client(red8["peer_name"], Z8_IDENT, red8["service_token"])
+    code, _ = Z8.req("POST", "/v1/handshakes/accept",
+                     {"handshake_id": red8["handshake_id"]})
+    check("z8 accept 200", code == 200, code)
+    Z8_NAME = red8["peer_name"]
+    M_ROOT = str(uuid.uuid4())
+    code, _ = N.req("POST", "/v1/send",
+                    {"id": M_ROOT, "to": Z8_NAME, "text": "thread root"})
+    check("thread root send 200", code == 200, code)
+    M_R1 = str(uuid.uuid4())
+    code, _ = Z8.req("POST", "/v1/send",
+                     {"id": M_R1, "to": N.name, "text": "reply one",
+                      "in_reply_to": M_ROOT})
+    check("thread reply send 200", code == 200, code)
+    M_R2 = str(uuid.uuid4())
+    code, _ = N.req("POST", "/v1/send",
+                    {"id": M_R2, "to": Z8_NAME, "text": "reply two",
+                      "in_reply_to": M_ROOT})
+    check("thread reply2 send 200", code == 200, code)
+    # Both sides ack what they received: the thread is fully acked
+    # mail -- exactly the rows the dead-letter sweep leaves behind.
+    code, _ = Z8.req("POST", "/v1/ack", {"ids": [M_ROOT, M_R2]})
+    check("z8 acks 200", code == 200, code)
+    code, _ = N.req("POST", "/v1/ack", {"ids": [M_R1]})
+    check("n acks 200", code == 200, code)
+    # Pre-revoke: fetch returns the acked thread history for both
+    # participants (recovery contract intact).
+    code, fz = Z8.req("GET", "/v1/fetch?in_reply_to=%s" % M_ROOT)
+    fz_ids = sorted(m["id"] for m in fz.get("messages", []))
+    check("pre-revoke z8 fetch sees acked thread",
+          code == 200 and fz_ids == sorted([M_R1, M_R2]), (code, fz_ids))
+    code, fn = N.req("GET", "/v1/fetch?in_reply_to=%s" % M_ROOT)
+    fn_ids = sorted(m["id"] for m in fn.get("messages", []))
+    check("pre-revoke n fetch sees acked thread (sender side)",
+          code == 200 and fn_ids == sorted([M_R1, M_R2]), (code, fn_ids))
+    # Revoke, then fetch with the known in_reply_to: nothing, both
+    # directions, even though every row was acked.
+    code, _ = N.req("POST", "/v1/handshakes/revoke", {"peer": Z8_NAME})
+    check("z8 revoke 200", code == 200, code)
+    code, fz2 = Z8.req("GET", "/v1/fetch?in_reply_to=%s" % M_ROOT)
+    check("post-revoke z8 fetch returns nothing",
+          code == 200 and fz2.get("messages") == [], (code, fz2))
+    code, fn2 = N.req("GET", "/v1/fetch?in_reply_to=%s" % M_ROOT)
+    check("post-revoke n fetch returns nothing (revoker too)",
+          code == 200 and fn2.get("messages") == [], (code, fn2))
+    # Control: a still-active pair's fetch is unaffected.
+    Z9_IDENT = Ident(TMPD, "z9")
+    _, frag9 = mint_link(N, max_uses=1, exp_days=7)
+    code, red9 = redeem_fresh(Z9_IDENT, frag9)
+    check("z9 redeem 200", code == 200, (code, red9))
+    Z9 = Client(red9["peer_name"], Z9_IDENT, red9["service_token"])
+    code, _ = Z9.req("POST", "/v1/handshakes/accept",
+                     {"handshake_id": red9["handshake_id"]})
+    check("z9 accept 200", code == 200, code)
+    M9R = str(uuid.uuid4())
+    code, _ = N.req("POST", "/v1/send",
+                    {"id": M9R, "to": red9["peer_name"], "text": "ctl root"})
+    check("control root send 200", code == 200, code)
+    M9Q = str(uuid.uuid4())
+    code, _ = Z9.req("POST", "/v1/send",
+                     {"id": M9Q, "to": N.name, "text": "ctl reply",
+                      "in_reply_to": M9R})
+    check("control reply send 200", code == 200, code)
+    code, _ = Z9.req("POST", "/v1/ack", {"ids": [M9R]})
+    check("control ack 200", code == 200, code)
+    code, f9 = Z9.req("GET", "/v1/fetch?in_reply_to=%s" % M9R)
+    f9_ids = [m["id"] for m in f9.get("messages", [])]
+    check("control pair fetch still works post-other-revoke",
+          code == 200 and f9_ids == [M9Q], (code, f9_ids))
+    receipt(test="revoke_blocks_fetch",
+            pre_revoke_fetch_ok=(fz_ids == sorted([M_R1, M_R2])),
+            post_revoke_empty=(fz2.get("messages") == []
+                               and fn2.get("messages") == []),
+            control_ok=(f9_ids == [M9Q]),
+            passed=(fz_ids == sorted([M_R1, M_R2])
+                   and fz2.get("messages") == []
+                   and fn2.get("messages") == []
+                   and f9_ids == [M9Q]))
 
     # ------- phase 6: old links can't resurrect; replayed accepts can't land
     print("== phase 6: generation binding ==")

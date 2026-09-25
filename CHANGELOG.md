@@ -29,6 +29,15 @@ connections, and revocation now fails closed on delivery.
   never delivered after revoke-commit. Receipts report such rows as
   `dead` (not `collected`). The poll collection marking skips rows that
   died between fetch and marking (revoke committing in the gap).
+- **Fetch revocation filter (Aaron's call: revocation = revocation):**
+  `/v1/fetch` (thread recovery, which has no ack filter by design) now
+  respects revocation — a revoked pair's thread history is not fetchable
+  post-revoke, not even acked mail, not even with a known `in_reply_to`.
+  Dead-lettered rows are excluded at the SQL layer (`dead_reason IS
+  NULL`); remaining rows are filtered against the handshake status of
+  the other participant (explicit `revoked` only — legacy rows with no
+  handshake keep the old behavior). Non-revoked recovery is untouched:
+  acked-but-unexpired thread history stays fetchable.
 
 ## v0.2.13 — handshake release (2026-09-24)
 

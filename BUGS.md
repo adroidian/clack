@@ -192,6 +192,17 @@ commit messages (`8c563d7`, `3a9506a`) and the cutover runbook.
   (collect → revoke → no redelivery, DB dead-lettered with collected_at
   set, receipt "dead") and phase 12 race invariant rewritten
   (always dead-lettered, never re-fetched) in `test-handshake.py`.
+- **Follow-up — fetch revocation filter (2026-09-25, Aaron's call:
+  "revocation needs to = revocation"):** `/v1/fetch` (thread recovery,
+  no ack filter by design) had no handshake/dead-letter filter, so a
+  revoked peer knowing an `in_reply_to` could pull thread history
+  post-revoke — including acked mail the dead-letter sweep leaves
+  behind. Fixed: `dead_reason IS NULL` at the SQL layer plus a
+  per-row handshake-status check (explicit `revoked` only; legacy rows
+  with no handshake keep the old behavior). Non-revoked recovery is
+  untouched. Tests: new phase 5d in `test-handshake.py` (pre-revoke
+  fetch sees acked thread both directions; post-revoke fetch returns
+  nothing for BOTH sides; active-pair control unaffected).
 
 ### BUG-009: Stale origin-verdict cache broke redeem/enroll hello
 - **Severity:** P1 · **Status:** `fixed-in-v0.2.12` (`b13d698`)

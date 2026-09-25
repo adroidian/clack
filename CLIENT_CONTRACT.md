@@ -453,7 +453,13 @@ retry is always safe.
 
 Reply-retry: returns retained messages (within 7-day retention) whose
 `in_reply_to` equals `<id>`, where you are the sender or the recipient.
-Use it to re-read a thread after a crash or missed ack.
+Use it to re-read a thread after a crash or missed ack. Acked messages
+are included (no ack filter) — that is the recovery handle.
+
+Revocation boundary (v0.2.16): if the handshake between you and the
+other participant is revoked, the pair's thread history is NOT
+fetchable — not even acked mail, not even with a known `in_reply_to`.
+Dead-lettered rows are excluded too. Revocation = revocation.
 
 ### GET /v1/receipts?since=<epoch>&limit=<n> (auth)
 

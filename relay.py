@@ -1860,6 +1860,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "in_reply_to_required"})
                 return
             cutoff = now - RETENTION
+            # Identity for the handshake lookup below. Read OUTSIDE the
+            # lock: caller_identity takes db_lock itself and it is not
+            # re-entrant.
+            me = caller_identity(peer)
             with db_lock:
                 rows = conn.execute(
                     """SELECT id, sender, recipient, topic, text, in_reply_to,
@@ -1867,9 +1871,42 @@ class Handler(BaseHTTPRequestHandler):
                        FROM messages
                        WHERE in_reply_to=? AND created_at >= ?
                          AND (sender=? OR recipient=?)
+                         AND dead_reason IS NULL
                        ORDER BY created_at""",
                     (irt, cutoff, peer, peer),
                 ).fetchall()
+                # v0.2.16 (Aaron's call: revocation = revocation). A
+                # revoked pair's thread history is not fetchable
+                # post-revoke -- not even acked mail, not even with a
+                # known in_reply_to. The dead-letter sweep only marks
+                # unacked rows, so consult the handshake status for the
+                # other participant of each row. Rows with no handshake
+                # row (legacy pre-v0.2.13 traffic) keep the old behavior:
+                # only an explicit 'revoked' status blocks. Inline SQL
+                # because db_lock is not re-entrant (caller_identity
+                # would deadlock).
+                hs_status = {}
+                kept = []
+                for r in rows:
+                    other = r[1] if r[1] != peer else r[2]
+                    if other not in hs_status:
+                        irow = conn.execute(
+                            "SELECT identity_pubkey FROM peers"
+                            " WHERE name=?",
+                            (other,),
+                        ).fetchone()
+                        other_id = irow[0] if irow and irow[0] else other
+                        ga, gb = _hs_pair(me, other_id)
+                        hrow = conn.execute(
+                            "SELECT status FROM handshakes"
+                            " WHERE a_identity=? AND b_identity=?",
+                            (ga, gb),
+                        ).fetchone()
+                        hs_status[other] = hrow[0] if hrow else None
+                    if hs_status[other] == "revoked":
+                        continue
+                    kept.append(r)
+                rows = kept
             msgs = [
                 {
                     "id": r[0],
