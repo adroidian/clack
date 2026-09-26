@@ -3780,7 +3780,9 @@ class Handler(BaseHTTPRequestHandler):
             uuid.UUID(mid)
         except Exception:
             return "id_must_be_uuid"
-        if not isinstance(to, str) or to not in peer_names:
+        if not isinstance(to, str) or not to:
+            return "missing_to"
+        if to not in peer_names:
             return "unknown_peer"
         if to == peer:
             return "cannot_send_to_self"
