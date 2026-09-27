@@ -1,10 +1,52 @@
-# Clack Federation Trust Model (Draft v0.4)
+# Clack Federation Trust Model (Draft v0.5)
 
-**Status:** Revised draft addressing Flint's v0.3 review (msg `50822210-a6fa-44d4-8ed4-3c5d0d9b05b9`,
-5 P1 + 3 P2 findings). For kin circle review. No code. No implementation sign-off.
+**Status:** Revised draft addressing Flint's v0.4 review (msg `1370d539-0a56-4ea0-b5c0-222669767e2d`,
+4 P1 + 2 P2 findings). For kin circle review. No code. No implementation sign-off.
 **Branch:** `design/federation-trust-model`
 **Date:** 2026-09-27
-**Replaces:** Draft v0.3 (commit `41b520b`)
+**Replaces:** Draft v0.4 (commit `6f56329`)
+
+## 0. What changed from v0.4
+
+Flint's v0.4 review found the remaining holes that kept v0.4 from being a
+complete executable contract:
+
+1. **Nonce retention anchor was receipt-based.** A future-dated attestation
+   (t=300, accepted at t=0) left its nonce evicted at t=1201 while the
+   timestamp stayed valid through t=1500 — a demonstrated replay hole.
+   Now: nonce evidence is retained through `attempt_at + 1200s`
+   (inclusive), anchored on the signed timestamp, persisted across
+   restart. (P1-1)
+2. **Recheck had no deadline or consumption rule.** A delayed signed
+   'active' could reset the watermark hours after sampling; a reused nonce
+   could renew it repeatedly. Now: requests carry a deadline, pending
+   context is persisted, nonces are consumed atomically, responses must
+   exactly match the requested grant set/generations, and only verified
+   grants reset. Revoked/unknown handling and tombstone retrieval are
+   defined; a signed recheck can never override a durable tombstone or
+   extend expiry. (P1-2)
+3. **Signed inputs missing from transmitted structures.** The
+   countersignature wrapper carried only a signature string — the verifier
+   couldn't reconstruct `countersigned_at`. The offer had no creation
+   time for the 30-day cap. Now: the wrapper carries the canonical
+   countersignature object with detached signature; the offer carries a
+   signed `issued_at`. (P1-3)
+4. **Delta/tombstone contradictions.** The directory schema lacked the
+   `base_sequence`/`base_hash` the delta rule required, and snapshot
+   replacement could drop tombstones. Now: exact schema with conditional
+   presence, plus a persistent removal registry that no snapshot can clear
+   without explicit authenticated reinstatement. (P1-4)
+5. **NEG mapping fixed.** The six agreed negative categories
+   (NEG-01..NEG-06) are now mapped directly instead of substituted. (P2-5)
+6. **Schema/recovery boundaries finished.** Global integer/array/string
+   bounds, grant-list ordering, `acceptance_id` (referenced by
+   `already_consumed`), `stale_epoch` recovery acceptance, expiry
+   tombstones vs neutral terminal error, and a portable adapter signature
+   contract. (P2-6)
+7. **Wire appendix.** §13 adds complete request/response examples for
+   countersignature transport, directory delta, and recheck recovery —
+   Flint's prerequisite for generating fixtures without inventing
+   protocol. (P1/P2)
 
 ## 0. What changed from v0.3
 
@@ -190,6 +232,12 @@ do not satisfy this table:
 base64url peer pubkey. Canonical order is lexicographic by the UTF-8
 bytes of the base64url key string. A directory with unsorted keys is
 rejected. (P1-1)
+
+**Global size bounds (P2-6).** Unless a schema states a tighter bound:
+integers are 0 ≤ n ≤ 2^63−1; strings are ≤ 1 MiB UTF-8; arrays and
+objects hold ≤ 10,000 elements. Grant-ID lists (`grant_ids`) hold ≤ 1000
+entries, sorted lexicographically, no duplicates. A value outside its
+bound is rejected before signature verification.
 
 **Fixed vectors:** For every domain type, the spec's test suite (§12) includes
 at least one fixed input → fixed canonical bytes → fixed signature vector
@@ -393,8 +441,29 @@ revocation-recheck watermark** (§8.1).
 }
 ```
 
-Same audience/epoch/freshness verification as heartbeats. `reason` is a
-closed enum — unknown reasons are rejected.
+Same audience/epoch/freshness verification as heartbeats, **except**
+`stale_epoch` recovery (below). `reason` is a closed enum — unknown
+reasons are rejected.
+
+**`stale_epoch` recovery acceptance (P2-6).** `link-error{reason:
+stale_epoch}` exists precisely for when the two relays disagree about
+the epoch, so it cannot require an epoch match. It is accepted iff:
+(a) the signature verifies against the linked relay key,
+(b) `to_relay_key` equals the receiver's own key,
+(c) `sent_at` is within [now−1200s, now+300s], and
+(d) it arrives on the **handshake transport** (the §6 handshake
+exchange), never on the data path. On acceptance the receiver starts a
+fresh handshake. Ordinary data-path epoch checks are unchanged and are
+not weakened by this rule.
+
+**Attempt expiry tombstones (P2-6).** After an attempt record
+(handshake or delivery) expires and is deleted, a timed-out attempt is
+indistinguishable from a never-seen one. To keep that distinction
+honest: on attempt expiry the relay retains an expiry tombstone
+`{attempt_id, outcome, terminal_at}` for 24h. Status queries inside the
+window return the recorded terminal outcome. After the window, queries
+get the single neutral terminal error `link-error{reason:
+unknown_attempt}` — which is the honest answer once evidence is gone.
 
 **Link liveness:** Signed heartbeats every 60s. Three missed heartbeats →
 DEGRADED. Whether new mail is accepted while DEGRADED is an explicit
@@ -443,7 +512,21 @@ stable pubkeys; aliases are resolved before signing.
      attester** — the relay whose signature verified against the linked
      key. A mismatch is rejected (no confused-deputy forwarding).
    - Attestation signature against Relay A's stable key; epoch is current;
-     `attempt_nonce` not seen (replay dedup, 1200s retention).
+     `attempt_nonce` not seen (replay dedup).
+   - **Nonce retention anchor (P1-1).** Nonce evidence is retained through
+     `attempt_at + 1200s`, **inclusive of the endpoint**, anchored on the
+     **signed** `attempt_at` — not on receipt time. A future-dated
+     attestation (`attempt_at` = t+300, accepted at t) keeps its nonce
+     until t+1500; worst-case retention from first receipt is 1500s. The
+     retention record is persisted across restarts. Rationale: with
+     receipt-anchored retention, the nonce of a future-dated attestation
+     evicts at receipt+1200s while the timestamp stays valid through
+     attempt_at+1200s — a demonstrated replay hole (Flint's v0.4 review,
+     cases +1201/+1499/+1500s). Timestamp-anchored retention closes it.
+     Durable envelope dedup (sender key, home relay, `msg_id`,
+     envelope-hash) is a second, independent barrier — it may still
+     prevent a second inbox insertion, but the transport layer does not
+     rely on it.
    - **Transport freshness (P1-2):** `attempt_at` must fall within
      [now−1200s, now+300s]. The past bound equals the nonce-retention
      window; the future bound is the 300s skew allowance. A captured
@@ -616,10 +699,12 @@ single-use is enforced by atomic consume (Zari #2).
     "consent_mode": "targeted | open",
     "countersignature_required": false,
     "target_peer_key": "<stable pubkey, or null when mode=open>",
-    "expires_at": "<rfc3339, max 30 days>"
+    "issued_at": "<rfc3339>",
+    "expires_at": "<rfc3339, max issued_at + 30 days>"
   },
   "offer_signature": "<minter signs clack:consent-offer/v1: + canonical offer>",
   "acceptance": {
+    "acceptance_id": "<uuid v4, unique per acceptance>",
     "grant_id": "<same as offer>",
     "generation": 1,
     "offer_hash": "<sha256 of canonical offer bytes, base64url>",
@@ -628,26 +713,33 @@ single-use is enforced by atomic consume (Zari #2).
     "expires_at": "<rfc3339>"
   },
   "acceptance_signature": "<redeemer signs clack:consent-acceptance/v1: + canonical acceptance>",
-  "minter_countersignature": "<or null; REQUIRED when offer.countersignature_required is true>"
+  "minter_countersignature": {
+    "countersignature": {
+      "v": 1,
+      "grant_id": "<uuid>",
+      "generation": 1,
+      "acceptance_hash": "<sha256 of canonical acceptance bytes, base64url>",
+      "countersigned_at": "<rfc3339>"
+    },
+    "signature": "<minter signs clack:consent-countersignature/v1: + canonical countersignature>"
+  }
 }
 ```
 
-**Countersignature preimage (P1-1).** When required, the minter signs
-domain `clack:consent-countersignature/v1:` over this canonical object:
+When `countersignature_required` is false, `minter_countersignature` is
+null. When true, the wrapper carries the **canonical countersignature
+object** with a detached signature — never a bare signature string (P1-3).
+The verifier reconstructs the preimage from the carried object, checks
+the signature against the minter's pinned key, and verifies the
+`acceptance_hash` matches the acceptance being installed. A bare
+signature string with no reconstructible preimage is rejected.
 
-```json
-{
-  "v": 1,
-  "grant_id": "<uuid>",
-  "generation": 1,
-  "acceptance_hash": "<sha256 of canonical acceptance bytes, base64url>",
-  "countersigned_at": "<rfc3339>"
-}
-```
-
-The verifier checks the signature against the minter's pinned key and
-that the `acceptance_hash` matches the acceptance being installed. A
-countersignature over a different acceptance is rejected.
+**Offer `issued_at` (P1-3).** The offer carries a signed `issued_at`. The
+verifier checks `expires_at ≤ issued_at + 30 days` and
+`expires_at > issued_at`; an offer missing `issued_at`, or with
+`expires_at` beyond the cap, is rejected. `issued_at` is the checkable
+anchor for the lease bound — the design no longer claims "30 days from
+creation" without a signed creation time.
 
 **Effective grant expiry (P1-4).** The grant is valid until
 `min(offer.expires_at, acceptance.expires_at)`. An acceptance with
@@ -700,7 +792,7 @@ RFC 3339 UTC; the 300s skew tolerance applies at verification time.
    *is* the single-use mechanism. Idempotent re-presentation by the same
    accepted claimant is a no-op success. A different claimant after
    consumption receives `already_consumed` carrying the winner's
-   acceptance ID (so races are observable, not silent).
+   `acceptance_id` (so races are observable, not silent).
 6. **Open-invite claimant eligibility.** For `mode=open`, the redeemer must
    be an enrolled peer on a relay linked to the minter's relay, proven by
    the forwarding relay's attestation. "Any qualifying holder" means
@@ -744,7 +836,7 @@ RFC 3339 UTC; the 300s skew tolerance applies at verification time.
 enrolled on Relay A, never issued an A token, and Mosaic's B token never
 travels to A.
 
-### 8.1 Revocation Recheck Protocol (P1-4)
+### 8.1 Revocation Recheck Protocol (P1-2, revised v0.5)
 
 The 24h partition cap (§7) is enforced by a defined exchange, not by
 liveness inference.
@@ -760,9 +852,13 @@ liveness inference.
   "grant_ids": ["<uuid>", "..."],
   "watermark": "<rfc3339: requester's last verified recheck per its own clock, or null>",
   "nonce": "<random 32 bytes, base64url>",
-  "requested_at": "<rfc3339>"
+  "requested_at": "<rfc3339>",
+  "deadline": "<rfc3339, = requested_at + 300s>"
 }
 ```
+
+`grant_ids` is sorted lexicographically, contains no duplicates, and holds
+at most 1000 entries.
 
 **Recheck response v1** (`clack:recheck-response/v1:`):
 
@@ -778,6 +874,7 @@ liveness inference.
       "grant_id": "<uuid>",
       "generation": 1,
       "status": "<active | revoked | unknown>",
+      "tombstone": "<canonical tombstone object, or null>",
       "tombstone_hash": "<sha256 of canonical tombstone, base64url, or null>",
       "effective_expires_at": "<rfc3339>"
     }
@@ -786,11 +883,45 @@ liveness inference.
 }
 ```
 
-**Rules:**
-- Each relay persists `last_recheck_verified_at` per grant per link,
-  durably across restarts. The cache age resets **only** on a valid
-  signed recheck response whose nonce matches an outstanding request.
-- **Heartbeats never reset the watermark.** Liveness is not revocation
+The `grants` array is sorted by `grant_id`, contains no duplicates, and
+**must contain exactly the requested set**: every requested grant ID
+appears exactly once, no unrequested IDs appear. For `status: revoked`,
+the full canonical tombstone is embedded (no second round trip).
+
+**Pending context (persisted).** On sending a request, the requester
+durably persists `{from_relay_key, to_relay_key, link_epoch, nonce,
+requested grant IDs + generations, deadline}`. The record survives
+restart.
+
+**Response validation — all must hold, else the response is rejected
+and no watermark moves:**
+1. Signature verifies against the linked relay key; `from_relay_key` /
+   `to_relay_key` / `link_epoch` match the pending context.
+2. `nonce` matches an outstanding pending context and is **consumed
+   atomically** — the first valid use deletes the pending record; any
+   second use of the same nonce is rejected. A nonce can never renew a
+   watermark twice.
+3. `responded_at` ≤ `deadline`. A delayed signed 'active' arriving after
+   the deadline is rejected — staleness is measured against the
+   request's deadline, not against signature validity.
+4. The `grants` array exactly matches the requested set and generations:
+   no duplicates, no missing entries, no unrequested entries.
+5. For each grant: if the requester holds a **durable local tombstone**
+   for that grant, the response cannot override it — a signed 'active'
+   for a locally-tombstoned grant is rejected for that grant (the
+   tombstone stands; the discrepancy is logged). A response can never
+   extend `effective_expires_at` beyond the installed grant's signed
+   expiry.
+
+**Watermark reset.** Only grants verified `active` under all rules above
+have their `last_recheck_verified_at` advanced. `revoked` grants trigger
+tombstone application (the embedded tombstone is verified and installed).
+`unknown` grants change nothing — the watermark does not advance and the
+grant stays on its previous standing.
+
+**Rules carried from v0.4:**
+- The cache age resets **only** on a valid signed recheck response.
+  **Heartbeats never reset the watermark.** Liveness is not revocation
   knowledge.
 - If 24h pass without a verified recheck for a grant, the relay fails
   closed: stops delivery under that grant, NDRs queued mail
@@ -809,7 +940,9 @@ liveness inference.
 **What signatures prove:** A signed directory proves **the relay authored
 it**. It does not independently prove peer identity.
 
-**Directory v1** (`clack:directory/v1:`):
+**Directory v1** (`clack:directory/v1:`) — exact schema (P1-4).
+Field order is canonical as shown. `base_sequence`/`base_hash` are
+always present; their nullability is conditioned on `is_delta`:
 
 ```json
 {
@@ -821,6 +954,8 @@ it**. It does not independently prove peer identity.
   "issued_at": "<rfc3339>",
   "expires_at": "<rfc3339>",
   "is_delta": false,
+  "base_sequence": null,
+  "base_hash": null,
   "entries": {
     "<peer stable pubkey>": {
       "display_name": "nugget",
@@ -833,6 +968,16 @@ it**. It does not independently prove peer identity.
   }
 }
 ```
+
+- When `is_delta` is false: `base_sequence` and `base_hash` MUST be
+  null. Non-null base fields on a full snapshot → rejected.
+- When `is_delta` is true: both MUST be present and non-null —
+  `base_sequence` (integer ≥ 0), `base_hash` (sha256 of the canonical
+  snapshot bytes the delta applies to, base64url). Missing or null →
+  rejected. This resolves the v0.4 contradiction: the fields the delta
+  rule requires are now in the schema, with exact conditional
+  presence — not unknown fields.
+- `epoch`, `sequence`: integers, 0 ≤ n ≤ 2^63−1, monotonic per §9 rules.
 
 **Rules:**
 - Keyed by **stable peer pubkey**. Names are informational. Entries and
@@ -848,20 +993,34 @@ it**. It does not independently prove peer identity.
 - **Rollback protection.** Monotonic sequence per epoch; high-water marks
   persist across restarts; lower sequence rejected; epoch resets need
   authenticated resync; tombstones durable.
-- **Delta binding (P2-8).** A delta (`is_delta: true`) carries
-  `base_sequence` and `base_hash` (sha256 of the canonical snapshot it
-  applies to). It applies **only if** both match the cached state.
-  Base mismatch → the delta is rejected outright; the receiver requests
-  a full snapshot. Deltas are never chained on top of other deltas.
+- **Delta binding (P2-8).** A delta (`is_delta: true`) applies **only if**
+  `base_sequence` and `base_hash` match the cached state. Base mismatch
+  → the delta is rejected outright; the receiver requests a full
+  snapshot. Deltas are never chained on top of other deltas.
 - **Equal-sequence conflict (P2-8).** If a directory arrives with
   `sequence` equal to the cached sequence but different content hash,
   **both** are quarantined and a full authenticated resync is required.
   Neither wins by arrival order.
+- **Tombstone persistence — the removal registry (P1-4).** Snapshot
+  replacement MUST NOT drop tombstones. Each relay maintains a
+  persistent removal registry: `peer_key → {removed_at, reason,
+  source_sequence}`, durable across restarts. On receiving a snapshot:
+  merge its tombstones into the registry (keep the latest `removed_at`
+  per key); **never delete registry entries on snapshot replace**.
+  Issuers SHOULD carry all applicable tombstones forward in every
+  snapshot (defense in depth), but receivers do not depend on it.
+  A peer key is treated as removed while the registry holds a
+  `removed_at` newer than any directory entry's `added_at` for that key.
+- **Authenticated reinstatement (P1-4).** A removed key goes live again
+  only via an explicit re-add: a signed directory entry for the key with
+  `added_at` > the registry's `removed_at`. A higher snapshot sequence
+  alone is NOT reinstatement authorization. Directory visibility changes
+  and consent revocation remain separate mechanisms — a visibility
+  tombstone never implies consent revocation and vice versa.
 - **Authenticated resync (P2-8).** A full snapshot with a higher
-  `sequence` (same epoch) or a new signed epoch replaces cached state.
-  Tombstones from the newer snapshot replace cached tombstones — a
-  tombstone is never restored to "live" by an older snapshot (durable
-  precedence).
+  `sequence` (same epoch) or a new signed epoch replaces cached
+  *entries*. Tombstones merge into the removal registry per the rule
+  above — they are never replaced wholesale.
 - **Queued-mail treatment: planned rotation vs compromised revocation
   (P2-8).** Planned key rotation (old-key-signed transition) drains queued
   mail under the old grant within its remaining lease; the new grant takes
@@ -969,8 +1128,14 @@ T2-20+) without renumbering anything.
 | Zari Z2 generation mismatch | T1-07 |
 | Zari Z3 expiry extension | T1-08 |
 | Zari Z4 countersignature mode | T1-09 (stripped), T1-10 (absent when required) |
-| Zari Z5 custody ACK separation | T1-26 |
+| Zari Z5 custody ACK separation | T1-26 (field integrity), T1-33 (semantic: custody ≠ delivered ≠ read ≠ complete) |
 | Zari Z6 domain framing completeness | T1-14, T1-15, T1-16, T1-17, T1-18 |
+| NEG-01 grant-ID binding | T1-06 |
+| NEG-02 countersignature mode | T1-09, T1-10 |
+| NEG-03 domain framing | T1-14, T1-15, T1-16, T1-17, T1-18 |
+| NEG-04 pin enforcement | T1-13 (substitution vs pinned), §9 pins-on-delivery-path |
+| NEG-05 custody-ACK separation | T1-26, T1-33 |
+| NEG-06 narrowed anti-forgery scope | T1-17 (confused deputy), T2-16 (TOFU scoping), §10 scope table |
 | v0.3 T2-17 simultaneous handshakes | unchanged |
 | v0.3 T2-18 lost FINISH_ACK | superseded by T2-20/T2-21/T2-25 (P1-3) |
 | v0.3 T2-19 24h partition cap | T2-19 + T2-23/T2-24 (P1-4) |
@@ -1010,6 +1175,32 @@ explicit agreement.
 - [ ] **T1-26** Custody ACK with wrong `msg_id`/envelope hash or unsigned → rejected (P1-1)
 - [ ] **T1-27** NDR missing issuer/audience/home bindings → rejected (P1-1)
 - [ ] **T1-28** Acceptance `expires_at` later than offer's → rejected; effective expiry = min (P1-4)
+- [ ] **T1-29** Nonce retention anchor (P1-1 v0.5): future-dated attestation
+  (`attempt_at` = t+300, accepted at t) replayed at t+1201, t+1499, t+1500
+  → rejected via nonce (evidence retained through `attempt_at` + 1200s
+  inclusive); at t+1501 → rejected via freshness window. Receipt-anchored
+  retention would pass the first three — the test pins the signed-timestamp
+  anchor.
+- [ ] **T1-30** Grant wrapper with bare signature-string countersignature
+  (no reconstructible object) → rejected; wrapper carrying the canonical
+  countersignature object + detached signature → accepted (P1-3)
+- [ ] **T1-31** Offer missing `issued_at`, or `expires_at` > `issued_at` +
+  30d → rejected (P1-3)
+- [ ] **T1-32** Directory delta missing `base_sequence`/`base_hash`, or
+  full snapshot with non-null base fields → rejected (P1-4)
+- [ ] **T1-33** Custody separation (NEG-05): status claim of
+  `custody_acked` with no valid signed custody ACK → rejected; a frame
+  asserting `accepted_at_destination`, `delivered_to_client`, or
+  `human_read` never implies `custody_acked`, and custody ACK never
+  implies any of them — the four states remain distinct
+- [ ] **T1-34** `already_consumed` references an `acceptance_id` absent
+  from the acceptance object schema → schema rejected (P2-6); with the
+  field present, race losers carry the winner's `acceptance_id`
+- [ ] **T1-35** Recheck response with duplicate, missing, or unrequested
+  grant entries → rejected; exact set match required (P1-2)
+- [ ] **T1-36** Recheck response with `responded_at` > deadline, or a
+  second response reusing the same nonce → rejected; watermark does not
+  move (P1-2)
 
 ### Tier 2 — adapter-driven stateful scenarios
 
@@ -1037,6 +1228,20 @@ explicit agreement.
 - [ ] **T2-23** Revocation recheck protocol → watermark advances only on valid signed response; cache age resets there (P1-4)
 - [ ] **T2-24** Heartbeats during partition do not reset the recheck watermark → fail-closed at 24h despite liveness (P1-4)
 - [ ] **T2-25** Selective FINISH_ACK loss → initiator retries, responder replays identical bytes; epoch commits exactly once (P1-3, needs adapter fault injection)
+- [ ] **T2-26** Delayed signed 'active' recheck response (arriving after
+  deadline) → rejected, watermark does NOT reset; delivery fails closed at
+  24h (P1-2 v0.5)
+- [ ] **T2-27** Recheck nonce reuse → second response with the same nonce
+  rejected; watermark renewed at most once per nonce (P1-2 v0.5)
+- [ ] **T2-28** Snapshot omitting a tombstone → removed key stays removed
+  (removal registry); later re-add with `added_at` > `removed_at` →
+  reinstated via explicit authenticated reinstatement (P1-4 v0.5)
+- [ ] **T2-29** `stale_epoch` link-error → accepted on the handshake
+  transport without epoch match (signature + audience + freshness hold);
+  data-path epoch checks unchanged and still reject (P2-6 v0.5)
+- [ ] **T2-30** Attempt evidence fully deleted after 24h expiry tombstone →
+  status queries return the neutral `unknown_attempt` terminal error; no
+  false distinction between timed-out and never-seen (P2-6 v0.5)
 - [ ] **T2-26** Compromised home relay suppressing revocation → documented non-guarantee; test asserts the design *states* the limit, not that it prevents it (negative control, P1-4)
 
 ### Tier 2 test-adapter interface
@@ -1059,19 +1264,30 @@ get_inbox(peer) -> [messages]
 install_grant(relay, grant) / revoke_grant(relay, tombstone)
 set_clock(handle, t)                    # time travel forward for expiry/lease tests
 get_pinned_key(relay, contact) -> pubkey
-# --- fault injection (new in v0.4) ---
-drop_next_response(n, match)            # drop next n responses matching predicate
-                                        # (selective: FINISH_ACK only, etc.)
-barrier_at_commit_point(point)          # pause before/after commit; point in
-                                        # {outbox_commit, inbox_insert, install, tombstone_apply}
+# --- fault injection (P2-6: explicit portable signatures) ---
+drop_next_response(link_id, n, match)   # drop next n responses on this link
+                                        # matching predicate (selective:
+                                        # FINISH_ACK only, etc.)
+barrier_at_commit_point(handle, point) -> barrier_token
+                                        # pause relay before/after commit;
+                                        # point in {outbox_commit, inbox_insert,
+                                        # install, tombstone_apply}
+release_barrier(barrier_token)          # deterministic release; unblocks exactly
+                                        # the paused relay, returns after resume
+on_commit(handle, point, callback)       # observable commit events: callback
+                                        # fires with {point, handle, attempt_id,
+                                        # committed_at} when the commit lands
 schedule_contenders(fn_list)            # run contender functions concurrently
-inject_signed_frame(frame_bytes, sig)   # deliver a raw signed frame to a relay
-replay_frame(frame_bytes)               # redeliver a captured frame verbatim
-inject_directory_update(relay, dir)     # deliver a crafted directory
-set_quota(scope, limits)                # configure quota bounds
-get_resource_usage(relay)               # inspect queue depth, in-flight counts
-get_receipts(relay)                     # inspect persisted receipts
-get_attempts(relay)                     # inspect handshake/delivery attempt records
+inject_signed_frame(handle, frame_bytes, sig)
+                                        # deliver a raw signed frame to a relay
+replay_frame(handle, frame_bytes)        # redeliver a captured frame verbatim
+inject_directory_update(handle, dir)    # deliver a crafted directory
+set_quota(handle, scope, limits)         # configure quota bounds
+get_resource_usage(handle)              # inspect queue depth, in-flight counts
+get_receipts(handle)                    # inspect persisted receipts
+get_attempts(handle)                    # inspect handshake/delivery attempt records
+get_recheck_context(handle, nonce)       # inspect persisted pending recheck context
+get_removal_registry(handle)            # inspect persistent removal registry
 ```
 
 **Adapter restart semantics:** identity (keys) and config survive
@@ -1090,18 +1306,192 @@ cannot claim the Tier 2 properties.
 
 ---
 
+## 13. Wire Appendix (new in v0.5)
+
+Complete request/response examples for the three exchanges Flint's
+v0.4 review named as fixture blockers: countersignature transport,
+directory delta, and recheck recovery. Keys and hashes are fixed
+synthetic vectors — any fixture generator must reproduce these bytes
+exactly to claim conformance. Signatures shown are the canonical
+preimage hashes (`sig:<sha256 of domain || canonical-bytes>`) so a
+test writer can recompute them without a key.
+
+### 13.1 Countersignature transport
+
+A grant whose offer requires countersignature is installed with the
+canonical countersignature object carried in the wrapper — the verifier
+reconstructs the preimage from the carried bytes (P1-3).
+
+```json
+{
+  "v": 1,
+  "offer": {
+    "grant_id": "9f2c4a1e-7b3d-4e8f-a2c1-5d6e7f8090a1",
+    "generation": 1,
+    "minter_peer_key": "minter-peer-key-b64u",
+    "minter_relay_key": "minter-relay-key-b64u",
+    "scope": "pairwise",
+    "consent_mode": "targeted",
+    "countersignature_required": true,
+    "target_peer_key": "target-peer-key-b64u",
+    "issued_at": "2026-09-27T06:00:00Z",
+    "expires_at": "2026-10-27T06:00:00Z"
+  },
+  "offer_signature": "sig:<sha256 of 'clack:consent-offer/v1:' || canonical offer>",
+  "acceptance": {
+    "acceptance_id": "b7e1d903-2a4c-4f5d-9e6a-1c2b3d4e5f60",
+    "grant_id": "9f2c4a1e-7b3d-4e8f-a2c1-5d6e7f8090a1",
+    "generation": 1,
+    "offer_hash": "sha256-b64u-of-canonical-offer",
+    "redeemer_peer_key": "target-peer-key-b64u",
+    "redeemer_relay_key": "target-relay-key-b64u",
+    "expires_at": "2026-10-20T06:00:00Z"
+  },
+  "acceptance_signature": "sig:<sha256 of 'clack:consent-acceptance/v1:' || canonical acceptance>",
+  "minter_countersignature": {
+    "countersignature": {
+      "v": 1,
+      "grant_id": "9f2c4a1e-7b3d-4e8f-a2c1-5d6e7f8090a1",
+      "generation": 1,
+      "acceptance_hash": "sha256-b64u-of-canonical-acceptance",
+      "countersigned_at": "2026-09-27T06:05:00Z"
+    },
+    "signature": "sig:<sha256 of 'clack:consent-countersignature/v1:' || canonical countersignature>"
+  }
+}
+```
+
+Verifier checks (T1-30, T1-31):
+1. Rebuild canonical bytes of the carried `countersignature` object;
+   verify `signature` against the minter's pinned key.
+2. `acceptance_hash` equals sha256 of the canonical acceptance bytes in
+   this wrapper — a countersignature over a different acceptance is
+   rejected.
+3. `offer.issued_at` present; `offer.expires_at ≤ issued_at + 30d`.
+4. Effective expiry = min(offer.expires_at, acceptance.expires_at) =
+   2026-10-20T06:00:00Z here.
+
+### 13.2 Directory delta
+
+Receiver holds snapshot seq=100, hash `H100`. Issuer sends a delta
+(P1-4). `base_sequence`/`base_hash` are present and non-null because
+`is_delta` is true; on a full snapshot they would be null (T1-32).
+
+```json
+{
+  "v": 1,
+  "issuer_relay_key": "issuer-relay-key-b64u",
+  "audience_relay_key": "receiver-relay-key-b64u",
+  "epoch": 42,
+  "sequence": 101,
+  "issued_at": "2026-09-27T06:10:00Z",
+  "expires_at": "2026-09-28T06:10:00Z",
+  "is_delta": true,
+  "base_sequence": 100,
+  "base_hash": "H100",
+  "entries": {
+    "new-peer-key-b64u": {
+      "display_name": "vesper",
+      "federation_visible": true,
+      "added_at": "2026-09-27T06:10:00Z"
+    }
+  },
+  "tombstones": {
+    "gone-peer-key-b64u": {"removed_at": "2026-09-27T06:09:00Z", "reason": "peer_opt_out"}
+  }
+}
+```
+
+Receiver behavior:
+1. Verify signature, epoch, `sequence` = cached 100 + 1.
+2. `base_sequence` == 100 and `base_hash` == cached hash → apply.
+   Mismatch → reject the delta, request a full snapshot. Deltas are
+   never chained.
+3. Merge tombstones into the persistent removal registry (P1-4):
+   `gone-peer-key-b64u` records `{removed_at: 2026-09-27T06:09:00Z,
+   reason: peer_opt_out, source_sequence: 101}`. A later snapshot at
+   seq=102 that omits the tombstone does NOT clear the registry entry
+   (T2-28).
+4. Reinstatement only via a signed entry with `added_at` >
+   registry's `removed_at` — a higher sequence alone is not enough.
+
+### 13.3 Recheck recovery
+
+Relay X holds a cached grant for relay Y, watermark at
+`2026-09-26T06:00:00Z`, approaching the 24h cap. Request (P1-2):
+
+```json
+{
+  "v": 1,
+  "from_relay_key": "relay-x-key-b64u",
+  "to_relay_key": "relay-y-key-b64u",
+  "link_epoch": 42,
+  "grant_ids": ["9f2c4a1e-7b3d-4e8f-a2c1-5d6e7f8090a1"],
+  "watermark": "2026-09-26T06:00:00Z",
+  "nonce": "random-32-bytes-b64u",
+  "requested_at": "2026-09-27T05:55:00Z",
+  "deadline": "2026-09-27T06:00:00Z"
+}
+```
+
+X persists the pending context (issuer, audience, epoch, nonce,
+requested IDs + generations, deadline) durably before sending.
+
+Valid response — watermark advances only for verified grants:
+
+```json
+{
+  "v": 1,
+  "from_relay_key": "relay-y-key-b64u",
+  "to_relay_key": "relay-x-key-b64u",
+  "link_epoch": 42,
+  "nonce": "random-32-bytes-b64u",
+  "grants": [
+    {
+      "grant_id": "9f2c4a1e-7b3d-4e8f-a2c1-5d6e7f8090a1",
+      "generation": 1,
+      "status": "active",
+      "tombstone": null,
+      "tombstone_hash": null,
+      "effective_expires_at": "2026-10-20T06:00:00Z"
+    }
+  ],
+  "responded_at": "2026-09-27T05:57:00Z"
+}
+```
+
+Validation: signature against Y's linked key; nonce matches the
+outstanding pending context → **consumed atomically** (a second response
+with this nonce is rejected, T1-36/T2-27); `responded_at ≤ deadline`;
+`grants` exactly matches the requested set (no dup/missing/unrequested,
+T1-35); `effective_expires_at` does not extend the installed grant's
+signed expiry. Only then does `last_recheck_verified_at` advance.
+
+Revoked variant — same request, response carries `status: revoked`
+with the full canonical tombstone embedded. X verifies and installs
+the tombstone; the grant leaves the deliverable set. A signed 'active'
+for a grant X already holds a durable tombstone for is rejected for
+that grant (P1-2).
+
+Late variant — `responded_at: 2026-09-27T06:05:00Z` (after deadline).
+Rejected. The watermark does not move. X fails closed at the 24h cap
+even though the signature is valid (T2-26).
+
+---
+
 **Next steps:**
-- [ ] Kin circle reviews this v0.4 draft (Zari, Flint, Clingy Bear)
+- [ ] Kin circle reviews this v0.5 draft (Zari, Flint, Clingy Bear)
 - [ ] Aaron approves the narrowed trust claims
 - [ ] After sign-off: protocol branch with sandbox implementation
 
-**Implementation checkpoint:**
-- Sandbox/prototype implementation work MAY proceed in parallel (Aaron's green light, YOLO mode).
-- The safety claims in §10 are NOT signed off until Flint's v0.3 P1/P2
-  findings are verified as addressed (this draft), the Tier 1 tests pass,
-  the Tier 2 adapter + scenarios run green against a sandbox
-  implementation, and kin review completes.
-- Parallel sandbox work is not safety sign-off. No production rollout
-  claims safety properties before the checkpoint clears.
+**Implementation checkpoint (design-only gate — Aaron's standing order):**
+- No implementation, no production relay deployments, and no sandbox
+  implementation until kin review clears this design. The v0.4 checkpoint
+  line permitting parallel sandbox work contradicted that gate and is
+  superseded — removed here.
+- The safety claims in §10 are NOT signed off until Flint's P1/P2
+  findings for this revision are addressed and the kin circle signs off.
+- YOLO mode covers design iteration speed, not implementation
+  authorization.
 - NO production relay deploys, NO federation implementation in production
   code paths, until the checkpoint clears.
