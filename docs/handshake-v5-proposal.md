@@ -1,7 +1,7 @@
 # Clack Handshake v5: Request-Based Pairing
 
-**Status:** DRAFT rev 3 — not implemented. Revised per Flint's rev-2 review
-(2 P1, 2 P2, gate extensions). Awaiting kin re-review. No relay
+**Status:** DRAFT rev 4 — not implemented. Revised per Flint's rev-3 review
+(2 P1, 3 P2, gate extensions). Awaiting kin re-review. No relay
 implementation authorized until the revised design clears kin review.
 
 ## Problem
@@ -70,51 +70,105 @@ Opening a v5 link **never auto-accepts**. It opens a pending request the user
 ### Flow
 
 ```
-1. Alice wants to talk to Bob.
-   Alice → Relay: POST /v1/handshakes/request {to: "bob"}
-   Relay persists an IMMUTABLE request record (canonical form defined
-   below):
+1. Alice wants to talk to Bob. Because the consent signature must cover
+   server-chosen fields (request_id, timestamps, resolved keys, generation),
+   creation is a prepare→sign→commit sequence — every signer receives every
+   byte before signing:
+
+   a. Alice → Relay: POST /v1/handshakes/prepare-request
+        {to: "bob", expires_in?: <seconds>, idempotency_key: <uuid>}
+      Relay (no state change to REQUESTED yet):
+        - Resolves `to` to Bob's enrolled public key NOW (targeted), or
+          null (open).
+        - Reads the current pair generation for (Alice, Bob) — null for
+          open requests (pair unknown).
+        - Builds the exact immutable unsigned core (all server-chosen
+          fields filled) and stores it under a `prepare_id` with a short
+          TTL (5 minutes, quota-bounded; pending preparations count
+          against the requester quota and are NOT yet consent).
+      Relay → Alice: {prepare_id, prepared_core: {...}, prepare_expires_at}
+   b. Alice signs the canonical bytes of `prepared_core` exactly as
+      received (consent preimage below) — she has now seen every byte.
+   c. Alice → Relay: POST /v1/handshakes/request
+        {prepare_id, requester_consent_sig}
+      Relay (compare-and-swap against CURRENT state):
+        - `prepare_id` exists, is unexpired, belongs to Alice, unused.
+        - Re-resolves the target key and re-reads the pair generation:
+          any change since prepare (key rotation, revoke bumping the
+          generation, expiry passing) → fail with 409, NEVER silently
+          alter fields under her old signature. Alice must re-prepare.
+        - Verifies `requester_consent_sig` against the STORED prepared
+          core (not client-supplied bytes).
+        - Idempotency: (Alice, idempotency_key) already committed → return
+          the original record, no duplicate.
+      Relay persists the IMMUTABLE request record and returns
+      {request_id, link, expires_at}. The request is now REQUESTED.
+
+   The persisted immutable request record core:
      {record_type: "v5-handshake-request",
       protocol_version: 5,
       request_id, requester_pubkey, relay_identity_fingerprint,
       target_pubkey|null,
-      pair_generation_at_create,   // targeted: current pair generation,
-                                   // read NOW. open: null (pair unknown)
+      pair_generation_at_create,   // targeted: generation read at prepare.
+                                   // open: null (pair unknown)
       scope: "pairing",
       created_at, expires_at,
       idempotency_key,
-      requester_consent_sig}       // Alice's consent signature over the
-                                   // canonical request digest
-   Relay → Alice: {request_id, link, expires_at}
+      prepare_id}                  // ties the record to its preparation
 
 2. Alice shares the link with Bob (any channel — chat, email, QR, etc.)
 
 3. Bob opens the link. His client pins the relay origin (above), fetches
-   the invitation view (see Pre-accept read path), and Bob explicitly
-   accepts:
-   Bob → Relay: POST /v1/handshakes/accept-request
-     {request_id,
-      acceptor_pubkey, request_version, accepted_at,
-      pair_generation_at_accept,  // current pair generation, read NOW
-                                  // and frozen. For targeted requests it
-                                  // MUST equal pair_generation_at_create.
-      acceptor_consent_sig}       // Bob's consent signature (preimage below)
-   Relay verifies: Bob's transport signature (he is who he says he is),
-   Bob's consent signature over the accept preimage, the request is still
-   REQUESTED, the deadline has not passed, and (for targeted requests)
-   Bob's key matches target_pubkey and the generation is unchanged since
-   creation. On success the relay freezes ONE immutable acceptance record
-   and moves the request to ACCEPTED_PENDING_CONFIRM — this phase commits
-   separately. Concurrent accepts: exactly one winner is frozen; losers get
-   a deterministic already-claimed result that cannot alter the frozen
-   acceptance.
+   the invitation view (full request core, so he can verify what he'd be
+   consenting to), and Bob explicitly accepts — again prepare→sign→commit:
+
+   a. Bob → Relay: POST /v1/handshakes/prepare-accept {request_id}
+      Relay: request must be REQUESTED and unexpired; for targeted
+      requests the caller must match target_pubkey (else 404). Reads the
+      CURRENT pair generation for the now-known pair and builds the exact
+      unsigned acceptance core — including `request_digest` (SHA-256 of
+      the canonical request core), which binds this acceptance to the
+      exact request terms. Stores under `prepare_id`, 5-minute TTL.
+      Relay → Bob: {prepare_id, prepared_acceptance_core,
+                    prepare_expires_at}
+   b. Bob signs the canonical acceptance core (preimage below).
+   c. Bob → Relay: POST /v1/handshakes/accept-request
+        {prepare_id, acceptor_consent_sig}
+      Relay compare-and-swap: prepare valid and owned by Bob; request
+      still REQUESTED; deadline unpassed; generation unchanged since
+      prepare; no concurrent winner already frozen (exactly one winner;
+      losers get deterministic already-claimed). Verifies the consent
+      signature against the STORED prepared core. Freezes the immutable
+      acceptance record and moves the request to ACCEPTED_PENDING_CONFIRM.
+      This phase commits separately.
+
+   The frozen acceptance record core:
+     {record_type: "v5-handshake-acceptance",
+      protocol_version: 5,
+      request_id,
+      request_digest,              // SHA-256(canonical(request core)) —
+                                   // binds the acceptance to the EXACT
+                                   // request terms (P1-2 fix)
+      acceptance_id,
+      acceptor_pubkey,
+      request_version: 5,
+      pair_generation_at_accept,   // generation read at prepare-accept,
+                                   // frozen here
+      accepted_at,
+      prepare_id}
 
 4. Relay notifies Alice. Alice reviews the AUTHENTICATED acceptor identity
    (public key from the frozen acceptance record — not a display name) and
    explicitly confirms:
    Alice → Relay: POST /v1/handshakes/confirm
      {request_id, acceptance_id, confirmer_consent_sig}
-   The confirmer consent signature's preimage is defined exactly below.
+   The confirmer consent preimage is `"clack-hs-v5-confirm-v1" ||
+   acceptance_digest`, where `acceptance_digest` now transitively covers
+   `request_digest` (P1-2 fix): changing the request's relay fingerprint,
+   expiry, or requester key changes the confirm preimage.
+   Lookup consistency is enforced: `acceptance.request_id` must equal the
+   request selected by the confirm body, and the signer must equal that
+   request's frozen `requester_pubkey`.
    A body of {request_id} alone is NOT sufficient — the selected acceptor
    must not depend on mutable relay state at confirm time.
 
@@ -148,14 +202,36 @@ Two different signatures exist. They must not be confused:
 Canonical form: UTF-8 JSON, keys sorted lexicographically by byte,
 no whitespace, integers as plain numbers, byte strings as lowercase hex,
 UUIDs in canonical 8-4-4-4-12 form. Digests are SHA-256 over the canonical
-bytes, rendered lowercase hex.
+bytes, rendered lowercase hex. In consent preimages, `||` is byte
+concatenation and digests appear as their 64 lowercase ASCII hex bytes
+(raw 32-byte form is never used in preimages — one spelling only).
 
 ```
-request_digest   = SHA-256(canonical(request_record_core))
-acceptance_digest = SHA-256(canonical(acceptance_record_core))
+request_digest    = SHA-256(canonical(request_record_core))       // hex
+acceptance_digest = SHA-256(canonical(acceptance_record_core))    // hex
 ```
 
-**Request record core** (what the relay stores immutably at creation;
+**Canonical validation rules** (applied before any digest or signature
+is computed; violation → reject, never coerce):
+
+- Duplicate object keys: reject.
+- Floats where an integer field is expected: reject (1.0 ≠ 1).
+- Booleans where an integer field is expected: reject (true ≠ 1).
+- Integer ranges: `protocol_version`/`request_version` = 5;
+  `created_at`/`expires_at`/`accepted_at` within [1, 2^63-1] and
+  `expires_at` > `created_at`; `pair_generation_at_create` /
+  `pair_generation_at_accept` ≥ 0 or null (null only where the schema
+  allows); `expires_in` (prepare input) within [60, relay max].
+- UUIDs: version 4, canonical lowercase 8-4-4-4-12; any other form
+  rejected.
+- Ed25519 public keys: exactly 64 lowercase hex chars (32 bytes).
+- `relay_identity_fingerprint`: `sha256:` + 16 lowercase hex chars.
+- Strings: ASCII only; control characters, lone surrogates, and
+  non-canonical escaping rejected. `record_type` and `scope` must match
+  exactly (no case variants).
+- Unknown fields in any signed core: reject.
+
+**Request record core** (what the relay stores immutably at commit;
 `requester_consent_sig` is stored alongside, not inside the digest):
 
 ```
@@ -189,28 +265,37 @@ stored.
 {record_type: "v5-handshake-acceptance",
  protocol_version: 5,
  request_id: <uuid>,
+ request_digest: <hex>,            // SHA-256(canonical(request core)) —
+                                   // binds acceptance to EXACT request terms
  acceptance_id: <uuid>,
  acceptor_pubkey: <ed25519 hex>,
  request_version: 5,
- pair_generation_at_accept: <int>,   // read NOW, frozen
- accepted_at: <unix int>}
+ pair_generation_at_accept: <int>,   // read at prepare-accept, frozen
+ accepted_at: <unix int>,
+ prepare_id: <uuid>}
 ```
 
 **Accept consent preimage** (signed by the acceptor):
 
 ```
-"clack-hs-v5-accept-v1" || request_digest || SHA-256(canonical(acceptance_record_core))
+"clack-hs-v5-accept-v1" || request_digest || acceptance_digest
 ```
 
-Binding the `request_digest` inside the accept preimage ties the acceptance
-to the exact immutable request — the acceptor cannot be tricked into
-consenting to different terms than the requester created.
+The `request_digest` inside the acceptance core (hence inside
+`acceptance_digest`) ties the acceptance to the exact immutable request —
+the acceptor cannot be tricked into consenting to different terms than the
+requester created. Listing it explicitly in the preimage as well keeps
+each preimage self-describing.
 
 **Confirm consent preimage** (signed by the original requester):
 
 ```
 "clack-hs-v5-confirm-v1" || acceptance_digest
 ```
+
+Because `acceptance_digest` now transitively covers `request_digest`,
+changing the request's relay fingerprint, expiry, or requester key changes
+the confirm preimage (rev-3 finding fixed and demonstrated).
 
 The relay verifies the confirmer's signature against the requester's
 enrolled public key and the `acceptance_digest` it recomputed from the
@@ -227,19 +312,28 @@ later. Unknown fields in signed bodies are rejected.
 counter, bumped on every revoke. Capture rules:
 
 - Targeted request: the relay reads the current generation for
-  (requester, target) at creation and freezes it as
+  (requester, target) at prepare and freezes it as
   `pair_generation_at_create`. The requester's create consent signature
   covers it (via `request_digest`).
-- Open request: `pair_generation_at_create` is null. At accept time the
-  relay reads the current generation for the now-known pair and freezes it
-  as `pair_generation_at_accept`. The acceptor's accept consent signature
-  covers it.
+- Open request: `pair_generation_at_create` is null — the pair is unknown
+  at prepare, so NO claim is made about revokes between create and accept.
+  At prepare-accept the relay reads the current generation for the
+  now-known pair and freezes it as `pair_generation_at_accept`. The
+  acceptor's accept consent signature covers it.
+- **Explicit open-request revocation rule:** a revoke between open-request
+  create and accept does NOT invalidate the acceptance — the acceptor's
+  fresh consent at the new generation, followed by the requester's explicit
+  confirm of that acceptance (which shows the generation), IS new consent
+  and may establish the handshake. A revoke between accept and confirm
+  bumps the generation, so the atomic activation's comparison
+  (current == `pair_generation_at_accept`) fails deterministically.
+- For targeted requests, `pair_generation_at_accept` must equal
+  `pair_generation_at_create`; any revoke anywhere in the flow fails the
+  confirm.
 - At confirm, the atomic activation transaction compares the CURRENT
-  generation for the pair against the frozen value. Any revoke between
-  create→accept, accept→confirm, or racing confirm (including across
-  restart) bumps the generation, so the confirm fails deterministically.
-- A retry of a failed/terminal request reuses the frozen generation; it
-  can never rebind the request to a newer generation.
+  generation for the pair against the frozen value. A retry of a
+  failed/terminal request reuses the frozen generation; it can never
+  rebind the request to a newer generation.
 ```
 
 ### State model
@@ -300,14 +394,21 @@ status lookup) before sending traffic, not the cached `outcome`.
 
 **Idempotency key rules:**
 
-- Keys are scoped to (authenticated requester, canonical request digest).
-  Same key + same digest → return the original record.
+- The unique lookup is **(authenticated requester, idempotency_key)**.
+  The original normalized intent digest and the prepared record are stored
+  as VALUES under that key — the digest is never the lookup key, so a
+  changed digest cannot create a second index entry.
+- Same key + same digest → return the original prepare/record.
 - Same key + DIFFERENT digest (changed `to`, `expires_in`, scope) → `409
   conflict`. The client must use a new key for intentionally new content.
+- Generated IDs, timestamps, and generations always come from the retained
+  original record on retry — never freshly generated before comparison.
 - A new key always permits an intentional new request (subject to quotas).
-- Idempotency results and tombstones are retained for the same retention
-  window as messages (7 days default, relay-configured), then swept.
-  Retention and per-requester pending quotas are relay-configured and
+- Idempotency records are retained for the request's validity window plus
+  the allowed retry horizon (default 7 days, relay-configured), then
+  swept. Eviction must never silently resurrect old work: a swept key
+  behaves as a new key, and any live request state is authoritative.
+- Retention and per-requester pending quotas are relay-configured and
   advertised; exceeding quota returns `429` with a `retry_after` hint.
 
 ### Key properties
@@ -460,25 +561,42 @@ time.)
 
 ### API changes
 
+Creation and acceptance are prepare→sign→commit (P1-1). Pending
+preparations are NOT consent and are never REQUESTED state.
+
 ```
-POST /v1/handshakes/request
+POST /v1/handshakes/prepare-request
   Body: {to: <peer-name|null>, expires_in?: <seconds>,
-         idempotency_key: <uuid>,
+         idempotency_key: <uuid>}
+  # Idempotency: (requester, idempotency_key) already prepared or
+  # committed → return the existing prepare/record.
+  # Targeted requests resolve `to` to the enrolled public key NOW.
+  # Generation read NOW (null for open).
+  Returns: {prepare_id: <uuid>,
+            prepared_core: {<exact immutable unsigned request core>},
+            prepare_expires_at: <unix int>}     // 5-min TTL
+  # The client signs canonical(prepared_core) — every byte seen.
+
+POST /v1/handshakes/request
+  Body: {prepare_id: <uuid>,
          requester_consent_sig: <ed25519 hex>}
-  # Consent preimage: "clack-hs-v5-request-v1" || request_digest.
-  # The relay recomputes request_digest from the record it persisted
-  # (including the generation IT read) and verifies the signature.
+  # Consent preimage: "clack-hs-v5-request-v1" || request_digest,
+  # where request_digest = SHA-256(canonical(STORED prepared_core)).
+  # Server compare-and-swap: prepare valid/owned/unexpired/unused;
+  # target key and generation re-read and compared — any change →
+  # 409, never silent field alteration; signature verified against
+  # the STORED core, never client-supplied bytes.
   Returns: {request_id, link, expires_at}
-  # Targeted requests resolve `to` to the enrolled public key NOW and
-  # freeze it in the immutable record. Never silently re-resolve a
-  # targeted name to a different key later.
 
 GET /v1/handshakes/requests/{id}/view   (invitation view, pre-accept)
-  Returns (minimal, authenticated):
+  Returns (full request core, authenticated):
     {request_id, protocol_version,
      requester_pubkey,            // authenticated key, never display name
+     relay_identity_fingerprint,
      target_pubkey,               // null for open requests
+     pair_generation_at_create,   // null for open requests
      scope, created_at, expires_at,
+     idempotency_key,
      state}                       // REQUESTED only; terminal states give
                                   // the terminal name and nothing else
   Authorization:
@@ -489,13 +607,24 @@ GET /v1/handshakes/requests/{id}/view   (invitation view, pre-accept)
     - Never exposes other pending acceptors, claimant counts, or
       unrelated request metadata.
 
+POST /v1/handshakes/prepare-accept
+  Body: {request_id: <uuid>}
+  # Request must be REQUESTED and unexpired. Targeted: caller must match
+  # target_pubkey (else 404). Server reads CURRENT pair generation and
+  # computes request_digest = SHA-256(canonical(request core)).
+  Returns: {prepare_id: <uuid>,
+            prepared_acceptance_core: {<exact unsigned acceptance core,
+                                       incl. request_digest>},
+            prepare_expires_at: <unix int>}
+
 POST /v1/handshakes/accept-request
-  Body: {request_id,
-         acceptor_pubkey, request_version, accepted_at,
-         pair_generation_at_accept,
+  Body: {prepare_id: <uuid>,
          acceptor_consent_sig: <ed25519 hex>}
   # Consent preimage: "clack-hs-v5-accept-v1" || request_digest ||
-  #                   SHA-256(canonical(acceptance_record_core)).
+  #                   acceptance_digest (64-hex ASCII each).
+  # Server compare-and-swap: prepare valid/owned/unexpired; request still
+  # REQUESTED; deadline unpassed; generation unchanged; exactly one
+  # winner (losers → deterministic already-claimed).
   Returns: {status: "pending-confirmation",
             acceptance_id, request_id, expires_at}
 
@@ -520,6 +649,137 @@ GET  /v1/handshakes/requests/pending
 
 All endpoints require existing signed authentication. Requester and
 acceptor must already be enrolled peers.
+
+### Worked transcripts (fixed synthetic vectors)
+
+All keys/IDs below are synthetic. Canonical bytes use the rules above
+(sorted keys, no whitespace). Digests are SHA-256, lowercase hex.
+
+**Transcript 1 — targeted create: prepare → sign → commit.**
+
+Alice prepares:
+
+```
+→ POST /v1/handshakes/prepare-request
+  {"to": "bob", "expires_in": 86400,
+   "idempotency_key": "33333333-3333-4333-8333-333333333333"}
+← 200
+  {"prepare_id": "22222222-2222-4222-8222-222222222222",
+   "prepared_core":
+     {"created_at":1780000000,"expires_at":1780086400,
+      "idempotency_key":"33333333-3333-4333-8333-333333333333",
+      "pair_generation_at_create":3,
+      "prepare_id":"22222222-2222-4222-8222-222222222222",
+      "protocol_version":5,
+      "record_type":"v5-handshake-request",
+      "relay_identity_fingerprint":"sha256:92b1401c584b74d0",
+      "request_id":"11111111-1111-4111-8111-111111111111",
+      "requester_pubkey":"aa…aa",
+      "scope":"pairing",
+      "target_pubkey":"bb…bb"},
+   "prepare_expires_at": 1780000300}
+```
+
+Alice computes `request_digest =
+SHA-256(canonical(prepared_core))` =
+`104eb7ab046a10a5a964d9731bf9d7f85c1fff11c8945a8cc76a3fb5bbf26b2f`,
+signs preimage
+`clack-hs-v5-request-v1` || `104eb7ab…f26b2f` with her private key,
+then commits:
+
+```
+→ POST /v1/handshakes/request
+  {"prepare_id": "22222222-2222-4222-8222-222222222222",
+   "requester_consent_sig": "<ed25519 hex>"}
+← 200 {"request_id": "11111111-1111-4111-8111-111111111111",
+       "link": "https://<relay>/v1/invites/<token>?r=https://<relay>&req=11111111-1111-4111-8111-111111111111",
+       "expires_at": 1780086400}
+```
+
+Relay-side compare-and-swap at commit: prepare valid/owned/unexpired;
+target `bb…bb` still resolves to the same enrolled key; pair generation
+for (Alice, Bob) still 3; signature verifies against the STORED
+prepared core. Any drift → 409, Alice re-prepares.
+
+**Transcript 2 — accept: prepare → sign → commit, with request-digest
+binding.**
+
+Bob fetches the invitation view (full core, verifies it matches what
+Alice showed him out-of-band), then prepares:
+
+```
+→ POST /v1/handshakes/prepare-accept
+  {"request_id": "11111111-1111-4111-8111-111111111111"}
+← 200
+  {"prepare_id": "55555555-5555-4555-8555-555555555555",
+   "prepared_acceptance_core":
+     {"acceptance_id":"44444444-4444-4334-8444-444444444444",
+      "accepted_at":1780000100,
+      "acceptor_pubkey":"bb…bb",
+      "pair_generation_at_accept":3,
+      "prepare_id":"55555555-5555-4555-8555-555555555555",
+      "protocol_version":5,
+      "record_type":"v5-handshake-acceptance",
+      "request_digest":"104eb7ab046a10a5a964d9731bf9d7f85c1fff11c8945a8cc76a3fb5bbf26b2f",
+      "request_id":"11111111-1111-4111-8111-111111111111",
+      "request_version":5},
+   "prepare_expires_at": 1780000400}
+```
+
+Bob signs preimage
+`clack-hs-v5-accept-v1` || `104eb7ab…f26b2f` || `171bcd65…042d2e`
+(`acceptance_digest =
+SHA-256(canonical(prepared_acceptance_core))`), then commits:
+
+```
+→ POST /v1/handshakes/accept-request
+  {"prepare_id": "55555555-5555-4555-8555-555555555555",
+   "acceptor_consent_sig": "<ed25519 hex>"}
+← 200 {"status": "pending-confirmation",
+       "acceptance_id": "44444444-4444-4334-8444-444444444444",
+       "request_id": "11111111-1111-4111-8111-111111111111",
+       "expires_at": 1780086400}
+```
+
+**Transcript 3 — confirm binds the request terms (P1-2 fixed).**
+
+Alice reviews the frozen acceptance (acceptor key `bb…bb`, generation 3)
+and signs preimage
+`clack-hs-v5-confirm-v1` || `171bcd65…042d2e`:
+
+```
+→ POST /v1/handshakes/confirm
+  {"request_id": "11111111-1111-4111-8111-111111111111",
+   "acceptance_id": "44444444-4444-4334-8444-444444444444",
+   "confirmer_consent_sig": "<ed25519 hex>"}
+← 200 {"outcome": "active",
+       "handshake_id": "aa…aa|bb…bb|3",
+       "current_state": "active", "current_generation": 3}
+```
+
+Binding check (verified offline): changing the request's
+`relay_identity_fingerprint`, `expires_at`, or `requester_pubkey` changes
+`request_digest` → changes `acceptance_digest` → changes BOTH the accept
+and confirm preimages. The rev-3 gap (confirm unchanged) is closed.
+
+**Transcript 4 — open request, revoke BEFORE accept (P2-3 rule).**
+
+1. Alice creates an open request (`target_pubkey: null`,
+   `pair_generation_at_create: null`), shares the link publicly.
+2. Alice and Mallory's OLD handshake is revoked → pair generation for
+   (Alice, Mallory) bumps 3 → 4.
+3. Mallory opens the link and prepares accept. The relay reads the CURRENT
+   generation (4) and freezes `pair_generation_at_accept: 4` in her
+   prepared acceptance core. Mallory signs it — fresh consent at
+   generation 4.
+4. Alice is notified: acceptor `mm…mm`, generation 4. She confirms
+   explicitly. Activation compares current (4) == frozen (4) → ACTIVE.
+   This is legitimate: both parties consented with full knowledge of the
+   post-revoke generation.
+5. Contrast — revoke AFTER accept: same setup, but the revoke lands after
+   Mallory's acceptance is frozen at generation 3 and before Alice
+   confirms. Activation compares current (4) ≠ frozen (3) → confirm FAILS
+   deterministically. Alice must wait for a fresh accept at generation 4.
 
 ### Migration path
 
@@ -586,6 +846,26 @@ Isolated executable tests must demonstrate, adversarially:
 13. Invitation-view access: requester, targeted recipient, and eligible
     open claimants can view; unrelated peers get 404; no claimant
     enumeration.
+14. Prepare/commit integrity: a client cannot sign without the prepare
+    step — commit with a `prepare_id` whose stored core was altered (or a
+    forged `prepare_id`) fails; revoke/expiry/key-change between prepare
+    and commit yields 409 and never commits altered fields under the old
+    signature. Prepare responses are quota-bounded and expire in 5 min.
+15. Confirm binding (P1-2 regression): mutating the request's relay
+    fingerprint, expiry, or requester key changes the confirm preimage;
+    `acceptance.request_id` must equal the confirm body's request and the
+    signer must equal the frozen `requester_pubkey`.
+16. Open-request revocation rule (P2-3): revoke-before-accept trace
+    establishes the handshake at the NEW generation with both parties'
+    explicit consent; revoke-after-accept fails the confirm
+    deterministically. Both cases tested separately.
+17. Idempotency lookup (P2-4): same `(requester, idempotency_key)` with
+    changed content → 409 without creating a second index entry; retries
+    reuse the retained original record's IDs/timestamps/generation.
+18. Canonical validation (P2-5): duplicate keys, floats/bools for integer
+    fields, bad UUID forms, wrong key lengths, and non-ASCII are rejected
+    before digest computation; fixed vectors from the worked transcripts
+    verify byte-for-byte.
 
 ## Review history
 
@@ -595,15 +875,29 @@ Isolated executable tests must demonstrate, adversarially:
   (signed API shapes vs security claims; pair-generation capture fields)
   and 2 P2 (retry-after-terminal semantics; pre-accept read path and
   transaction wording) remain, plus gate extensions.
-- **Rev 3** (this document): exact canonical encodings, digests, and
+- **Rev 3** (859ac41): exact canonical encodings, digests, and
   consent-signature preimages; transport vs consent signature distinction;
   explicit `pair_generation_at_create` / `pair_generation_at_accept`
   persisted fields with capture rules; retry responses carry both outcome
   and current terminal state; idempotency-key conflict semantics;
   invitation-view endpoint with authorization rules; per-phase commit
-  wording (only activation is atomic). Awaiting kin re-review.
-  No implementation authorized.
+  wording (only activation is atomic). Reviewed by Flint: NOT ready —
+  2 P1 (clients cannot construct the required signatures through the API;
+  confirm does not bind request terms), 3 P2 (open-request revocation
+  rule; idempotency lookup key; canonical validation + fixed vectors).
+- **Rev 4** (this document): prepare→sign→commit for create and accept so
+  every signer receives every byte before signing (server verifies against
+  STORED prepared cores; compare-and-swap on target key/generation/expiry
+  between prepare and commit, 409 on drift); `request_digest` added to the
+  acceptance core so confirm binds the exact request terms; explicit
+  open-request revocation rule (revoke-before-accept = fresh consent at
+  new generation, revoke-after-accept = deterministic confirm failure);
+  idempotency lookup keyed by (requester, idempotency_key) with digest as
+  value; exact canonical validation rules; worked transcripts with fixed
+  synthetic vectors including the open-request revoke traces. Awaiting kin
+  re-review. No implementation authorized.
 
 ## Status
 
-DRAFT rev 2 — not implemented. Awaiting kin re-review (Zari, Sigrid).
+DRAFT rev 4 — not implemented. Revised per Flint's rev-3 review (2 P1,
+3 P2, gate extensions). Awaiting kin re-review.
