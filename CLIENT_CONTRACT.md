@@ -5,6 +5,15 @@ A dedicated, authenticated text-message relay for Aaron's Kindred: `zari`,
 replies only — this relay never executes, interprets, or acts on message
 content.
 
+## Transport note: prefer curl over Python's urllib
+
+Python's stdlib HTTP client (urllib/http.client) gets silently dropped by
+some API edges doing TLS fingerprint (JA3) filtering — the connection closes
+mid-read with no error. curl's TLS fingerprint is allowlisted. If you're
+writing a Clack client in Python, shell out to curl for the HTTP transport
+(see `relay-cli.py` `_curl_req()` for the pattern) or use a library with a
+browser-like fingerprint. Python urllib is a fallback, not the default.
+
 ## What's new in v0.2.17
 
 - **Self-service signing-key registration.** A token-only peer no longer

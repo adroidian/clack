@@ -12,7 +12,9 @@ Interface matches PinnedClient so runner.py needs only an import change.
 import base64
 import hashlib
 import json
+import os
 import secrets
+import sys
 import urllib.parse
 import urllib.request
 
@@ -198,10 +200,72 @@ class SignedClient:
             "X-Clack-Sig": _sign_seed(self.seed, canon).hex(),
         }
 
+    def _curl_request(self, path, body):
+        """Execute via curl subprocess (primary transport).
+
+        curl's TLS fingerprint is allowlisted by edges that filter Python's
+        urllib JA3. Falls back to urllib on failure.
+        """
+        import subprocess
+        import tempfile
+        import os
+
+        raw = None if body is None else json.dumps(body).encode()
+        method = "POST" if raw is not None else "GET"
+        headers = {
+            "Authorization": "Bearer " + self.token,
+            "Content-Type": "application/json",
+        }
+        headers.update(self._sign_headers(method, path, raw))
+
+        url = self.origin + path
+        cmd = ["curl", "-s", "-m", "35", "-X", method, url, "-D", "-", "-o", "-"]
+        for k, v in headers.items():
+            cmd += ["-H", "%s: %s" % (k, v)]
+        body_file = None
+        if raw is not None:
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
+                f.write(raw)
+                body_file = f.name
+            cmd += ["--data-binary", "@" + body_file]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=45)
+            if body_file:
+                os.unlink(body_file)
+            if result.returncode != 0:
+                raise ConnectionError("curl failed")
+            output = result.stdout
+            parts = output.split(b"\r\n\r\n", 1)
+            if len(parts) != 2:
+                parts = output.split(b"\n\n", 1)
+            if len(parts) != 2:
+                raise ValueError("curl output missing header/body separator")
+            header_text, data = parts
+            status_line = header_text.split(b"\n")[0].decode()
+            status = int(status_line.split()[1])
+            if 300 <= status < 400:
+                raise ValueError("refusing redirect: HTTP %d" % status)
+            if len(data) > MAX_RESPONSE:
+                raise ValueError("response too large")
+            return json.loads(data) if data.strip() else {}
+        except Exception:
+            if body_file and os.path.exists(body_file):
+                os.unlink(body_file)
+            raise
+
     def request(self, path, body=None):
         if path not in ("/v1/poll?timeout=25", "/v1/ack", "/v1/send",
                         "/v1/peers", "/v1/handshakes/mint-link"):
             raise ValueError("unsupported operation: " + path)
+        # Primary: curl. Fallback: Python urllib.
+        use_curl = os.environ.get("CLACK_USE_CURL", "1") == "1"
+        if use_curl:
+            try:
+                return self._curl_request(path, body)
+            except Exception as e:
+                print("curl transport failed (%s), falling back to Python"
+                      % type(e).__name__, file=sys.stderr)
+        # Fallback: urllib
         raw = None if body is None else json.dumps(body).encode()
         method = "POST" if raw is not None else "GET"
         headers = {
