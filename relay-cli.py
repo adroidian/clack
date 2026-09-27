@@ -38,6 +38,7 @@ Never print a token or private key.
 import argparse
 import base64
 import datetime
+import http.client
 import json
 import os
 import sys
@@ -632,6 +633,67 @@ def _ensure_origin_verified(origin, cfg):
     return "tofu"
 
 
+def _curl_req(cfg, method, url, headers, data, timeout):
+    """Execute an HTTP request via curl subprocess.
+
+    curl's TLS fingerprint is allowlisted by edges that filter Python's
+    urllib JA3 (Cloudflare, TypeSafe, etc.). This is the primary transport;
+    Python urllib is the fallback.
+    """
+    import subprocess
+    import tempfile
+    import os
+
+    cmd = ["curl", "-s", "-m", str(timeout), "-X", method, url]
+    # Response headers + body separated
+    cmd += ["-D", "-", "-o", "-"]
+    # Don't use proxy for localhost
+    # (curl respects NO_PROXY env var automatically)
+    for k, v in headers.items():
+        cmd += ["-H", "%s: %s" % (k, v)]
+    if data is not None:
+        # Write body to temp file to avoid shell quoting issues
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
+            f.write(data)
+            body_file = f.name
+        cmd += ["--data-binary", "@" + body_file]
+    else:
+        body_file = None
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
+        if body_file:
+            os.unlink(body_file)
+        if result.returncode != 0:
+            raise ConnectionError("curl failed: %s" % result.stderr.decode()[:200])
+        # Parse: headers, blank line, body
+        output = result.stdout
+        # Find the last header block (curl -D - prints headers for each redirect;
+        # we don't follow redirects, so there's one block)
+        parts = output.split(b"\r\n\r\n", 1)
+        if len(parts) != 2:
+            parts = output.split(b"\n\n", 1)
+        if len(parts) != 2:
+            raise ValueError("curl output missing header/body separator")
+        header_text, body = parts
+        # Parse status from first line: HTTP/1.1 200 OK
+        status_line = header_text.split(b"\n")[0].decode()
+        status = int(status_line.split()[1])
+        # Refuse redirects (same policy as Python transport)
+        if 300 <= status < 400:
+            print("refusing redirect from relay: HTTP %d" % status, file=sys.stderr)
+            sys.exit(1)
+        try:
+            payload = json.loads(body.decode("utf-8")) if body.strip() else {}
+        except Exception:
+            payload = {"error": "http_%d" % status} if status >= 400 else {}
+        return status, payload
+    except Exception:
+        if body_file and os.path.exists(body_file):
+            os.unlink(body_file)
+        raise
+
+
 def req(cfg, method, path, body=None, base=None):
     origin = (base or base_url(cfg)).rstrip("/")
     token = auth_token(cfg)
@@ -646,30 +708,63 @@ def req(cfg, method, path, body=None, base=None):
         sys.exit(1)
     url = origin + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    r = urllib.request.Request(url, data=data, method=method)
+    headers = {}
     if token:
-        r.add_header("Authorization", "Bearer " + token)
-    r.add_header("User-Agent", user_agent(cfg))
-    for k, v in sign_headers(cfg, method, path, data).items():
-        r.add_header(k, v)
+        headers["Authorization"] = "Bearer " + token
+    headers["User-Agent"] = user_agent(cfg)
+    headers.update(sign_headers(cfg, method, path, data))
     if data is not None:
-        r.add_header("Content-Type", "application/json")
-    try:
-        with _open(r, timeout=130) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if 300 <= e.code < 400:
-            # _NoRedirect raises for 3xx: never treat as a normal response.
-            loc = e.headers.get("Location") if e.headers else None
-            print("refusing redirect from relay: HTTP %d%s"
-                  % (e.code, (" -> " + loc) if loc else ""),
-                  file=sys.stderr)
-            sys.exit(1)
+        headers["Content-Type"] = "application/json"
+
+    # Primary transport: curl (TLS fingerprint allowlisted by edges).
+    # Fallback: Python urllib (for environments without curl).
+    # Controlled by CLACK_USE_CURL env (default: 1). Set to 0 to force Python.
+    use_curl = os.environ.get("CLACK_USE_CURL", "1") == "1"
+    if use_curl:
         try:
-            payload = json.loads(e.read().decode("utf-8"))
-        except Exception:
-            payload = {"error": "http_%d" % e.code}
-        return e.code, payload
+            return _curl_req(cfg, method, url, headers, data, timeout=130)
+        except Exception as e:
+            print("curl transport failed (%s), falling back to Python"
+                  % type(e).__name__, file=sys.stderr)
+
+    # Fallback: Python urllib with retry
+    r = urllib.request.Request(url, data=data, method=method)
+    for k, v in headers.items():
+        r.add_header(k, v)
+    # Retry on transient connection drops. The relay/Cloudflare occasionally
+    # drops mid-read (IncompleteRead) or closes without response
+    # (RemoteDisconnected) after processing. For idempotent GETs, retry is safe.
+    # For POSTs, the caller must use stable IDs (relay dedupes on id+sender).
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with _open(r, timeout=130) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                # _NoRedirect raises for 3xx: never treat as a normal response.
+                loc = e.headers.get("Location") if e.headers else None
+                print("refusing redirect from relay: HTTP %d%s"
+                      % (e.code, (" -> " + loc) if loc else ""),
+                      file=sys.stderr)
+                sys.exit(1)
+            try:
+                payload = json.loads(e.read().decode("utf-8"))
+            except Exception:
+                payload = {"error": "http_%d" % e.code}
+            return e.code, payload
+        except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                ConnectionError, TimeoutError) as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(1 + attempt)
+                # Rebuild the request: urllib Request objects are single-use
+                # after a failed open on some Python versions.
+                r = urllib.request.Request(url, data=data, method=method)
+                for k, v in headers.items():
+                    r.add_header(k, v)
+                continue
+            raise
 
 
 # --- Relay identity (TOFU, v0.2.10) -------------------------------------------
@@ -741,13 +836,27 @@ def fetch_relay_identity(relay_url, cfg=None):
     nonce = os.urandom(32).hex()
     id_req = urllib.request.Request(relay_url + "/v1/identity?nonce=" + nonce)
     id_req.add_header("User-Agent", user_agent(cfg or {}))
-    try:
-        with _open(id_req, timeout=30) as resp:
-            ident = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 503:
-            return None, None
-        raise
+    # Retry on transient connection drops (IncompleteRead, RemoteDisconnected).
+    # The relay/Cloudflare occasionally drops mid-read; the identity itself
+    # is stable, so retrying the fetch is safe.
+    last_exc = None
+    for attempt in range(3):
+        try:
+            with _open(id_req, timeout=30) as resp:
+                ident = json.loads(resp.read().decode("utf-8"))
+            last_exc = None
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 503:
+                return None, None
+            raise
+        except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                ConnectionError, TimeoutError) as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(1 + attempt)
+                continue
+            raise
     if not isinstance(ident, dict):
         raise ValueError("relay identity response is not a JSON object")
     if ident.get("nonce") != nonce:
