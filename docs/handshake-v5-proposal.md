@@ -1,8 +1,9 @@
 # Clack Handshake v5: Request-Based Pairing
 
-**Status:** DRAFT rev 5 — not implemented. Revised per Flint's rev-4 review
-(2 P1, 2 P2, gate extensions). Awaiting kin re-review. No relay
-implementation authorized until the revised design clears kin review.
+**Status:** DRAFT rev 6 — not implemented. Revised per Flint's rev-5 review
+(2 P2, gate extensions). Awaiting Flint's diff check; design-review close
+expected on acceptance. No relay implementation authorized until the
+revised design clears kin review.
 
 ## Problem
 
@@ -91,12 +92,14 @@ Opening a v5 link **never auto-accepts**. It opens a pending request the user
       received (consent preimage below) — she has now seen every byte.
    c. Alice → Relay: POST /v1/handshakes/request
         {prepare_id, requester_consent_sig}
-      Relay (compare-and-swap against CURRENT state):
+      Relay — for a NEW commit (already-committed retries take precedence;
+      see "Commit retry precedence"):
         - `prepare_id` exists, is unexpired, belongs to Alice, unused.
         - Re-resolves the target key and re-reads the pair generation:
           any change since prepare (key rotation, revoke bumping the
           generation, expiry passing) → fail with 409, NEVER silently
-          alter fields under her old signature. Alice must re-prepare.
+          alter fields under her old signature. Alice must re-prepare
+          (see "Create preparation replacement" for the same-key rule).
         - Verifies `requester_consent_sig` against the STORED prepared
           core (not client-supplied bytes).
         - Idempotency: (Alice, idempotency_key) already committed → return
@@ -136,13 +139,14 @@ Opening a v5 link **never auto-accepts**. It opens a pending request the user
    b. Bob signs the canonical acceptance core (preimage below).
    c. Bob → Relay: POST /v1/handshakes/accept-request
         {prepare_id, acceptor_consent_sig}
-      Relay compare-and-swap: prepare valid and owned by Bob; request
-      still REQUESTED; deadline unpassed; generation unchanged since
-      prepare; no concurrent winner already frozen (exactly one winner;
-      losers get deterministic already-claimed). Verifies the consent
-      signature against the STORED prepared core. Freezes the immutable
-      acceptance record and moves the request to ACCEPTED_PENDING_CONFIRM.
-      This phase commits separately.
+      Relay — for a NEW commit (already-committed retries take precedence;
+      see "Commit retry precedence"): prepare valid and owned by Bob;
+      request still REQUESTED; deadline unpassed; generation unchanged
+      since prepare; no concurrent winner already frozen (exactly one
+      winner; losers get deterministic already-claimed). Verifies the
+      consent signature against the STORED prepared core. Freezes the
+      immutable acceptance record and moves the request to
+      ACCEPTED_PENDING_CONFIRM. This phase commits separately.
 
    The frozen acceptance record core:
      {record_type: "v5-handshake-acceptance",
@@ -254,19 +258,6 @@ every response, view, and vector uses this exact object:
  idempotency_key: <uuid>,
  prepare_id: <uuid>}                        // the preparation this
                                             // consent was given for
-
-```
-{record_type: "v5-handshake-request",
- protocol_version: 5,
- request_id: <uuid>,
- requester_pubkey: <ed25519 hex>,
- relay_identity_fingerprint: <"sha256:..." pinned relay identity>,
- target_pubkey: <ed25519 hex | null>,
- pair_generation_at_create: <int | null>,   // null only for open requests
- scope: "pairing",
- created_at: <unix int>,
- expires_at: <unix int>,
- idempotency_key: <uuid>}
 ```
 
 **Create consent preimage** (signed by the requester at creation):
@@ -455,17 +446,24 @@ status lookup) before sending traffic, not the cached `outcome`.
 
 ### Targeted vs. open requests
 
+Creation is always prepare→sign→commit (see Flow). The `to` field is
+supplied at **prepare** time, with an idempotency key:
+
 ```
-POST /v1/handshakes/request {
-  "to": "bob"          // targeted (DEFAULT): only Bob's enrolled public
-                       // key can accept. Recommended for v1.
+POST /v1/handshakes/prepare-request {
+  "to": "bob",           // targeted (DEFAULT): only Bob's enrolled public
+                         // key can accept. Recommended for v1.
+  "expires_in": 86400,
+  "idempotency_key": "<uuid>"
 }
 // or
-POST /v1/handshakes/request {
-  "to": null           // open: any enrolled peer can accept.
-                       // Explicitly one-use: the first accepted claim
-                       // freezes the single winner; the link cannot be
-                       // re-claimed or have its acceptance mutated.
+POST /v1/handshakes/prepare-request {
+  "to": null,            // open: any enrolled peer can accept.
+                         // Explicitly one-use: the first accepted claim
+                         // freezes the single winner; the link cannot be
+                         // re-claimed or have its acceptance mutated.
+  "expires_in": 86400,
+  "idempotency_key": "<uuid>"
 }
 ```
 
@@ -589,8 +587,13 @@ preparations are NOT consent and are never REQUESTED state.
 POST /v1/handshakes/prepare-request
   Body: {to: <peer-name|null>, expires_in?: <seconds>,
          idempotency_key: <uuid>}
-  # Idempotency: (requester, idempotency_key) already prepared or
-  # committed → return the existing prepare/record.
+  # Idempotency: (requester, idempotency_key) already committed → return
+  # the committed record. Already prepared and LIVE → return the existing
+  # prepare. Prepared but EXPIRED/CAS-failed and uncommitted → same-key
+  # REPLACEMENT (see "Create preparation replacement"): new prepare_id
+  # and core, atomic mapping update, old preparation invalidated.
+  # The normalized intent digest is compared before returning anything
+  # retained: changed TTL or target → 409.
   # Targeted requests resolve `to` to the enrolled public key NOW.
   # Generation read NOW (null for open).
   Returns: {prepare_id: <uuid>,
@@ -603,10 +606,13 @@ POST /v1/handshakes/request
          requester_consent_sig: <ed25519 hex>}
   # Consent preimage: "clack-hs-v5-request-v1" || request_digest,
   # where request_digest = SHA-256(canonical(STORED prepared_core)).
-  # Server compare-and-swap: prepare valid/owned/unexpired/unused;
-  # target key and generation re-read and compared — any change →
-  # 409, never silent field alteration; signature verified against
-  # the STORED core, never client-supplied bytes.
+  # Precedence: consumed-prepare → result map is consulted BEFORE the
+  # checks below (see "Commit retry precedence") — a lost success
+  # response retried after prepare expiry returns the saved result.
+  # For NEW commits: prepare valid/owned/unexpired/unused; target key
+  # and generation re-read and compared — any change → 409, never
+  # silent field alteration; signature verified against the STORED
+  # core, never client-supplied bytes.
   Returns: {request_id, link, expires_at}
 
 GET /v1/handshakes/requests/{id}/view   (invitation view, pre-accept)
@@ -727,12 +733,69 @@ retry, no quota consumed twice. An expired or CAS-failed uncommitted
 preparation is REPLACED: new `prepare_id`, new core bytes, requiring a
 new consent signature (the old signature cannot be reused). A re-prepare
 never revives a terminal request — if the request left REQUESTED, the
-prepare fails. The normalized create-intent digest is
-`SHA-256(canonical({target_pubkey, scope, expires_at_effective}))` where
-`target_pubkey` is the alias-resolved enrolled key (or null) and
-`expires_at_effective` is the absolute deadline after applying the
-default (86400s) — so identical retries with omitted/defaulted fields
-are judged consistently, and any semantic change → 409.
+prepare fails. The normalized create-intent digest is defined in
+"Normalized create intent" below — so identical retries with
+omitted/defaulted fields are judged consistently, and any semantic
+change → 409.
+
+### Normalized create intent
+
+`prepare-request` normalizes the client's `{to, expires_in?}` before any
+retention comparison:
+
+- `target_pubkey` = the alias-resolved enrolled public key for `to`
+  (or null for open requests). Alias resolution is part of the intent:
+  two different aliases resolving to the same key are the same intent.
+- `ttl_normalized` = `expires_in` if supplied, else the relay default
+  (86400s). The TTL — not an absolute timestamp — is part of the intent.
+- `created_at_anchor` = `created_at` of the FIRST preparation under
+  this (requester, idempotency_key). Retained, never recomputed.
+- `normalized_intent_digest` =
+  `SHA-256(canonical({target_pubkey, scope, ttl_normalized}))`.
+  Absolute timestamps are excluded so that a retry issued at a different
+  wall clock with the same semantic intent produces the same digest.
+- `expires_at_effective` = `created_at_anchor + ttl_normalized`.
+  Computed from the RETAINED initial time anchor plus the normalized
+  TTL — never from retry wall clock.
+
+Same-key retry behavior: the relay recomputes the digest from the NEW
+request's normalized fields and compares it to the retained digest
+BEFORE returning anything retained. A changed TTL or a changed target
+(alias or resolved key) → 409 Conflict, even if a retained prepare or
+record exists. Identical default-TTL retries match and return the
+retained result.
+
+### Create preparation replacement
+
+Specified outcome for an uncommitted expired or CAS-failed create
+preparation: **same-key replacement** (not a terminal error).
+
+1. The (requester, idempotency_key) mapping still points at an
+   UNCOMMITTED preparation whose TTL has expired, or whose stored
+   target/generation no longer matches current state (CAS drift).
+2. The relay creates a fresh preparation in ONE atomic transaction:
+   new `prepare_id`, new core bytes with `created_at` = replacement
+   time, `pair_generation_at_create` and target re-read from CURRENT
+   state, and `expires_at` = the RETAINED `expires_at_effective`
+   (created_at_anchor + ttl_normalized) — the deadline is NOT renewed
+   by replacement. The key→prepare mapping is updated atomically and
+   the old `prepare_id` is invalidated, so concurrent replacements
+   cannot both commit: exactly one winner, the loser receives the
+   winner's prepare (or a deterministic conflict).
+3. The replacement requires a FRESH consent signature — the old
+   signature covered different core bytes and is unusable.
+4. If the retained `expires_at_effective` has already passed → 410
+   Gone. A new logical request (new idempotency key, new anchor) is
+   required to extend the deadline. Repeated replacement can therefore
+   never silently renew a request's lifetime.
+5. NEVER replace a committed operation: if (requester,
+   idempotency_key) maps to a committed REQUESTED record, the record
+   is returned as-is; the same-key path is idempotent success, not
+   replacement.
+
+This closes the gap where an expired-unused preparation's key kept
+returning an unusable core: the same operation recovers with the same
+key, a fresh signature, and the original deadline.
 
 ### Worked transcripts (machine-readable vectors)
 
@@ -1004,7 +1067,15 @@ Isolated executable tests must demonstrate, adversarially:
     expired/CAS-failed preparations are replaced with a new prepare_id
     requiring a new signature; re-prepare never revives a terminal
     request.
-21. Machine-readable vectors: the worked transcripts' literal cores,
+21. Create preparation replacement: an uncommitted expired/CAS-failed
+    create preparation is replaced same-key with a new prepare_id and
+    fresh signature, atomically, retaining the original absolute
+    deadline (never renewed; 410 Gone if passed); committed operations
+    are never replaced. Normalized intent digest uses
+    `{target_pubkey, scope, ttl_normalized}`; `expires_at_effective` =
+    retained `created_at_anchor + ttl_normalized`; changed TTL/target
+    → 409 before any retained result is returned.
+22. Machine-readable vectors: the worked transcripts' literal cores,
     preimages, and Ed25519 signatures verify independently from the
     document bytes alone; the sample link uses the declared
     `/join#v=5&r=<base64url>&req=<uuid>` format.
@@ -1035,20 +1106,33 @@ Isolated executable tests must demonstrate, adversarially:
   schema with prepare_id signed; commit-retry precedence over preparation
   checks), 2 P2 (prepare-accept retry identity; machine-readable vectors
   with real signatures + correct link format).
-- **Rev 5** (this document): ONE request-core schema — `prepare_id` is
-  signed and present in every response, view, and vector; invitation view
-  and owner status lookup return the literal `request_core` /
-  `acceptance_core` objects with state outside; explicit commit-retry
-  precedence (consumed-prepare → result map consulted before TTL/phase
-  checks, persisted for the full retry horizon); prepare-accept takes an
-  acceptor idempotency key with same-actor retry and replacement rules;
-  normalized create-intent digest defined precisely; worked transcripts
-  rebuilt as machine-readable vectors with real Ed25519 signatures
-  (independently verifiable from the document bytes) and the declared
-  `/join#v=5&r=<base64url>&req=<uuid>` link format. Awaiting kin
-  re-review. No implementation authorized.
+- **Rev 5** (a597974): ONE request-core schema — `prepare_id` signed and
+  present in every response, view, and vector; invitation view and owner
+  status lookup return literal `request_core` / `acceptance_core` objects
+  with state outside; explicit commit-retry precedence (consumed-prepare
+  → result map consulted before TTL/phase checks, persisted for the full
+  retry horizon); prepare-accept takes an acceptor idempotency key with
+  same-actor retry and replacement rules; normalized create-intent
+  digest defined; worked transcripts rebuilt as machine-readable vectors
+  with real Ed25519 signatures (all three independently verified by
+  Flint) and the declared `/join#v=5&r=<base64url>&req=<uuid>` link
+  format. Reviewed by Flint: signatures verify, all architectural
+  findings closed — 2 bounded P2 corrections before design-review close.
+- **Rev 6** (this document): removed the obsolete second request schema
+  (exactly one request-core object now); Targeted/Open examples call
+  `prepare-request` with an idempotency key; flow/API commit
+  preconditions marked as NEW-commits-only with pointers to the
+  authoritative retry-precedence section; specified same-key replacement
+  for expired/CAS-failed CREATE preparations (atomic, fresh signature,
+  original deadline retained never renewed, 410 Gone when passed,
+  committed operations never replaced); explicit normalized-intent
+  formula (`digest` over `{target_pubkey, scope, ttl_normalized}`,
+  `expires_at_effective = created_at_anchor + ttl_normalized`,
+  changed TTL/target → 409). Awaiting Flint's diff check. No
+  implementation authorized.
 
 ## Status
 
-DRAFT rev 5 — not implemented. Revised per Flint's rev-4 review (2 P1,
-2 P2, gate extensions). Awaiting kin re-review.
+DRAFT rev 6 — not implemented. Revised per Flint's rev-5 review (2 P2,
+gate extensions). Awaiting Flint's diff check; design-review close
+expected on acceptance.
