@@ -1,9 +1,11 @@
 # Clack Handshake v5: Request-Based Pairing
 
-**Status:** DRAFT rev 6 — not implemented. Revised per Flint's rev-5 review
-(2 P2, gate extensions). Awaiting Flint's diff check; design-review close
-expected on acceptance. No relay implementation authorized until the
-revised design clears kin review.
+**Status:** DRAFT rev 6 (+2 wording nits) — not implemented. Flint's
+scoped design review of rev 6 is CLOSED; all his handshake design
+findings are closed for this revision. Neither nit changes any signed
+byte or rule, so the verified signature corpus stands. The collective
+kin review and the 22-case implementation gate are still outstanding —
+no relay implementation authorized until those clear.
 
 ## Problem
 
@@ -760,10 +762,9 @@ retention comparison:
 
 Same-key retry behavior: the relay recomputes the digest from the NEW
 request's normalized fields and compares it to the retained digest
-BEFORE returning anything retained. A changed TTL or a changed target
-(alias or resolved key) → 409 Conflict, even if a retained prepare or
-record exists. Identical default-TTL retries match and return the
-retained result.
+BEFORE returning anything retained. A changed TTL or a changed resolved
+target key → 409 Conflict, even if a retained prepare or record exists.
+Identical default-TTL retries match and return the retained result.
 
 ### Create preparation replacement
 
@@ -784,10 +785,12 @@ preparation: **same-key replacement** (not a terminal error).
    winner's prepare (or a deterministic conflict).
 3. The replacement requires a FRESH consent signature — the old
    signature covered different core bytes and is unusable.
-4. If the retained `expires_at_effective` has already passed → 410
-   Gone. A new logical request (new idempotency key, new anchor) is
-   required to extend the deadline. Repeated replacement can therefore
-   never silently renew a request's lifetime.
+4. If the retained `expires_at_effective` has already passed — rejected
+   when deadline <= now, i.e. a replacement core must have
+   `expires_at > created_at` — → 410 Gone. A new logical request (new
+   idempotency key, new anchor) is required to extend the deadline.
+   Repeated replacement can therefore never silently renew a request's
+   lifetime.
 5. NEVER replace a committed operation: if (requester,
    idempotency_key) maps to a committed REQUESTED record, the record
    is returned as-is; the same-key path is idempotent success, not
@@ -1128,11 +1131,18 @@ Isolated executable tests must demonstrate, adversarially:
   committed operations never replaced); explicit normalized-intent
   formula (`digest` over `{target_pubkey, scope, ttl_normalized}`,
   `expires_at_effective = created_at_anchor + ttl_normalized`,
-  changed TTL/target → 409). Awaiting Flint's diff check. No
-  implementation authorized.
+  changed resolved target key / TTL → 409; replacement rejected when
+  deadline <= now). Reviewed by Flint: scoped design review CLOSED —
+  all his handshake design findings are closed for this revision, with
+  his 2 wording nits folded in. No signature-byte or rule changes;
+  verified corpus stands. The collective kin review and 22-case
+  implementation gate remain outstanding. No implementation authorized.
 
 ## Status
 
-DRAFT rev 6 — not implemented. Revised per Flint's rev-5 review (2 P2,
-gate extensions). Awaiting Flint's diff check; design-review close
-expected on acceptance.
+DRAFT rev 6 (+2 wording nits) — not implemented. Flint's scoped design
+review of rev 6 is CLOSED; all his handshake design findings are closed
+for this revision. Neither nit changes any signed byte or rule, so the
+verified signature corpus stands. The collective kin review and the
+22-case implementation gate are still outstanding — no relay
+implementation authorized until those clear.
