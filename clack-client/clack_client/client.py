@@ -2,26 +2,32 @@
 
 Handles:
 - Transport: curl primary (secrets via header file, never argv),
-  Python fallback ONLY on curl unavailability
+  Python fallback ONLY when the curl binary is missing/unlaunchable
 - Ed25519 signing: matches relay's actual scheme (X-Clack-Scheme: 1, etc.)
-- Relay identity pinning (TOFU)
-- Fresh nonce per request (retries re-sign)
+- Relay identity pinning (TOFU with challenge-response) — MANDATORY,
+  no bypass flag
+- Fresh nonce per request; retries re-sign with a fresh nonce
+- Retries only for idempotent operations; non-idempotent ops (mint,
+  redeem) fail with outcome-unknown instead of blind retry
 - Send validation: requires accepted:true + matching UUID
-- Handshake origin verification: link's r must match relay identity
+- Handshake origin verification: link's r must match relay identity,
+  and the link URL's own origin must agree with r
 - Human-readable errors
 """
 
 import base64
-import hashlib
 import json
 import os
+import time
+import urllib.parse
 import uuid
 
 from . import transport
 from .signing import load_private_key, sign_headers, parse_handshake_link
+from .identity import verify_relay_identity
 from .errors import (
     ClackError, HandshakeRequired, LinkExpired, LinkUnusable,
-    RelayUnreachable, AuthFailed, TransportUnavailable,
+    RelayUnreachable, AuthFailed, TransportUnavailable, CurlFailed,
 )
 
 
@@ -29,10 +35,25 @@ def _b64u_decode(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+# curl exit codes that are never worth retrying: 60 = peer cert cannot be
+# authenticated, 77 = problem with the SSL CA cert. Retrying a TLS
+# failure is pointless at best and masks a MITM at worst.
+_CURL_FATAL_CODES = {60, 77}
+
+
+def _is_transient(exc) -> bool:
+    """Is this transport failure worth one retry with a fresh signature?"""
+    if isinstance(exc, RelayUnreachable):
+        return True
+    if isinstance(exc, CurlFailed):
+        return exc.returncode not in _CURL_FATAL_CODES
+    return False
+
+
 class ClackClient:
     def __init__(self, relay_url, token, privkey_path, peer_name,
                  user_agent="ClackClient/1.0", timeout=30,
-                 pin_file=None, skip_pin=False):
+                 pin_file=None, auto_pin=False):
         self.relay_url = relay_url.rstrip("/")
         self.token = token
         self.peer_name = peer_name
@@ -40,82 +61,72 @@ class ClackClient:
         self.timeout = timeout
         self._seed = load_private_key(privkey_path) if privkey_path else None
         self._pin_file = pin_file or os.path.expanduser("~/.clack/relay_pins.json")
-        self._pinned = None
-        if not skip_pin:
-            self._verify_pin()
+        # Relay identity verification is MANDATORY. There is no skip flag:
+        # a client that talks to an unverified relay is a credential leak.
+        # First contact requires auto_pin=True (operator verified the
+        # fingerprint out-of-band) — see identity.verify_relay_identity.
+        self._fingerprint = verify_relay_identity(
+            self.relay_url,
+            user_agent=self.user_agent,
+            timeout=self.timeout,
+            pin_file=self._pin_file,
+            auto_pin=auto_pin,
+        )
 
-    # --- Relay identity pinning (TOFU) ---
-
-    def _verify_pin(self):
-        """TOFU pin verification. Fails closed on mismatch."""
-        identity = self._fetch_relay_identity()
-        pins = {}
-        if os.path.exists(self._pin_file):
-            try:
-                pins = json.load(open(self._pin_file))
-            except Exception:
-                pass
-        stored = pins.get(self.relay_url)
-        if stored is None:
-            # First connect: pin it
-            pins[self.relay_url] = identity
-            os.makedirs(os.path.dirname(self._pin_file), exist_ok=True)
-            json.dump(pins, open(self._pin_file, "w"), indent=2)
-            self._pinned = identity
-        elif stored != identity:
-            raise ClackError(
-                f"Relay identity PIN MISMATCH for {self.relay_url}. "
-                f"Expected {stored[:20]}..., got {identity[:20]}.... "
-                f"Possible MITM or relay rebuild. Verify out-of-band."
-            )
-        else:
-            self._pinned = identity
-
-    def _fetch_relay_identity(self):
-        """Fetch relay identity without auth (public endpoint)."""
-        # Use unsigned request for identity check
-        url = self.relay_url + "/v1/identity"
-        try:
-            status, raw = transport.request(
-                "GET", url,
-                {"User-Agent": self.user_agent},
-                timeout=self.timeout,
-                allow_fallback=False,  # pin check must use primary transport
-            )
-            if status == 200:
-                data = json.loads(raw.decode())
-                return data.get("identity_pubkey") or data.get("pubkey") or raw.decode()[:200]
-        except Exception:
-            pass
-        # Fallback: no identity endpoint, use URL as pin basis (weaker)
-        return f"url:{self.relay_url}"
+    @property
+    def relay_fingerprint(self):
+        """The verified relay identity fingerprint (sha256:...)."""
+        return self._fingerprint
 
     # --- Core request ---
 
-    def _request(self, method, path, body=None):
-        """Signed request with fresh nonce. Returns parsed JSON."""
+    def _request(self, method, path, body=None, idempotent=False):
+        """Signed request with fresh nonce per attempt. Returns parsed JSON.
+
+        idempotent=True: transient transport failures are retried (up to 2
+        retries) with a FRESH signature each attempt — never the same nonce
+        twice. Safe for GETs, /v1/send (stable UUID dedupes server-side),
+        and /v1/ack.
+
+        idempotent=False (default): any transport failure raises immediately
+        with the outcome UNKNOWN — the caller must reconcile (e.g. via
+        get_receipt) before retrying. Used for mint-link and redeem, where
+        a blind retry could mint a second link or burn a single-use claim.
+        """
         data = json.dumps(body).encode() if body is not None else None
-        headers = {
-            "User-Agent": self.user_agent,
-            "Content-Type": "application/json",
-        }
-        # Auth header via header file (transport handles it), not in dict
-        # that could leak — but we pass it here, transport writes to file
-        headers["Authorization"] = f"Bearer {self.token}"
-
-        if self._seed:
-            # path_and_query for signing
-            headers.update(sign_headers(
-                self._seed, self.peer_name, method, path, data
-            ))
-
         url = self.relay_url + path
-        try:
-            status, raw = transport.request(method, url, headers, data, self.timeout)
-        except TransportUnavailable:
-            raise
-        except Exception as e:
-            raise RelayUnreachable(f"Cannot reach {self.relay_url}: {e}")
+
+        last_exc = None
+        for attempt in range(3):
+            headers = {
+                "User-Agent": self.user_agent,
+                "Content-Type": "application/json",
+                # Written to a 0600 header file by transport, never argv.
+                "Authorization": f"Bearer {self.token}",
+            }
+            if self._seed:
+                # Fresh signature EVERY attempt — a reused nonce is a replay.
+                headers.update(sign_headers(
+                    self._seed, self.peer_name, method, path, data
+                ))
+
+            try:
+                status, raw = transport.request(
+                    method, url, headers, data, self.timeout)
+            except (RelayUnreachable, CurlFailed, TransportUnavailable) as e:
+                last_exc = e
+                if idempotent and _is_transient(e) and attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if not _is_transient(e) and not isinstance(e, TransportUnavailable):
+                    raise ClackError(
+                        f"Request to {path} failed ({type(e).__name__}: {e}). "
+                        f"State is UNKNOWN — reconcile before retrying."
+                    )
+                raise
+            break
+        else:
+            raise last_exc  # pragma: no cover — loop always breaks or raises
 
         try:
             payload = json.loads(raw.decode()) if raw.strip() else {}
@@ -123,7 +134,7 @@ class ClackClient:
             # Malformed JSON is NEVER success — caller must handle
             raise ClackError(
                 f"Relay returned malformed JSON (HTTP {status}). "
-                f"Send state is UNKNOWN — reconcile before retrying."
+                f"State is UNKNOWN — reconcile before retrying."
             )
 
         if status == 401:
@@ -135,6 +146,11 @@ class ClackClient:
                 raise HandshakeRequired(
                     body.get("to", "unknown") if body else "unknown"
                 )
+            if code == "handshake_revoked":
+                raise ClackError(
+                    f"Handshake with '{body.get('to', 'unknown') if body else 'unknown'}' "
+                    f"was revoked or expired. Re-establish the handshake before sending."
+                )
             if code == "link_unusable":
                 raise LinkUnusable("Link invalid, revoked, or already used")
             if code == "link_expired":
@@ -145,8 +161,9 @@ class ClackClient:
                 raise AuthFailed(f"Signature rejected: {code}")
             raise ClackError(f"Forbidden (403): {code or payload}")
         if status == 400 and payload.get("error") == "unknown_peer":
+            peer = body.get("to", "unknown") if isinstance(body, dict) else "unknown"
             raise ClackError(
-                f"Unknown peer: {payload.get('detail', body)}"
+                f"Unknown peer '{peer}': not enrolled on this relay."
             )
         if status == 429:
             raise ClackError("Rate limited — back off and retry")
@@ -163,6 +180,10 @@ class ClackClient:
         """Send a message. Returns (message_id, accepted).
 
         Raises ClackError if the relay does not confirm accepted:true.
+        Idempotent: the same msg_id is reused across retries and the relay
+        dedupes on (id, sender), so a retry after a dropped connection is
+        safe — but ALWAYS reconcile via get_receipt() if the outcome is
+        unclear rather than assuming.
         """
         mid = msg_id or str(uuid.uuid4())
         body = {"id": mid, "to": to, "text": text}
@@ -171,7 +192,7 @@ class ClackClient:
         if in_reply_to:
             body["in_reply_to"] = in_reply_to
 
-        result = self._request("POST", "/v1/send", body)
+        result = self._request("POST", "/v1/send", body, idempotent=True)
 
         # Validate acceptance — never report success without it
         if not isinstance(result, dict):
@@ -182,14 +203,20 @@ class ClackClient:
                 f"State is UNKNOWN — reconcile before retrying."
             )
         returned_id = result.get("id")
-        if returned_id and returned_id != mid:
+        if not returned_id:
+            raise ClackError(
+                f"Send: relay accepted but returned no ID. "
+                f"State is UNKNOWN — reconcile before retrying."
+            )
+        if returned_id != mid:
             raise ClackError(f"Send: relay returned mismatched ID {returned_id} != {mid}")
 
         return mid, True
 
     def poll(self, timeout=25):
         """Poll for messages. Returns list of message dicts."""
-        result = self._request("GET", f"/v1/poll?timeout={int(timeout)}")
+        result = self._request("GET", f"/v1/poll?timeout={int(timeout)}",
+                               idempotent=True)
         # Handle both formats safely
         if isinstance(result, list):
             return result
@@ -199,12 +226,12 @@ class ClackClient:
         return []
 
     def ack(self, ids):
-        """Acknowledge handled message IDs."""
-        return self._request("POST", "/v1/ack", {"ids": ids})
+        """Acknowledge handled message IDs. Idempotent."""
+        return self._request("POST", "/v1/ack", {"ids": ids}, idempotent=True)
 
     def peers(self):
         """List enrolled peer names."""
-        result = self._request("GET", "/v1/peers")
+        result = self._request("GET", "/v1/peers", idempotent=True)
         if isinstance(result, dict):
             return result.get("peers", [])
         return []
@@ -212,7 +239,11 @@ class ClackClient:
     # --- Handshakes ---
 
     def mint_handshake_link(self):
-        """Mint a handshake link. Returns the URL."""
+        """Mint a handshake link. Returns the URL.
+
+        NOT idempotent: a retry could mint a second link. Transport
+        failures raise with outcome UNKNOWN — do not blind-retry.
+        """
         result = self._request("POST", "/v1/handshakes/mint-link", {})
         link = result.get("link") if isinstance(result, dict) else None
         if not link:
@@ -222,27 +253,58 @@ class ClackClient:
     def redeem_handshake(self, link_or_hk):
         """Redeem a handshake link.
 
-        Verifies the link origin (r field) matches this relay's identity
-        before releasing the claim. Rejects on mismatch.
+        For URL inputs, verifies origin in two steps before releasing the
+        claim secret:
+        1. The link's r field is REQUIRED, must be valid base64url, and must
+           decode to this client's relay URL. No silent fallback.
+        2. The link URL's own origin (host) must agree with r's origin —
+           a link minted for relay A must not arrive via relay B's domain.
+
+        Raw {"h": ..., "k": ...} dicts are a separate trusted-caller
+        interface (no origin to check — the caller constructed it).
+
+        NOT idempotent: the claim is single-use. Transport failures raise
+        with outcome UNKNOWN — reconcile via list_handshakes() before
+        retrying, never blind-retry.
         """
         if isinstance(link_or_hk, str):
             parsed = parse_handshake_link(link_or_hk)
-            # Origin check: link's r must match our relay
+            # Origin check 1: r is REQUIRED for URL inputs.
             link_relay = parsed.get("r")
-            if link_relay:
-                try:
-                    expected = _b64u_decode(link_relay).decode()
-                except Exception:
-                    expected = link_relay
-                # Normalize: compare against our relay URL
-                if expected.rstrip("/") != self.relay_url:
-                    raise ClackError(
-                        f"Handshake link origin mismatch: link is for {expected}, "
-                        f"this client is configured for {self.relay_url}. "
-                        f"Refusing to forward claim to wrong relay."
-                    )
+            if not link_relay:
+                raise ClackError(
+                    "Handshake link missing required 'r' (relay) field. "
+                    "Refusing to redeem a link with unverified origin."
+                )
+            try:
+                expected = _b64u_decode(link_relay).decode()
+            except Exception:
+                raise ClackError(
+                    f"Handshake link 'r' field is not valid base64url: "
+                    f"{link_relay[:30]}"
+                )
+            if expected.rstrip("/") != self.relay_url:
+                raise ClackError(
+                    f"Handshake link origin mismatch: link is for {expected}, "
+                    f"this client is configured for {self.relay_url}. "
+                    f"Refusing to forward claim to wrong relay."
+                )
+            # Origin check 2: the link URL's own host must agree with r.
+            try:
+                link_host = urllib.parse.urlsplit(
+                    parsed["_base"]).netloc.lower()
+                relay_host = urllib.parse.urlsplit(expected).netloc.lower()
+            except Exception:
+                raise ClackError("Handshake link has an unparsable URL origin")
+            if not link_host or link_host != relay_host:
+                raise ClackError(
+                    f"Handshake link origin disagreement: link URL is served "
+                    f"from {link_host or '(none)'}, but its r field names "
+                    f"{relay_host or '(none)'}. Refusing."
+                )
             h, k = parsed["h"], parsed["k"]
         elif isinstance(link_or_hk, dict):
+            # Trusted-caller interface: no URL, no origin to verify.
             h, k = link_or_hk["h"], link_or_hk["k"]
         else:
             h, k = link_or_hk
@@ -258,8 +320,23 @@ class ClackClient:
                              {"handshake_id": handshake_id})
 
     def list_handshakes(self):
-        return self._request("GET", "/v1/handshakes")
+        return self._request("GET", "/v1/handshakes", idempotent=True)
 
-    def get_status(self, message_id):
-        """Query send status for reconciliation. Returns relay's record."""
-        return self._request("GET", f"/v1/status/{message_id}")
+    def get_receipt(self, message_id):
+        """Find the delivery receipt for a sent message.
+
+        The relay exposes sender-visible delivery states via /v1/receipts
+        (states: queued, collected, acked, expired, dead) — there is no
+        per-ID endpoint, so this pages recent receipts and filters
+        client-side. Raises ClackError if the message is not found.
+        """
+        result = self._request("GET", "/v1/receipts?limit=1000",
+                               idempotent=True)
+        receipts = result.get("receipts", []) if isinstance(result, dict) else []
+        for r in receipts:
+            if isinstance(r, dict) and r.get("id") == message_id:
+                return r
+        raise ClackError(
+            f"No receipt found for message {message_id} in recent receipts. "
+            f"The message may have expired from the retention window."
+        )

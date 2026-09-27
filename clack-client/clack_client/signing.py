@@ -28,9 +28,10 @@ def load_private_key(path: str) -> bytes:
     """Load a 32-byte Ed25519 seed.
 
     Supports:
-    - Raw 32 bytes
-    - Base64url-encoded 32 bytes + optional newline (what relay-cli.py writes)
-    - PEM PKCS8 (validates Ed25519 OID)
+    - Raw 32 bytes (checked FIRST, before any whitespace handling — a seed
+      whose first or last byte is 0x20 must not be mangled by stripping)
+    - Base64url-encoded 32 bytes + optional trailing newline (what relay-cli.py writes)
+    - PEM PKCS8 (validated with real DER structure parsing)
 
     Fails explicitly on anything else. Never silently misreads.
     """
@@ -41,14 +42,16 @@ def load_private_key(path: str) -> bytes:
     if b"-----BEGIN" in raw:
         return _load_pem_seed(raw)
 
-    # Strip whitespace/newlines
+    # Raw 32 bytes — checked BEFORE stripping. A file that is exactly
+    # 32 bytes is a seed, even if it starts/ends with whitespace bytes.
+    if len(raw) == 32:
+        return raw
+
+    # Otherwise: strip ASCII whitespace and try base64url.
     stripped = raw.strip()
-
-    # Raw 32 bytes?
-    if len(stripped) == 32:
+    if len(stripped) == 32 and stripped == raw:
+        # Already handled above; unreachable, kept for clarity.
         return stripped
-
-    # Base64url?
     try:
         decoded = _b64u_decode(stripped.decode("ascii"))
         if len(decoded) == 32:
@@ -62,19 +65,79 @@ def load_private_key(path: str) -> bytes:
     )
 
 
+def _der_read(data: bytes, offset: int):
+    """Read one DER TLV at offset. Returns (tag, value_bytes, next_offset).
+
+    Minimal DER reader: short and long form lengths only, no indefinite
+    length, no constructed-bit games. Enough to validate PKCS8 structure.
+    """
+    if offset + 2 > len(data):
+        raise ValueError("DER truncated at header")
+    tag = data[offset]
+    lb = data[offset + 1]
+    pos = offset + 2
+    if lb & 0x80:
+        nbytes = lb & 0x7F
+        if nbytes == 0 or nbytes > 4:
+            raise ValueError("DER: unsupported length encoding")
+        if pos + nbytes > len(data):
+            raise ValueError("DER truncated in length bytes")
+        length = int.from_bytes(data[pos:pos + nbytes], "big")
+        pos += nbytes
+    else:
+        length = lb
+    if pos + length > len(data):
+        raise ValueError("DER truncated in value")
+    return tag, data[pos:pos + length], pos + length
+
+
+# OID 1.3.101.112 (Ed25519) as DER content bytes: 06 03 2B 65 70 -> content 2B 65 70
+_ED25519_OID_CONTENT = bytes([0x2B, 0x65, 0x70])
+
+
 def _load_pem_seed(pem: bytes) -> bytes:
-    """Extract Ed25519 seed from PEM PKCS8 with algorithm validation."""
+    """Extract the Ed25519 seed from PEM PKCS8 with real structure validation.
+
+    Parses the DER as:
+        SEQUENCE {
+            INTEGER 0,                          # version
+            SEQUENCE { OID 1.3.101.112 },       # algorithm = Ed25519
+            OCTET STRING { OCTET STRING (32) }  # private key -> seed
+        }
+    Any structural deviation raises ValueError. No OID-substring heuristics,
+    no taking the last 32 bytes of an unparsed blob.
+    """
     lines = [l.strip() for l in pem.decode().split("\n")
              if l.strip() and not l.startswith("-----")]
-    der = base64.b64decode("".join(lines))
-    # PKCS8 Ed25519: OID 1.3.101.112 must be present
-    # OID bytes: 06 03 2B 65 70
-    if b"\x06\x03\x2b\x65\x70" not in der:
-        raise ValueError("PEM is not an Ed25519 key (OID 1.3.101.112 not found)")
-    # Seed is the last 32 bytes of the PKCS8 structure
-    seed = der[-32:]
-    if len(seed) != 32:
-        raise ValueError("PEM Ed25519 seed extraction failed")
+    try:
+        der = base64.b64decode("".join(lines))
+    except Exception as e:
+        raise ValueError(f"PEM base64 decode failed: {e}")
+
+    tag, outer, end = _der_read(der, 0)
+    if tag != 0x30 or end != len(der):
+        raise ValueError("PEM is not a well-formed PKCS8 SEQUENCE")
+
+    # Child 1: INTEGER version == 0
+    tag, ver, pos = _der_read(outer, 0)
+    if tag != 0x02 or int.from_bytes(ver, "big") != 0:
+        raise ValueError("PEM PKCS8: expected INTEGER version 0")
+
+    # Child 2: SEQUENCE { OID }
+    tag, alg_seq, pos = _der_read(outer, pos)
+    if tag != 0x30:
+        raise ValueError("PEM PKCS8: expected algorithm SEQUENCE")
+    tag, oid, oid_end = _der_read(alg_seq, 0)
+    if tag != 0x06 or oid != _ED25519_OID_CONTENT or oid_end != len(alg_seq):
+        raise ValueError("PEM PKCS8: algorithm is not Ed25519 (OID 1.3.101.112)")
+
+    # Child 3: OCTET STRING wrapping the key
+    tag, key_wrap, pos = _der_read(outer, pos)
+    if tag != 0x04 or pos != len(outer):
+        raise ValueError("PEM PKCS8: expected trailing OCTET STRING")
+    tag, seed, seed_end = _der_read(key_wrap, 0)
+    if tag != 0x04 or len(seed) != 32 or seed_end != len(key_wrap):
+        raise ValueError("PEM PKCS8: inner OCTET STRING is not a 32-byte seed")
     return seed
 
 
@@ -114,14 +177,30 @@ def sign_headers(seed: bytes, peer_name: str, method: str,
 def parse_handshake_link(link: str) -> dict:
     """Parse a v4 handshake link URL into components.
 
-    Returns dict with v, h, k, r, by, exp, max.
+    Strict parsing:
+    - Duplicate fields are REJECTED (dict(parse_qsl) silently keeps the
+      last; an attacker or a mangled copy-paste must not get that).
+    - Unknown version rejected. Missing h/k rejected here; the caller
+      must still check r (origin) — see ClackClient.redeem_handshake.
+
+    Returns dict with v, h, k, r, by, exp, max, and _base (the URL without
+    the fragment, for origin cross-checking).
     Does NOT validate origin — caller must check r matches relay identity.
     """
     import urllib.parse
     if "#" not in link:
         raise ValueError("Invalid handshake link: missing # fragment")
-    fragment = link.split("#", 1)[1]
-    params = dict(urllib.parse.parse_qsl(fragment))
+    base, fragment = link.split("#", 1)
+    pairs = urllib.parse.parse_qsl(fragment, keep_blank_values=True)
+    seen = set()
+    params = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(
+                f"Invalid handshake link: duplicate field {k!r}"
+            )
+        seen.add(k)
+        params[k] = v
     v = params.get("v", "4")
     if v != "4":
         raise ValueError(f"Unsupported handshake link version: {v} (expected 4)")
@@ -135,4 +214,5 @@ def parse_handshake_link(link: str) -> dict:
         "by": params.get("by"),
         "exp": params.get("exp"),
         "max": params.get("max"),
+        "_base": base,
     }
