@@ -1,7 +1,7 @@
 # Clack Handshake v5: Request-Based Pairing
 
-**Status:** DRAFT rev 2 — not implemented. Revised per Zari and Flint design
-reviews of rev 1 (6a3f5b3d). Awaiting Zari/Sigrid re-review. No relay
+**Status:** DRAFT rev 3 — not implemented. Revised per Flint's rev-2 review
+(2 P1, 2 P2, gate extensions). Awaiting kin re-review. No relay
 implementation authorized until the revised design clears kin review.
 
 ## Problem
@@ -72,43 +72,174 @@ Opening a v5 link **never auto-accepts**. It opens a pending request the user
 ```
 1. Alice wants to talk to Bob.
    Alice → Relay: POST /v1/handshakes/request {to: "bob"}
-   Relay persists an IMMUTABLE request record:
-     {request_id, requester_pubkey, relay_identity, target_pubkey|null,
-      protocol_version, created_at, expires_at, scope}
+   Relay persists an IMMUTABLE request record (canonical form defined
+   below):
+     {record_type: "v5-handshake-request",
+      protocol_version: 5,
+      request_id, requester_pubkey, relay_identity_fingerprint,
+      target_pubkey|null,
+      pair_generation_at_create,   // targeted: current pair generation,
+                                   // read NOW. open: null (pair unknown)
+      scope: "pairing",
+      created_at, expires_at,
+      idempotency_key,
+      requester_consent_sig}       // Alice's consent signature over the
+                                   // canonical request digest
    Relay → Alice: {request_id, link, expires_at}
 
 2. Alice shares the link with Bob (any channel — chat, email, QR, etc.)
 
-3. Bob opens the link. His client pins the relay origin (above) and Bob
-   explicitly accepts:
+3. Bob opens the link. His client pins the relay origin (above), fetches
+   the invitation view (see Pre-accept read path), and Bob explicitly
+   accepts:
    Bob → Relay: POST /v1/handshakes/accept-request
-     {request_id, acceptance: {acceptor_pubkey, request_version, timestamp}}
-   Relay verifies Bob's signed identity, the request is still REQUESTED,
-   the deadline has not passed, and (for targeted requests) Bob's key
-   matches target_pubkey. On success the relay freezes ONE immutable
-   acceptance record and moves the request to ACCEPTED_PENDING_CONFIRM.
-   Concurrent accepts: exactly one winner is frozen; losers get a
-   deterministic already-claimed result that cannot alter the frozen
+     {request_id,
+      acceptor_pubkey, request_version, accepted_at,
+      pair_generation_at_accept,  // current pair generation, read NOW
+                                  // and frozen. For targeted requests it
+                                  // MUST equal pair_generation_at_create.
+      acceptor_consent_sig}       // Bob's consent signature (preimage below)
+   Relay verifies: Bob's transport signature (he is who he says he is),
+   Bob's consent signature over the accept preimage, the request is still
+   REQUESTED, the deadline has not passed, and (for targeted requests)
+   Bob's key matches target_pubkey and the generation is unchanged since
+   creation. On success the relay freezes ONE immutable acceptance record
+   and moves the request to ACCEPTED_PENDING_CONFIRM — this phase commits
+   separately. Concurrent accepts: exactly one winner is frozen; losers get
+   a deterministic already-claimed result that cannot alter the frozen
    acceptance.
 
 4. Relay notifies Alice. Alice reviews the AUTHENTICATED acceptor identity
    (public key from the frozen acceptance record — not a display name) and
    explicitly confirms:
    Alice → Relay: POST /v1/handshakes/confirm
-     {request_id, acceptance_id, confirm_signature}
-   The confirm signature is bound to: protocol version, domain, relay
-   identity, request_id, acceptance_id, BOTH full peer public keys, scope,
-   and expiry. A body of {request_id} alone is NOT sufficient — the selected
-   acceptor must not depend on mutable relay state at confirm time.
+     {request_id, acceptance_id, confirmer_consent_sig}
+   The confirmer consent signature's preimage is defined exactly below.
+   A body of {request_id} alone is NOT sufficient — the selected acceptor
+   must not depend on mutable relay state at confirm time.
 
-5. In ONE atomic transaction the relay rechecks: deadline not passed,
-   request still ACCEPTED_PENDING_CONFIRM, both identities still valid and
-   authorized, no revocation/withdrawal since acceptance, current pair
-   generation unchanged. Only then does it create the ACTIVE handshake.
-   Alice confirming after Bob withdraws, either side revoking, or the
-   deadline expiring MUST fail. Reopening an old request can never bypass a
-   revocation — it requires a fresh request with fresh consent at the new
-   pair generation.
+5. The relay runs the ACTIVATION as one atomic transaction. It rechecks:
+   deadline not passed, request still ACCEPTED_PENDING_CONFIRM, both
+   identities still valid and authorized, no revocation/withdrawal since
+   acceptance, and the CURRENT pair generation equals the generation frozen
+   in the acceptance record. Only then does it create the ACTIVE handshake.
+   (Each earlier phase — create, accept, confirm-request — committed
+   separately; only this final activation is a single atomic transaction.
+   The human-delayed request/accept/confirm flow as a whole is not one
+   transaction.)
+   Alice confirming after Bob withdraws, either side revoking, a revoke
+   bumping the pair generation, or the deadline expiring MUST fail.
+   Reopening an old request can never bypass a revocation — it requires a
+   fresh request with fresh consent at the new pair generation. A failed or
+   terminal older request is NEVER rebound to a new generation by a retry.
+
+### Canonical encodings and consent signatures
+
+Two different signatures exist. They must not be confused:
+
+- **Transport signature** (existing clack-ed25519-v1): authenticates the
+  HTTP API call itself. Covers method, path/query, raw-body SHA-256, and a
+  fresh nonce. Proves the caller holds the enrolled private key *right now*.
+  It says nothing about handshake consent.
+- **Consent signatures** (new, detached): prove agreement to the specific
+  handshake terms. They are computed over canonical digests, not over HTTP
+  framing, so they survive transport retries with fresh nonces.
+
+Canonical form: UTF-8 JSON, keys sorted lexicographically by byte,
+no whitespace, integers as plain numbers, byte strings as lowercase hex,
+UUIDs in canonical 8-4-4-4-12 form. Digests are SHA-256 over the canonical
+bytes, rendered lowercase hex.
+
+```
+request_digest   = SHA-256(canonical(request_record_core))
+acceptance_digest = SHA-256(canonical(acceptance_record_core))
+```
+
+**Request record core** (what the relay stores immutably at creation;
+`requester_consent_sig` is stored alongside, not inside the digest):
+
+```
+{record_type: "v5-handshake-request",
+ protocol_version: 5,
+ request_id: <uuid>,
+ requester_pubkey: <ed25519 hex>,
+ relay_identity_fingerprint: <"sha256:..." pinned relay identity>,
+ target_pubkey: <ed25519 hex | null>,
+ pair_generation_at_create: <int | null>,   // null only for open requests
+ scope: "pairing",
+ created_at: <unix int>,
+ expires_at: <unix int>,
+ idempotency_key: <uuid>}
+```
+
+**Create consent preimage** (signed by the requester at creation):
+
+```
+"clack-hs-v5-request-v1" || request_digest
+```
+
+The relay recomputes `request_digest` from the fields it persisted —
+including the generation it read itself — and verifies the signature. The
+client never supplies a hash the relay trusts; the relay hashes what it
+stored.
+
+**Acceptance record core** (frozen at accept):
+
+```
+{record_type: "v5-handshake-acceptance",
+ protocol_version: 5,
+ request_id: <uuid>,
+ acceptance_id: <uuid>,
+ acceptor_pubkey: <ed25519 hex>,
+ request_version: 5,
+ pair_generation_at_accept: <int>,   // read NOW, frozen
+ accepted_at: <unix int>}
+```
+
+**Accept consent preimage** (signed by the acceptor):
+
+```
+"clack-hs-v5-accept-v1" || request_digest || SHA-256(canonical(acceptance_record_core))
+```
+
+Binding the `request_digest` inside the accept preimage ties the acceptance
+to the exact immutable request — the acceptor cannot be tricked into
+consenting to different terms than the requester created.
+
+**Confirm consent preimage** (signed by the original requester):
+
+```
+"clack-hs-v5-confirm-v1" || acceptance_digest
+```
+
+The relay verifies the confirmer's signature against the requester's
+enrolled public key and the `acceptance_digest` it recomputed from the
+frozen acceptance record. This is the single consistent confirm shape —
+there is no separate `confirm_signature` vs `Signed (envelope)` variant.
+
+**Verification rules:** the relay MUST recompute every digest from its own
+stored immutable records and verify each consent signature against the
+enrolled public key of the claimed signer. No security property may depend
+on an unsigned field supplied by the client and filled in by the relay
+later. Unknown fields in signed bodies are rejected.
+
+**Pair generation binding.** The relay maintains a per-pair generation
+counter, bumped on every revoke. Capture rules:
+
+- Targeted request: the relay reads the current generation for
+  (requester, target) at creation and freezes it as
+  `pair_generation_at_create`. The requester's create consent signature
+  covers it (via `request_digest`).
+- Open request: `pair_generation_at_create` is null. At accept time the
+  relay reads the current generation for the now-known pair and freezes it
+  as `pair_generation_at_accept`. The acceptor's accept consent signature
+  covers it.
+- At confirm, the atomic activation transaction compares the CURRENT
+  generation for the pair against the frozen value. Any revoke between
+  create→accept, accept→confirm, or racing confirm (including across
+  restart) bumps the generation, so the confirm fails deterministically.
+- A retry of a failed/terminal request reuses the frozen generation; it
+  can never rebind the request to a newer generation.
 ```
 
 ### State model
@@ -141,15 +272,43 @@ idempotent across transport failures:
   (client-supplied idempotency key). A lost create response returns the
   original request_id, never a duplicate request.
 - **Accept/confirm:** each HTTP attempt carries a fresh transport
-  signature/nonce, but reuses the logical request/acceptance identity. A
-  lost response retried by the same actor with the same content returns the
-  same committed result. A different acceptor or altered content must not
-  succeed.
+  signature/nonce, but reuses the logical request/acceptance identity and
+  the same consent signatures. A lost response retried by the same actor
+  with the same content returns the same committed result. A different
+  acceptor or altered content must not succeed.
 - **Status lookup:** an owner-scoped `GET /v1/handshakes/requests/{id}`
   returns the authoritative state including terminal states, so clients
   fetch state before acting instead of inferring from notifications.
 - Notifications are retriable, deduplicated hints. State is committed before
   notifying.
+
+**Retry after terminal transitions — one rule.** An idempotent retry must
+return the immutable operation outcome AND the current state, never a stale
+success:
+
+```
+POST /v1/handshakes/confirm   (retry, after the handshake was revoked)
+→ {outcome: "already_confirmed",
+   handshake_id: "a|b|3",
+   current_state: "revoked",        // NOT "active"
+   current_generation: 4}
+```
+
+Returning the original success without `current_state` would advertise a
+revoked handshake as active. Clients MUST consult `current_state` (or the
+status lookup) before sending traffic, not the cached `outcome`.
+
+**Idempotency key rules:**
+
+- Keys are scoped to (authenticated requester, canonical request digest).
+  Same key + same digest → return the original record.
+- Same key + DIFFERENT digest (changed `to`, `expires_in`, scope) → `409
+  conflict`. The client must use a new key for intentionally new content.
+- A new key always permits an intentional new request (subject to quotas).
+- Idempotency results and tombstones are retained for the same retention
+  window as messages (7 days default, relay-configured), then swept.
+  Retention and per-requester pending quotas are relay-configured and
+  advertised; exceeding quota returns `429` with a `retry_after` hint.
 
 ### Key properties
 
@@ -165,9 +324,12 @@ idempotent across transport failures:
   or pairing secret and cannot activate a handshake by possession alone.
   Real credentials remain in the signed client-to-relay exchange; request
   metadata can still be private depending on how it is shared.
-- **Atomic activation.** The request → acceptance → confirm → ACTIVE path is
-  a single checked transaction; races with revoke/withdraw/expire have
-  deterministic committed outcomes, durable across restart.
+- **Atomic activation.** Create, accept, and the confirm request each commit
+  as separate transactions (the human-delayed flow is not one transaction).
+  Only the final activation step — rechecking deadline, state, identities,
+  and the frozen pair generation, then creating ACTIVE — is a single atomic
+  transaction. Races with revoke/withdraw/expire have deterministic
+  committed outcomes, durable across restart.
 
 ### Targeted vs. open requests
 
@@ -301,25 +463,52 @@ time.)
 ```
 POST /v1/handshakes/request
   Body: {to: <peer-name|null>, expires_in?: <seconds>,
-         idempotency_key: <uuid>}
+         idempotency_key: <uuid>,
+         requester_consent_sig: <ed25519 hex>}
+  # Consent preimage: "clack-hs-v5-request-v1" || request_digest.
+  # The relay recomputes request_digest from the record it persisted
+  # (including the generation IT read) and verifies the signature.
   Returns: {request_id, link, expires_at}
   # Targeted requests resolve `to` to the enrolled public key NOW and
   # freeze it in the immutable record. Never silently re-resolve a
   # targeted name to a different key later.
 
+GET /v1/handshakes/requests/{id}/view   (invitation view, pre-accept)
+  Returns (minimal, authenticated):
+    {request_id, protocol_version,
+     requester_pubkey,            // authenticated key, never display name
+     target_pubkey,               // null for open requests
+     scope, created_at, expires_at,
+     state}                       // REQUESTED only; terminal states give
+                                  // the terminal name and nothing else
+  Authorization:
+    - The requester: always.
+    - The targeted recipient (key matches target_pubkey): yes.
+    - Any enrolled peer, for OPEN requests only: yes (eligible claimant).
+    - Unrelated peers: 404 (indistinguishable from nonexistent).
+    - Never exposes other pending acceptors, claimant counts, or
+      unrelated request metadata.
+
 POST /v1/handshakes/accept-request
   Body: {request_id,
-         acceptance: {acceptor_pubkey, request_version, timestamp}}
+         acceptor_pubkey, request_version, accepted_at,
+         pair_generation_at_accept,
+         acceptor_consent_sig: <ed25519 hex>}
+  # Consent preimage: "clack-hs-v5-accept-v1" || request_digest ||
+  #                   SHA-256(canonical(acceptance_record_core)).
   Returns: {status: "pending-confirmation",
             acceptance_id, request_id, expires_at}
 
 POST /v1/handshakes/confirm
-  Body: {request_id, acceptance_id}
-  Signed (envelope): protocol_version, domain, relay_identity,
-                     request_id, acceptance_id, requester_pubkey,
-                     acceptor_pubkey, scope, expires_at
-  Returns: {status: "active", handshake_id}
+  Body: {request_id, acceptance_id,
+         confirmer_consent_sig: <ed25519 hex>}
+  # Consent preimage: "clack-hs-v5-confirm-v1" || acceptance_digest.
+  # Single consistent shape — no envelope variant.
   # Body {request_id} alone is rejected for open requests.
+  Returns: {outcome: "active", handshake_id,
+            current_state: "active", current_generation: <int>}
+  # On retry after a later revoke, outcome stays "already_confirmed"
+  # but current_state reports "revoked" (see Idempotency).
 
 POST /v1/handshakes/requests/{id}/cancel    (requester, before ACTIVE)
 POST /v1/handshakes/requests/{id}/decline   (acceptor, before confirm)
@@ -380,13 +569,40 @@ Isolated executable tests must demonstrate, adversarially:
 8. A new unenrolled peer receives explicit `enrollment_required`, never
    hidden access from a public `req`; remote-relay peers get explicit
    `unsupported_remote_relay` until federation is defined.
+9. Exact signed preimages: accept and confirm consent signatures verify
+   against recomputed canonical digests; tampering with any bound field
+   (domain, relay identity, keys, scope, expiry, generation) invalidates
+   the signature. Transport-signature replay without the consent signature
+   cannot accept or confirm.
+10. Generation binding for open offers: the frozen
+    `pair_generation_at_accept` is compared atomically at confirm; a
+    revoke between accept and confirm (or a concurrent confirm/revoke
+    across restart) fails the confirm deterministically.
+11. Retry after revocation: an idempotent confirm retry returns the
+    original outcome AND `current_state: "revoked"` — never a stale
+    `"active"`.
+12. Idempotency-key conflicts: same key + changed content → `409
+    conflict`; new key + same content → new request (quotas permitting).
+13. Invitation-view access: requester, targeted recipient, and eligible
+    open claimants can view; unrelated peers get 404; no claimant
+    enumeration.
 
 ## Review history
 
 - **Rev 1** (6a3f5b3d): initial proposal. Reviewed by Flint (6 items, 8-test
   gate) and Zari (5 required revisions). Direction supported by both.
-- **Rev 2** (this document): integrates both reviews. Awaiting Zari/Sigrid
-  re-review. No implementation authorized.
+- **Rev 2** (d1d4e63): integrates both reviews. Reviewed by Flint: 2 P1
+  (signed API shapes vs security claims; pair-generation capture fields)
+  and 2 P2 (retry-after-terminal semantics; pre-accept read path and
+  transaction wording) remain, plus gate extensions.
+- **Rev 3** (this document): exact canonical encodings, digests, and
+  consent-signature preimages; transport vs consent signature distinction;
+  explicit `pair_generation_at_create` / `pair_generation_at_accept`
+  persisted fields with capture rules; retry responses carry both outcome
+  and current terminal state; idempotency-key conflict semantics;
+  invitation-view endpoint with authorization rules; per-phase commit
+  wording (only activation is atomic). Awaiting kin re-review.
+  No implementation authorized.
 
 ## Status
 
