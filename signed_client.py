@@ -234,14 +234,17 @@ class SignedClient:
                 os.unlink(body_file)
             if result.returncode != 0:
                 raise ConnectionError("curl failed")
+            # Handle proxy CONNECT response: curl -D - prints the proxy's
+            # "200 Connection Established" headers, then the actual response
+            # headers, then the body. Take the LAST header block + body.
+            import re
             output = result.stdout
-            parts = output.split(b"\r\n\r\n", 1)
-            if len(parts) != 2:
-                parts = output.split(b"\n\n", 1)
-            if len(parts) != 2:
+            parts = re.split(b"\r\n\r\n|\n\n", output)
+            if len(parts) < 2:
                 raise ValueError("curl output missing header/body separator")
-            header_text, data = parts
-            status_line = header_text.split(b"\n")[0].decode()
+            data = parts[-1]
+            header_text = parts[-2]
+            status_line = header_text.strip().split(b"\n")[0].decode()
             status = int(status_line.split()[1])
             if 300 <= status < 400:
                 raise ValueError("refusing redirect: HTTP %d" % status)

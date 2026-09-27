@@ -666,18 +666,22 @@ def _curl_req(cfg, method, url, headers, data, timeout):
             os.unlink(body_file)
         if result.returncode != 0:
             raise ConnectionError("curl failed: %s" % result.stderr.decode()[:200])
-        # Parse: headers, blank line, body
+        # Parse: curl -D - prints headers for the proxy CONNECT (when using
+        # a proxy) followed by the actual response headers, then the body.
+        # Split on all header/body separators and take the LAST block as body.
         output = result.stdout
-        # Find the last header block (curl -D - prints headers for each redirect;
-        # we don't follow redirects, so there's one block)
-        parts = output.split(b"\r\n\r\n", 1)
-        if len(parts) != 2:
-            parts = output.split(b"\n\n", 1)
-        if len(parts) != 2:
+        # Find all occurrences of the header/body separator
+        import re
+        # Split into header blocks and body: the last \r\n\r\n separates
+        # final headers from body
+        parts = re.split(b"\r\n\r\n|\n\n", output)
+        if len(parts) < 2:
             raise ValueError("curl output missing header/body separator")
-        header_text, body = parts
+        body = parts[-1]
+        # The final header block is parts[-2]
+        header_text = parts[-2]
         # Parse status from first line: HTTP/1.1 200 OK
-        status_line = header_text.split(b"\n")[0].decode()
+        status_line = header_text.strip().split(b"\n")[0].decode()
         status = int(status_line.split()[1])
         # Refuse redirects (same policy as Python transport)
         if 300 <= status < 400:
