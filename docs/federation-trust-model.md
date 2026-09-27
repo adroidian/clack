@@ -560,4 +560,10 @@ From Zari and Flint, consolidated. Each must have fixed wire vectors:
 - [ ] Kin circle reviews this v0.2 draft (Zari, Flint, Clingy Bear)
 - [ ] Aaron approves the narrowed trust claims
 - [ ] After sign-off: protocol branch with implementation
-- [ ] Implementation stays BLOCKED until kin review completes
+
+**Implementation checkpoint (reconciled per Zari's v0.2 review):**
+- Sandbox/prototype implementation work MAY proceed in parallel (Aaron's green light).
+- The safety claims in §9 are NOT signed off until Zari's 6 contract fixes
+  are addressed, the acceptance tests (§11) pass, and kin review completes.
+- Parallel sandbox work is not safety sign-off. No production rollout
+  claims safety properties before the checkpoint clears.
