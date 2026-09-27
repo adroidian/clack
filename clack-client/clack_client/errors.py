@@ -27,6 +27,10 @@ class RelayUnreachable(ClackError):
     """Raised when the relay can't be reached after retries."""
     pass
 
+class TransportUnavailable(ClackError):
+    """Raised when the preferred transport (curl) is not available."""
+    pass
+
 class AuthFailed(ClackError):
     """Raised on 401 — bad token or missing signature."""
     pass
