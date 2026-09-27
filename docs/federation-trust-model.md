@@ -45,6 +45,19 @@ fixture context — completed here). For kin circle review. No code. No implemen
    live acceptance additionally requires the pending nonce context,
    installed-grant state, and the manifest's per-case preconditions.
 
+**Post-review clarifications (Flint's v0.8 closure, same draft — no
+normative rule changed):** (1) the late fixture's manifest
+`expected.reject_rule` is now a list of acceptable rejection paths
+(`pending_context_expired`, `responded_at_past_deadline`) — its
+`commit_at` (09:06) is past the local deadline too, so a conforming
+processor may reject at pending-context expiry before the
+`responded_at` predicate; required outcome identical on every path;
+(2) the active exchange's prior watermark is labeled as intentionally
+seeded stale state (55 min past the 24h cap at request time) — the
+exchange is the fail-closed-then-recover path, not an "approaching the
+cap" timeline (manifest `state_note`, §13.3/§13.5). No vector bytes
+changed; all 12 signatures still verify.
+
 ## 0b. What changed from v0.6 (kept)
 
 Flint independently verified all eight v0.6 corpus signatures with OpenSSL
@@ -1879,7 +1892,12 @@ Relay X — the home relay of the grant's minter — holds a cached grant
 for relay Y — the home relay of the grant's redeemer (the grant's two
 home relays are named in the signed offer/acceptance; the recheck
 always runs between those identities, never stand-ins). X's watermark
-is at `2026-09-26T06:00:00Z`, approaching the 24h cap. Request (P1-2):
+is at `2026-09-26T06:00:00Z` — deliberately seeded **stale**, 55
+minutes past the 24h cap at request time, so this exchange exercises
+the fail-closed-then-recover path: no delivery is allowed under the
+grant until this recheck succeeds and re-anchors the watermark (the
+manifest's `state_note` says so explicitly; this is not an
+"approaching the cap" timeline). Request (P1-2):
 
 ```json
 {
@@ -2032,8 +2050,16 @@ its own fresh request window (07:55–08:00, nonce
 `Y2xhY2stdjA4LW5vbmNlLTAwMDAwMDAwMDAwMDAwMDM`) but with
 `responded_at` = 2026-09-27T09:05:00Z — 3900s past the 08:00 deadline.
 The outer signature is valid, but rule 4 (`responded_at ≤ deadline`)
-rejects it: zero writes, nonce unconsumed, watermark unchanged. (The
-grant is not rescued — X still fails closed at the 24h cap, T2-31.)
+rejects it: zero writes, nonce unconsumed, watermark unchanged. Note
+the late fixture's `commit_at` (09:06) is itself past the local 08:00
+deadline, so a conforming processor may reject earlier — at
+pending-context expiry / the commit-time check — before ever reaching
+the `responded_at` predicate. Either rejection path is acceptable; the
+exact `responded_at ≤ deadline` assertion is the static predicate test
+(T2-31), and the required outcome is identical on every path: no
+grant/tombstone/watermark updates, no nonce consumed by a successful
+response. (The grant is not rescued — X still fails closed at the 24h
+cap, T2-31.)
 
 ### 13.5 Exchange fixture manifest (new in v0.8)
 
@@ -2081,7 +2107,21 @@ for accepted active cases, and timeline order
 (countersigned < active sample < revoked_at < revoked sample). A
 conformance harness must reproduce each exchange's expected result
 from its pinned preconditions — a `positive` role alone does not
-license acceptance (T2-38).
+license acceptance (T2-38). Two manifest semantics worth stating
+plainly:
+
+- `expected.reject_rule` is a **list of acceptable rejection paths**,
+  not a single mandated one. The late fixture lists
+  `["pending_context_expired", "responded_at_past_deadline"]` because
+  its `commit_at` (09:06) is past the local deadline too — a
+  conforming processor may reject at pending-context expiry before
+  the `responded_at` predicate. The required outcome is identical on
+  every path.
+- `state_note` (on `active-recheck`) labels the intentionally seeded
+  stale state: the prior watermark is 55 minutes past the 24h cap at
+  request time, so no delivery is allowed until the recheck succeeds
+  and re-anchors it. The exchange is the fail-closed-then-recover
+  path, not an "approaching the cap" timeline.
 
 ---
 

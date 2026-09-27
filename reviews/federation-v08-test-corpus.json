@@ -53,6 +53,7 @@
         "tombstone_present": false
       },
       "prior_watermark": "2026-09-26T06:00:00Z",
+      "state_note": "Intentionally seeded STALE: at request time the prior watermark is 55 min past the 24h cap, so no delivery is allowed under the grant until this recheck succeeds and re-anchors the watermark to 06:57:00Z. This exchange is the fail-closed-then-recover path, not an 'approaching the cap' timeline.",
       "requester_clock": {
         "requested_at": "2026-09-27T06:55:00Z",
         "deadline": "2026-09-27T07:00:00Z",
@@ -110,7 +111,10 @@
       },
       "expected": {
         "outcome": "reject",
-        "reject_rule": "responded_at_past_deadline",
+        "reject_rule": [
+          "pending_context_expired",
+          "responded_at_past_deadline"
+        ],
         "state_changed": false,
         "nonce_consumed": false
       }

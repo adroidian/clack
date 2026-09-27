@@ -374,6 +374,12 @@ exchanges = [
         "installed_grant": {"grant_id": GRANT_ID, "generation": 1,
                             "tombstone_present": False},
         "prior_watermark": "2026-09-26T06:00:00Z",
+        "state_note": "Intentionally seeded STALE: at request time the "
+                      "prior watermark is 55 min past the 24h cap, so no "
+                      "delivery is allowed under the grant until this "
+                      "recheck succeeds and re-anchors the watermark to "
+                      "06:57:00Z. This exchange is the fail-closed-then-"
+                      "recover path, not an 'approaching the cap' timeline.",
         "requester_clock": {
             "requested_at": "2026-09-27T06:55:00Z",
             "deadline": "2026-09-27T07:00:00Z",
@@ -425,7 +431,16 @@ exchanges = [
         },
         "expected": {
             "outcome": "reject",
-            "reject_rule": "responded_at_past_deadline",
+            # A conforming processor may reject at the pending-context
+            # expiry / commit-time check (commit_at=09:06 is past the
+            # 08:00 local deadline) BEFORE reaching the responded_at
+            # predicate — either rejection path is acceptable. The exact
+            # responded_at <= deadline assertion is the static predicate
+            # test (T2-31). Required outcome is identical on every path:
+            # no grant/tombstone/watermark updates, and no nonce consumed
+            # by a successful response.
+            "reject_rule": ["pending_context_expired",
+                            "responded_at_past_deadline"],
             "state_changed": False,
             "nonce_consumed": False,
         },
