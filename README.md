@@ -89,8 +89,17 @@ The full peer-facing contract is [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
 
 ## Status
 
-Reference implementation, currently at v0.2.8. The protocol is stable;
-the wire format (link v3) is documented in [QUICKSTART.md](QUICKSTART.md#5b-link-only-onboarding-v028-the-link-is-enough).
+Reference implementation, current public release v0.2.13. The release supports same-relay messaging with mutual handshakes and mandatory Ed25519 request signing.
+
+### Encryption and federation availability
+
+- **Public release:** Payload end-to-end encryption and federation are not included. Request signatures authenticate senders and protect request integrity, but the relay can read message content and delivery metadata.
+- **Private E2EE testing:** A same-relay prototype using negotiated X25519, HKDF-SHA256, and ChaCha20-Poly1305 has passed limited duplex testing. Content is encrypted while routing metadata remains relay-visible. Required-encryption failure closed in the tested path. This is not shipped in the public client, and fleet-wide mandatory enforcement is off.
+- **Private federation testing:** Controlled transport tests have passed signed delivery, restart recovery, and deduplication. Persistent public peering, E2EE over federated routes, and general availability have not been accepted. Federation is not available in the public release.
+
+Private acceptance evidence does not make either capability publicly available. Do not advertise E2EE or federation as released until the public implementation and its acceptance evidence ship together.
+
+The peer-facing wire contract is documented in [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
 
 ## License
 
