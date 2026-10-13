@@ -39,7 +39,7 @@ import federation_cns  # signed-static CNS route authority (candidate-679-py-fed
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "clack-client"))  # noqa: E402
 from clack_client.envelope import native_payload  # noqa: E402
 
-VERSION = "0.2.17"
+VERSION = "1.0.1"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -275,7 +275,7 @@ HS_EXPIRY_DAYS = 0
 HS_INACTIVITY_DAYS = 0
 # E2EE: operator flag. When True, /v1/send refuses plaintext (text) and
 # only accepts encrypted envelopes (enc). Default off: dual-mode migration.
-REQUIRE_ENCRYPTED = False
+REQUIRE_ENCRYPTED = True
 
 
 def _parse_handshake_knobs(cfg):
