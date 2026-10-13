@@ -33,7 +33,7 @@ Create a directory for the relay's state and a config file in it
 CLACK_RELAY_BASE=/path/to/relay-home setsid python3 relay.py \
   >> relay-home/relay.log 2>&1 &
 curl -s http://127.0.0.1:18997/health
-# → {"ok": true, "version": "0.2.9", "total_pending": 0}
+# → {"ok": true, "version": "1.0.0", "total_pending": 0}
 ```
 
 The relay reads `relay-config.json` and `relay.db` from

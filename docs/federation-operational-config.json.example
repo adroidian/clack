@@ -1,0 +1,35 @@
+{
+  "schema": "clack-federation-operational-v1",
+  "proof_only": false,
+  "state_dir": "/var/lib/clack-federation/operator-owned-pair",
+  "bootstrap_ref": "/etc/clack-federation/approved-bootstrap.json",
+  "ndr_key_ref": "/etc/clack-federation/existing-ndr.key",
+  "verifier_pub_ref": "/etc/clack-federation/approved-verifier.pub",
+  "verifier_id": "operator-approved-verifier",
+  "timeout": 15,
+  "partition_cap_s": 3600,
+  "endpoints": {
+    "remote-send": {
+      "url": "https://203.0.113.10:8443",
+      "peer": "existing-local-identity",
+      "token_ref": "/etc/clack-federation/remote-service-token.ref",
+      "key_ref": "/etc/clack-federation/existing-local-identity.key",
+      "pin_ref": "/etc/clack-federation/remote-origin-pins.json"
+    },
+    "local-receive": {
+      "url": "http://127.0.0.1:18803",
+      "peer": "existing-local-identity",
+      "token_ref": "/etc/clack-federation/local-service-token.ref",
+      "key_ref": "/etc/clack-federation/existing-local-identity.key",
+      "pin_ref": "/etc/clack-federation/local-origin-pins.json"
+    }
+  },
+  "routes": {
+    "existing-approved-pair-grant": {
+      "send_endpoint": "remote-send",
+      "to": "existing-remote-identity",
+      "receive_endpoint": "local-receive",
+      "from": "existing-remote-identity"
+    }
+  }
+}

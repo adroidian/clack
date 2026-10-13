@@ -5,7 +5,8 @@
 # tears everything down. Nothing touches the production relay.
 # Assertions: auth, mandatory Ed25519 request signing (v0.2.12 negative
 # matrix: unsigned/tampered/replay/stale-nonce/unknown-key/upgrade_required),
-# validation, dedup/409, poll isolation, at-least-once, ack, fetch
+# validation, dedup/409, poll isolation, at-least-once redelivery with
+# redelivered/delivery_count flags (issue #4), ack, fetch
 # visibility, TTL expiry, 500-recipient cap, identity challenge (fresh-nonce
 # PKCS#1 v1.5 SHA-256 + tamper/bad-nonce rejects), 60/min rate limit,
 # kill -9 restart durability, peer revocation (removed peer 401s after
@@ -368,12 +369,39 @@ CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages'][0]['id']")" = "$ID1" ] \
   && [ "$(jget "['messages'][0]['from']")" = "alice" ] \
   && [ "$(jget "['messages'][0]['text']")" = "hi bob" ] && ok "poll delivers" || bad "poll" "$CODE $(cat "$BODY")"
+[ "$(jget "['messages'][0]['redelivered']")" = "False" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "1" ] \
+  && ok "first delivery not flagged redelivered" || bad "first-delivery flags" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/poll?timeout=1" "$TA")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages']")" = "[]" ] && ok "poll isolation (alice sees none)" || bad "poll isolation" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$(jget "['messages'][0]['id']")" = "$ID1" ] && ok "at-least-once re-poll before ack" || bad "re-poll" "$(cat "$BODY")"
+[ "$(jget "['messages'][0]['redelivered']")" = "True" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "2" ] \
+  && ok "re-poll flagged redelivered with count" || bad "redelivery flags" "$(cat "$BODY")"
+
+# --- issue #4: mid-read poll drop must not lose mail --------------------------
+# Simulates the 2026-09-24 field incident: carol's poll response is "lost"
+# (fetched server-side, bytes never processed client-side, no ack). The
+# next poll must redeliver the same message, flagged.
+MID="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$MID\",\"to\":\"carol\",\"text\":\"drop test\"}")"
+[ "$CODE" = "200" ] && ok "issue4 send" || bad "issue4 send" "$CODE $(cat "$BODY")"
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages'][0]['id']")" = "$MID" ] \
+  && [ "$(jget "['messages'][0]['redelivered']")" = "False" ] && ok "issue4 first fetch" || bad "issue4 fetch" "$(cat "$BODY")"
+# client "crashes" here: no ack, response discarded.
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages'][0]['id']")" = "$MID" ] \
+  && [ "$(jget "['messages'][0]['redelivered']")" = "True" ] \
+  && [ "$(jget "['messages'][0]['delivery_count']")" = "2" ] \
+  && ok "issue4 redelivery after dropped read" || bad "issue4 redeliver" "$(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TC" "{\"ids\":[\"$MID\"]}")"
+[ "$(jget "['acked']")" = "['$MID']" ] && ok "issue4 ack" || bad "issue4 ack" "$(cat "$BODY")"
+CODE="$(req GET "/v1/poll?timeout=1" "$TC")"
+[ "$(jget "['messages']")" = "[]" ] && ok "issue4 ack retires message" || bad "issue4 retire" "$(cat "$BODY")"
 
 RID="$(newid)"
 CODE="$(req POST /v1/send "$TB" "{\"id\":\"$RID\",\"to\":\"alice\",\"text\":\"got it\",\"in_reply_to\":\"$ID1\"}")"
@@ -383,11 +411,56 @@ CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$ID1\"]}")"
 [ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$ID1']" ] && ok "ack" || bad "ack" "$CODE $(cat "$BODY")"
 CODE="$(req GET "/v1/poll?timeout=1" "$TB")"
 [ "$(jget "['messages']")" = "[]" ] && ok "acked message gone from poll" || bad "acked poll" "$(cat "$BODY")"
+CODE="$(req GET "/v1/receipts?limit=10" "$TA")"
+RSTATE="$(python3 -c "
+import json
+try:
+    rs = json.load(open('$BODY'))['receipts']
+    r = [x for x in rs if x['id'] == '$ID1'][0]
+    print(r['state'], r['fetch_count'])
+except Exception:
+    print('ERR')
+")"
+[ "$CODE" = "200" ] && [ "$RSTATE" = "acked 2" ] && ok "receipts show state + fetch_count" || bad "receipts" "$CODE $RSTATE"
 
 CODE="$(req POST /v1/ack "$TA" "{\"ids\":[\"$RID\"]}")"  # alice acks bob->alice msg: fine
 [ "$(jget "['acked']")" = "['$RID']" ] && ok "ack own message" || bad "ack own" "$(cat "$BODY")"
 CODE="$(req POST /v1/ack "$TC" "{\"ids\":[\"$RID\"]}")"  # carol acks others' msg: no-op
-[ "$(jget "['acked']")" = "[]" ] && ok "cross-peer ack no-op" || bad "cross-peer ack" "$(cat "$BODY")"
+[ "$(jget "['acked']")" = "[]" ] && [ "$(jget "['unknown']")" = "['$RID']" ] && ok "cross-peer ack no-op (unknown, not acked)" || bad "cross-peer ack" "$(cat "$BODY")"
+
+# --- BUG-002: ack outcomes must be idempotent and queryable -------------------
+# Simulates the field incident: ack applies, connection drops before the
+# client reads the response. The retry must distinguish "already applied"
+# from "never existed" without an extra poll.
+AID="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$AID\",\"to\":\"bob\",\"text\":\"ack-outcome\"}")"
+[ "$CODE" = "200" ] && ok "bug2 setup send" || bad "bug2 setup" "$CODE $(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$AID\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$AID']" ] \
+  && [ "$(jget "['already_acked']")" = "[]" ] \
+  && [ "$(jget "['unknown']")" = "[]" ] \
+  && ok "ack first call: acked" || bad "ack first" "$(cat "$BODY")"
+# client "loses" the response here; retry with the same ids.
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$AID\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "[]" ] \
+  && [ "$(jget "['already_acked']")" = "['$AID']" ] \
+  && [ "$(jget "['unknown']")" = "[]" ] \
+  && ok "ack retry after drop: already_acked (not ambiguous)" || bad "ack retry" "$(cat "$BODY")"
+NOPE="$(newid)"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$NOPE\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "[]" ] \
+  && [ "$(jget "['already_acked']")" = "[]" ] \
+  && [ "$(jget "['unknown']")" = "['$NOPE']" ] \
+  && ok "ack unknown id: unknown (not silent empty)" || bad "ack unknown" "$(cat "$BODY")"
+# mixed batch: one new, one already-acked, one unknown.
+BID2="$(newid)"
+CODE="$(req POST /v1/send "$TA" "{\"id\":\"$BID2\",\"to\":\"bob\",\"text\":\"mixed\"}")"
+[ "$CODE" = "200" ] || bad "bug2 setup2" "$CODE $(cat "$BODY")"
+CODE="$(req POST /v1/ack "$TB" "{\"ids\":[\"$BID2\",\"$AID\",\"$NOPE\"]}")"
+[ "$CODE" = "200" ] && [ "$(jget "['acked']")" = "['$BID2']" ] \
+  && [ "$(jget "['already_acked']")" = "['$AID']" ] \
+  && [ "$(jget "['unknown']")" = "['$NOPE']" ] \
+  && ok "ack mixed batch: per-id outcomes" || bad "ack mixed" "$(cat "$BODY")"
 
 CODE="$(req GET "/v1/fetch?in_reply_to=$ID1" "$TA")"
 [ "$CODE" = "200" ] && [ "$(jget "['messages'][0]['id']")" = "$RID" ] && ok "fetch thread (participant)" || bad "fetch" "$CODE $(cat "$BODY")"
@@ -473,10 +546,10 @@ done
 # no crypto), and a live smoke proves signed requests aren't falsely 429'd.
 while IFS='|' read -r st nm dt; do
   [ "$st" = "ok" ] && ok "$nm" || bad "$nm" "$dt"
-done < <(python3 - <<'PYEOF'
-import importlib.util, time
+done < <(RELAY_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/relay.py" python3 - <<'PYEOF'
+import importlib.util, os, time
 spec = importlib.util.spec_from_file_location(
-    "relay", "/home/hatch/workspace/clack-relay/relay.py")
+    "relay", os.environ["RELAY_PY"])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 tok = "unittest-token-sha2"
 r = [m.rate_ok(tok) for _ in range(60)] + [m.rate_ok(tok)]

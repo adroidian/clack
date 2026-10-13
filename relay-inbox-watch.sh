@@ -27,7 +27,7 @@ with open(seenfile, 'a') as f:
 if not new:
     print('[%s] no new messages' % name)
 for m in new:
-    print('[%s] NEW from=%s topic=%s id=%s' % (name, m.get('from'), m.get('topic'), m.get('id')))
+    print('[%s] NEW from=%s topic=%s id=%s in_reply_to=%s' % (name, m.get('from'), m.get('topic'), m.get('id'), m.get('in_reply_to')))
     print((m.get('text') or '')[:600])
     print('---')
 EOF

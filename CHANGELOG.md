@@ -1,5 +1,122 @@
 # Clack relay changelog
 
+## v1.0.0 — E2EE-only, Fix A, federation (2026-10-12)
+
+**E2EE-only enforcement:** No plaintext fallback. The relay rejects plaintext
+sends; handlers reject plaintext receives. This closes the systemic downgrade
+vulnerability found in the Phase 5 canary (unguarded plaintext branch in
+capable clients).
+
+**Fix A — v4 link redeem upgrades active pairs:** Redeeming a v4 invitation
+link against an existing active pair now upgrades its capability instead of
+no-op. Includes provenance-bound role selection and canonical row-class
+handling (fails closed on unknown/missing/conflicting provenance).
+
+**Re-accept ownership binding:** Active re-accept is now bound to canonical
+actor ownership — only the established redeemer can write the capability.
+Fails closed on missing/conflicting evidence.
+
+**Federation:** Main relay (clack.kasnet.us) now federates with Ex node.
+Standing `own_home`, signed CNS projection, reciprocal pinned transport.
+Main→Ex→main encrypted duplex verified.
+
+**Self-service Ed25519 key registration:** The `401 upgrade_required` break
+from v0.2.15 is now self-healing: a token-only peer registers its own
+Ed25519 public key with just its Bearer token — no operator provisioning,
+no re-enrollment.
+
+### Server (relay.py)
+
+- **`POST /v1/register-key` (new):** Bearer-token authenticated, intentionally
+  **exempt from request signing** (it is the upgrade path for token-only
+  peers). Body `{"pubkey": <raw 43-char b64u | PEM SPKI>}`. The key is
+  validated as a real prime-order Ed25519 key, normalized to canonical raw
+  base64url, bound to the authenticated peer immediately, and persisted —
+  config-managed peers are written through to `relay-config.json`
+  (`identity_pubkeys`), atomic temp-file + `os.replace`. Self-enrolled peers
+  persist in the DB row (config re-read preserves non-config rows).
+  Rotation is supported: response
+  `{"registered": true, "peer": "<name>", "rotated": <bool>}`.
+- **Handshake redeem accepts optional `pubkey`:** a fresh enrollment can now
+  carry `{"pubkey": <raw|PEM>}` alongside `identity_pubkey` — the proof-of-key
+  binds whichever key the peer proved, so new peers register their key in the
+  same round trip instead of redeeming keyless and calling register-key after.
+  `identity_pubkey` remains the proof-of-possession anchor; the new field is
+  strictly additive (redeem without either still 400s).
+- All other auth-path behavior unchanged: wrong/missing pubkey → 400
+  `bad_pubkey` / `pubkey_required`; missing/bad token → 401; register-key is
+  the ONLY authenticated endpoint exempt from signing.
+
+### CLI (relay-cli.py)
+
+- **`register-key` subcommand:** for a token-only peer — generates a keypair
+  when missing (mode-600 private key file, never leaves the machine),
+  upgrades a legacy token config to an identity config in place, and POSTs
+  the public key to `/v1/register-key`. Reports `registered signing key`
+  vs `rotated signing key`.
+- BUG-007 is now `fixed-in-v1.0.0`: token-only peers self-register;
+  operator key provisioning is no longer required for the signing upgrade.
+
+### Tests
+
+- New `test-register-key.py` (31 checks): token-only register 200
+  signature-exempt; 400s on missing/garbage/wrong-length/malformed-PEM keys;
+  401s on missing/bad token; rotation overwrite + `rotated` flag; old key
+  rejected after rotation; PEM normalization; config persistence +
+  restart survival; signed requests work post-registration; handshake redeem
+  with `pubkey` (PEM) binds at enrollment; CLI `register-key` round trip.
+
+## v0.2.16 — at-least-once durability (unreleased, in development)
+
+Message-durability release: the relay no longer loses mail to dropped
+connections, and revocation now fails closed on delivery.
+
+### Server (relay.py)
+
+- **At-least-once poll redelivery (issue #4):** poll responses carry
+  `redelivered` + `delivery_count` per message so clients can tell a retry
+  from a first delivery; dedupe on `id` as before. `collected_at` keeps the
+  first-fetch time (`COALESCE`); new `fetch_count` column (with migration)
+  counts every poll delivery, exposed on `/v1/receipts`. `collected_at` is
+  telemetry, not a delivery guarantee: **only ack retires a message**. A
+  poll response that never arrives no longer risks the mail. The sweep no
+  longer prunes collected-but-unacked rows on the collection timer; unacked
+  rows (collected or not) live until 7d past expiry, then go as dead
+  letters visible via `/v1/receipts`.
+- **BUG-002 — ack queryability:** `/v1/ack` returns per-id outcomes
+  (`acked` / `already_acked` / `unknown`), making ack retries idempotent
+  and queryable after dropped connections.
+- **BUG-008 — revoke dead-letters collected-but-unacked:** the revoke
+  sweep no longer requires `collected_at IS NULL` — ALL unacked mail
+  between the pair dies with the consent, because under at-least-once
+  "collected" no longer means delivered. New delivery boundary:
+  revocation cannot retract bytes already on the wire and cannot un-ack
+  an ack; everything else is dead-lettered with `handshake_revoked` and
+  never delivered after revoke-commit. Receipts report such rows as
+  `dead` (not `collected`). The poll collection marking skips rows that
+  died between fetch and marking (revoke committing in the gap).
+- **Fetch revocation filter (Aaron's call: revocation = revocation):**
+  `/v1/fetch` (thread recovery, which has no ack filter by design) now
+  respects revocation — a revoked pair's thread history is not fetchable
+  post-revoke, not even acked mail, not even with a known `in_reply_to`.
+  Dead-lettered rows are excluded at the SQL layer (`dead_reason IS
+  NULL`); remaining rows are filtered against the handshake status of
+  the other participant (explicit `revoked` only — legacy rows with no
+  handshake keep the old behavior). Non-revoked recovery is untouched:
+  acked-but-unexpired thread history stays fetchable.
+
+### Private-relay serving adapter (serve_relay.py, new in release path)
+
+- **Staged v0.2.15 adapter fixes merged (Path B cutover):** the bounded
+  serving adapter (24-slot semaphore, binds the tailnet address) now lives
+  in the release path. It sets `relay.relay_cfg` before init (handshake
+  mint-link needs it for `base_url`) and runs the full `_init_*` startup
+  sequence mirroring `main()` — including `_init_peer_hashes`, which
+  skipping would silently revoke hash-only peers (e.g. sigrid) on startup.
+  Verified against v0.2.16 `relay.py`: all init entry points present;
+  canaried on Omni scratch port (5/5 peers incl. sigrid, signed auth,
+  mint-link, signed poll).
+
 ## v0.2.13 — handshake release (2026-09-24)
 
 Mutual-consent handshakes gate all messaging; client transport release gate

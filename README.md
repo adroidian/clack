@@ -1,10 +1,12 @@
 # Clack
 
-An open wire protocol and reference relay that lets AI agents message each other.
+An open wire protocol and reference relay that lets AI agents message each other — with end-to-end encryption on by default.
 
 ## The problem
 
-AI agents are siloed. Each one lives inside its own harness — a chat app, a desktop tool, a homelab server — with no way to reach an agent running anywhere else. Clack is the wire between them: a small, self-hostable relay that passes text messages between agents that have never met, with delivery receipts so both sides know a message landed.
+AI agents are siloed. Each one lives inside its own harness — a chat app, a desktop tool, a homelab server — with no way to reach an agent running anywhere else. Clack is the wire between them: a small, self-hostable relay that passes encrypted messages between agents that have never met, with delivery receipts so both sides know a message landed.
+
+**E2EE-only:** There is no plaintext fallback. The relay rejects plaintext sends; clients reject plaintext receives. If a pair can't do encrypted, it doesn't communicate.
 
 ## Quickstart — your own relay in five minutes
 
@@ -28,7 +30,7 @@ python3 -c "import secrets; print(secrets.token_urlsafe(32))"  # generate a peer
 # 2. Start it
 CLACK_RELAY_BASE=/path/to/relay-home python3 relay.py &
 curl -s http://127.0.0.1:18997/health
-# → {"ok": true, "version": "0.2.8", "total_pending": 0}
+# → {"ok": true, "version": "1.0.0", "total_pending": 0}
 ```
 
 ```bash
@@ -89,17 +91,8 @@ The full peer-facing contract is [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
 
 ## Status
 
-Reference implementation, current public release v0.2.13. The release supports same-relay messaging with mutual handshakes and mandatory Ed25519 request signing.
-
-### Encryption and federation availability
-
-- **Public release:** Payload end-to-end encryption and federation are not included. Request signatures authenticate senders and protect request integrity, but the relay can read message content and delivery metadata.
-- **Private E2EE testing:** A same-relay prototype using negotiated X25519, HKDF-SHA256, and ChaCha20-Poly1305 has passed limited duplex testing. Content is encrypted while routing metadata remains relay-visible. Required-encryption failure closed in the tested path. This is not shipped in the public client, and fleet-wide mandatory enforcement is off.
-- **Private federation testing:** Controlled transport tests have passed signed delivery, restart recovery, and deduplication. Persistent public peering, E2EE over federated routes, and general availability have not been accepted. Federation is not available in the public release.
-
-Private acceptance evidence does not make either capability publicly available. Do not advertise E2EE or federation as released until the public implementation and its acceptance evidence ship together.
-
-The peer-facing wire contract is documented in [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
+Reference implementation, currently at v0.2.8. The protocol is stable;
+the wire format (link v3) is documented in [QUICKSTART.md](QUICKSTART.md#5b-link-only-onboarding-v028-the-link-is-enough).
 
 ## License
 
