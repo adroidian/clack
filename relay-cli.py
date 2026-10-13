@@ -1813,18 +1813,36 @@ def cmd_redeem(args):
     # pin-verified origin -- check_relay_identity above guaranteed a
     # verifiable relay identity, and the pin is stored below.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
-        code, sent = req(cfg, "POST", "/v1/send", {
+        hello_text = ("hello %s -- joined via your invite link "
+                      "(Clack onboarding MVP)" % inviter)
+        hello_body = {
             "id": hello_id,
             "to": inviter,
             "topic": "introductions",
-            "text": "hello %s -- joined via your invite link (Clack onboarding MVP)" % inviter,
-        }, base=relay_url)
-        if 200 <= code < 300:
-            print("hello sent to %s (id %s)" % (inviter, hello_id))
+        }
+        try:
+            env, reason = _e2ee_encrypt_for(cfg, inviter, hello_text,
+                                           base_url=relay_url)
+        except E2EEError as ex:
+            print("hello skipped: encryption failed (%s)" % ex,
+                  file=sys.stderr)
+            env, reason = None, "encryption failed"
+        if env is not None:
+            hello_body["enc"] = env
+            code, sent = req(cfg, "POST", "/v1/send", hello_body,
+                             base=relay_url)
+            if 200 <= code < 300:
+                print("hello sent to %s (id %s, encrypted)" % (inviter, hello_id))
+            else:
+                print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
         else:
-            print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+            print("hello skipped: pair not enc_capable (%s); "
+                  "not sending plaintext" % reason, file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     else:
         print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)
@@ -2134,18 +2152,36 @@ def cmd_enroll(args):
     # origin -- check_relay_identity above guaranteed a verifiable relay
     # identity, and the pin is stored above.
     inviter = out.get("inviter_name")
-    if inviter:
+    if inviter and cfg.get("relay_identity_fingerprint"):
         hello_id = str(uuid.uuid4())
-        code, sent = req(cfg, "POST", "/v1/send", {
+        hello_text = ("hello %s -- self-enrolled on the relay "
+                      "(Clack agent onboarding)" % inviter)
+        hello_body = {
             "id": hello_id,
             "to": inviter,
             "topic": "introductions",
-            "text": "hello %s -- self-enrolled on the relay (Clack agent onboarding)" % inviter,
-        }, base=relay_url)
-        if 200 <= code < 300:
-            print("hello sent to %s (id %s)" % (inviter, hello_id))
+        }
+        try:
+            env, reason = _e2ee_encrypt_for(cfg, inviter, hello_text,
+                                           base_url=relay_url)
+        except E2EEError as ex:
+            print("hello skipped: encryption failed (%s)" % ex,
+                  file=sys.stderr)
+            env, reason = None, "encryption failed"
+        if env is not None:
+            hello_body["enc"] = env
+            code, sent = req(cfg, "POST", "/v1/send", hello_body,
+                             base=relay_url)
+            if 200 <= code < 300:
+                print("hello sent to %s (id %s, encrypted)" % (inviter, hello_id))
+            else:
+                print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
         else:
-            print("hello failed: %s" % json.dumps(sent), file=sys.stderr)
+            print("hello skipped: pair not enc_capable (%s); "
+                  "not sending plaintext" % reason, file=sys.stderr)
+    elif inviter:
+        print("note: relay has no identity key; skipping hello rather than "
+              "sending credentials to an unverified relay")
     else:
         print("note: inviter has no messageable peer name; skipping hello")
     print("config saved: %s" % args.config)

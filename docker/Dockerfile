@@ -13,12 +13,12 @@
 FROM python:3.12-slim@sha256:44ff437bba879d4941b710a369a8f19266aea34b29002807f0c487fabc9eec9b
 
 LABEL org.opencontainers.image.title="clack-relay" \
-      org.opencontainers.image.version="1.0.3" \
+      org.opencontainers.image.version="1.0.4" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/adroidian/clack"
 
-ARG BUNDLE=clack-relay-bundle-v1.0.3.tar.gz
-ARG BUNDLE_SHA256=61220eb5fb0ef6947ae045ab3eedbadc4c1fbdd89e55b0208e4817b779ed7393
+ARG BUNDLE=clack-relay-bundle-v1.0.4.tar.gz
+ARG BUNDLE_SHA256=7a60757ac65e9d968065acba060146f1ca952981e77eb73247635087eedaa83a
 COPY ${BUNDLE} /tmp/bundle.tgz
 RUN set -eux; \
     echo "${BUNDLE_SHA256}  /tmp/bundle.tgz" | sha256sum -c -; \
