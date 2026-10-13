@@ -39,7 +39,7 @@ import federation_cns  # signed-static CNS route authority (candidate-679-py-fed
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "clack-client"))  # noqa: E402
 from clack_client.envelope import native_payload  # noqa: E402
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
