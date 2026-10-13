@@ -17,8 +17,8 @@ LABEL org.opencontainers.image.title="clack-relay" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/adroidian/clack"
 
-ARG BUNDLE=clack-relay-bundle-v1.0.0.tar.gz
-ARG BUNDLE_SHA256=7b445b8571a7f376580df31f412a380cc597cc38d79147bf7efe6d0aef168c69
+ARG BUNDLE=clack-relay-bundle-v1.0.2.tar.gz
+ARG BUNDLE_SHA256=c3a401b1b857d1d9d745dbe6fe618af389b7a9c09cfa014332c8b34221283d8f
 COPY ${BUNDLE} /tmp/bundle.tgz
 RUN set -eux; \
     echo "${BUNDLE_SHA256}  /tmp/bundle.tgz" | sha256sum -c -; \
