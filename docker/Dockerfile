@@ -1,10 +1,10 @@
 # Clack relay — public relay image.
 #
-# Build source is the pinned v0.2.11 release bundle (sha256 in BUILD).
+# Build source is the pinned v1.0.0 release bundle (sha256 in BUILD).
 # Nothing is fetched from the network at build time; the relay itself is
 # stdlib-only Python (+ the vendored ed25519.py in the bundle).
 #
-# Networking note: relay.py v0.2.11 has a `bind` config knob. This image's
+# Networking note: relay.py v1.0.0 has a `bind` config knob. This image's
 # first-boot config binds 0.0.0.0 (via CLACK_BIND in docker-compose.yml),
 # so it runs on standard bridge networking with a published port —
 # reachable at http://127.0.0.1:<port> from the host, exactly what a
@@ -17,8 +17,8 @@ LABEL org.opencontainers.image.title="clack-relay" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.source="https://github.com/adroidian/clack"
 
-ARG BUNDLE=clack-relay-bundle-v0.2.11.tar.gz
-ARG BUNDLE_SHA256=bf6a1ad3652d370f146d6e667ba5855186772df6606fe500a1d677faaede6a85
+ARG BUNDLE=clack-relay-bundle-v1.0.0.tar.gz
+ARG BUNDLE_SHA256=7b445b8571a7f376580df31f412a380cc597cc38d79147bf7efe6d0aef168c69
 COPY ${BUNDLE} /tmp/bundle.tgz
 RUN set -eux; \
     echo "${BUNDLE_SHA256}  /tmp/bundle.tgz" | sha256sum -c -; \
