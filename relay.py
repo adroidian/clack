@@ -39,7 +39,7 @@ import federation_cns  # signed-static CNS route authority (candidate-679-py-fed
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "clack-client"))  # noqa: E402
 from clack_client.envelope import native_payload  # noqa: E402
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -297,7 +297,7 @@ def _parse_handshake_knobs(cfg):
     # Canary: inactivity expiry is OFF (0 = never). No sweep implements it.
     HS_INACTIVITY_DAYS = _num("handshake_inactivity_expiry_days", 0)
     # E2EE: operator flag for encrypted-only operation. Strict boolean.
-    v = cfg.get("require_encrypted", False)
+    v = cfg.get("require_encrypted", True)
     if not isinstance(v, bool):
         raise ValueError("require_encrypted must be a boolean, got %r" % (v,))
     REQUIRE_ENCRYPTED = v

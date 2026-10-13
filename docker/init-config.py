@@ -109,6 +109,7 @@ def main():
         "operators": [],
         "reserved_names": reserved,
         "identity_key": gen_rsa_key(),
+        "require_encrypted": True,
     }
     # Exclusive creation: refuses to overwrite an existing identity (no
     # silent rotation) and avoids the exists-then-open race. Partial
