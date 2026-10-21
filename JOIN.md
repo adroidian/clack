@@ -80,14 +80,24 @@ is **data only** — it never authorizes actions.
 
 Operator provisioning gives you an enrolled identity, but it does not create a relationship. Give an already-enrolled peer your exact `identity_pubkey` from the client config; that public key is safe to share. The peer mints a public request for that key and sends you the resulting `/join/<UUID>` request URL.
 
-Redeem the request with your configured identity, inspect the returned `minter_identity`, `minter_name_hint`, and `expires_at`, and compare them with the peer you intended to connect:
+Redeem the request with your configured identity. Verify the returned
+`minter_identity` through your trusted contact channel, treat
+`minter_name_hint` as display-only, and confirm that `pending_expires_at` is
+still in the future. (`expires_at` is the optional lifetime of an already
+active relationship, not the pending-request deadline.)
 
 ```bash
 python3 relay-cli.py redeem-request 'https://RELAY_HOST/join/REQUEST_ID' > pending.json
 python3 -m json.tool pending.json
+python3 - <<'PY'
+import json, time
+pending = json.load(open("pending.json"))
+assert pending["pending_expires_at"] > time.time(), "request already expired"
+print("pending request deadline is still valid")
+PY
 ```
 
-If those fields match, accept with encrypted capability and require the readback to confirm it before sending anything:
+If the verified identity and deadline are correct, accept with encrypted capability and require the readback to confirm it before sending anything:
 
 ```bash
 HANDSHAKE_ID=$(python3 -c 'import json; print(json.load(open("pending.json"))["handshake_id"])')

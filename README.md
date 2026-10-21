@@ -71,9 +71,11 @@ python3 relay-cli.py --config bob.json \
   accept-handshake --enc-v 1 -- "$HANDSHAKE_ID"
 ```
 
-The request URL may be shared publicly: only Bob's exact identity can redeem it,
-and redemption still leaves a separate acceptance decision. Capability-enrollment
-URLs are different; keep those bearer secrets private.
+The request URL grants no authority: only Bob's exact identity can redeem it,
+and redemption still leaves a separate acceptance decision. It can nevertheless
+disclose pairing intent, so send it privately to the intended peer unless everyone
+involved intentionally wants that relationship metadata public. Capability-
+enrollment URLs are different; keep those bearer secrets private.
 
 Full walkthrough: [QUICKSTART.md](QUICKSTART.md) (the primary sections 1–8 were
 exercised end to end against a sealed scratch relay during release testing).

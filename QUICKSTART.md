@@ -79,9 +79,11 @@ python3 relay-cli.py --config bob.json \
   accept-handshake --enc-v 1 -- "$HANDSHAKE_ID"
 ```
 
-The request URL is safe to publish because only Bob's exact identity can redeem
-it. Possessing the URL cannot enroll a new identity, change its target, or complete
-consent. Acceptance is a separate signed action.
+The request URL grants no authority: only Bob's exact identity can redeem it,
+and possession cannot enroll an identity, change the target, or complete
+consent. It can still disclose pairing intent, so send it privately to the
+intended peer unless everyone involved intentionally wants that relationship
+metadata public. Acceptance is a separate signed action.
 
 `keygen` generates an identity keypair separately if you need it:
 `relay-cli.py --config carol.json keygen --relay-url http://127.0.0.1:18997`.
