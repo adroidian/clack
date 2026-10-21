@@ -22,6 +22,10 @@ and compatible v4 capability invitations remain private bearer secrets.
   generation and request ownership. Explicit signed accept remains mandatory.
 - Public request records are excluded from legacy enrollment challenges and use
   rate-limit namespaces disjoint from legacy secret-capability redemption.
+- Config-managed peer refresh now updates authority-owned fields in place instead
+  of deleting and recreating surviving rows, preserving row IDs, creation times,
+  display metadata and activity timestamps across restart. A config name that
+  collides with an independently enrolled peer now fails closed.
 
 ### Clients
 
@@ -40,6 +44,8 @@ and compatible v4 capability invitations remain private bearer secrets.
   live-credential test was skipped.
 - Standalone downloaded-client bootstrap/integration: 4/4 passed, including encrypted
   request/reply with unchanged identity configuration.
+- Config-peer restart preservation: 2/2 passed, including a takeover-collision
+  negative control.
 - Independent follow-up review approved the repaired feature tree with zero open
   findings. The inherited broad-suite failures remain documented in
   `docs/short-invitations-verification.md`; they were identical on the untouched base

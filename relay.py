@@ -1503,29 +1503,45 @@ def init_db(cfg):
                 conn.execute(
                     "DELETE FROM webhooks WHERE peer=?", (name,))
                 conn.execute(
+                    "DELETE FROM peers WHERE name=?", (name,))
+                conn.execute(
                     "INSERT OR IGNORE INTO retired_names(name, retired_at)"
                     " VALUES(?,?)",
                     (name, now_r),
                 )
-        conn.execute(
-            "DELETE FROM peers WHERE enroll_gate='config' "
-            "OR (enroll_gate IS NULL AND identity_pubkey IS NULL)"
-        )
-        conn.executemany(
-            "INSERT INTO peers(name, token_hash, created_at, identity_pubkey, enroll_gate)"
-            " VALUES(?,?,?,?,?)",
-            [
-                (name, hashlib.sha256(token.encode("utf-8")).hexdigest(), now,
-                 _IDENTITY_PUBKEYS.get(name), "config")
-                for name, token in cfg.get("peers", {}).items()
-            ] + [
-                # Hash-only peers: the token hash comes straight from the
-                # validated peer_hashes map. The plaintext token is never
-                # present on this host -- nothing to derive, nothing to log.
-                (name, token_hash, now, _IDENTITY_PUBKEYS.get(name), "config")
-                for name, token_hash in _PEER_HASHES.items()
-            ],
-        )
+        configured_rows = [
+            (name, hashlib.sha256(token.encode("utf-8")).hexdigest(),
+             _IDENTITY_PUBKEYS.get(name))
+            for name, token in cfg.get("peers", {}).items()
+        ] + [
+            # Hash-only peers: the token hash comes straight from the
+            # validated peer_hashes map. The plaintext token is never
+            # present on this host -- nothing to derive, nothing to log.
+            (name, token_hash, _IDENTITY_PUBKEYS.get(name))
+            for name, token_hash in _PEER_HASHES.items()
+        ]
+        for name, token_hash, identity_pubkey in configured_rows:
+            if name in existing_config:
+                # Refresh authority-owned fields in place. Replacing the row
+                # would change rowid/created_at and erase activity timestamps
+                # on every restart.
+                conn.execute(
+                    "UPDATE peers SET token_hash=?, identity_pubkey=?, "
+                    "enroll_gate='config' WHERE name=?",
+                    (token_hash, identity_pubkey, name),
+                )
+            else:
+                try:
+                    conn.execute(
+                        "INSERT INTO peers(name, token_hash, created_at, "
+                        "identity_pubkey, enroll_gate) VALUES(?,?,?,?,?)",
+                        (name, token_hash, now, identity_pubkey, "config"),
+                    )
+                except sqlite3.IntegrityError:
+                    raise SystemExit(
+                        "clack relay: config-managed peer name collides with "
+                        "an enrolled peer: %s" % name
+                    ) from None
         if incoming:
             conn.execute(
                 "DELETE FROM retired_names WHERE name IN (%s)"
