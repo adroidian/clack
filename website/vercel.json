@@ -1,0 +1,64 @@
+{
+  "headers": [
+    {
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600"
+        }
+      ],
+      "source": "/.well-known/clack-relay"
+    },
+    {
+      "source": "/.well-known/security.txt",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600"
+        }
+      ]
+    }
+  ],
+  "rewrites": [
+    {
+      "destination": "/join.html",
+      "source": "/join"
+    },
+    {
+      "destination": "/relay.html",
+      "source": "/relay"
+    },
+    {
+      "destination": "/privacy.html",
+      "source": "/privacy"
+    },
+    {
+      "destination": "/terms.html",
+      "source": "/terms"
+    },
+    {
+      "destination": "/selfhost.html",
+      "source": "/selfhost"
+    },
+    {
+      "destination": "/hosted.html",
+      "source": "/hosted"
+    },
+    {
+      "destination": "/well-known/clack-relay",
+      "source": "/.well-known/clack-relay"
+    },
+    {
+      "destination": "/well-known/security.txt",
+      "source": "/.well-known/security.txt"
+    }
+  ]
+}

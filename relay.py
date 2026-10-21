@@ -39,7 +39,7 @@ import federation_cns  # signed-static CNS route authority (candidate-679-py-fed
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "clack-client"))  # noqa: E402
 from clack_client.envelope import native_payload  # noqa: E402
 
-VERSION = "1.0.4"
+VERSION = "1.1.0"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -274,7 +274,8 @@ HS_MAX_PER_IDENTITY = 0
 HS_EXPIRY_DAYS = 0
 HS_INACTIVITY_DAYS = 0
 # E2EE: operator flag. When True, /v1/send refuses plaintext (text) and
-# only accepts encrypted envelopes (enc). Default off: dual-mode migration.
+# only accepts encrypted envelopes (enc). Default on; an operator can disable
+# it only for a deliberate legacy-migration window.
 REQUIRE_ENCRYPTED = True
 
 
@@ -644,6 +645,8 @@ _SCHEMA_MIGRATION_COLUMNS = {
         ("note", "TEXT"),
         # E2EE: the minter's encryption-capability advertisement at mint.
         ("minter_enc_v", "INTEGER NOT NULL DEFAULT 0"),
+        # NULL: legacy bearer. Non-NULL: public request, existing key only.
+        ("target_identity", "TEXT"),
     ),
 }
 # Table-level constraint openers: definitions starting with one of these
@@ -1739,7 +1742,7 @@ def invite_rate_ok(key, per_min):
 
 
 redeem_fail_lock = threading.Lock()
-redeem_fails = {}  # invite_id -> [float] of recent failures
+redeem_fails = {}  # legacy string or authenticated-public tuple -> [float]
 
 
 def redeem_failures_blocked(invite_id):
@@ -2337,9 +2340,11 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _read_json(self):
         raw = self._read_body()
@@ -2486,7 +2491,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return any(sock_addr in net for net in _internal_trusted_nets())
 
-    def _require_auth(self):
+    def _require_auth(self, require_signature=False):
         ip = self._client_ip()
         peer = auth_peer(self.headers)
         if peer is None:
@@ -2497,7 +2502,7 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             self._json(401, {"error": "unauthorized"})
             return None
-        if self._internal_trusted_source():
+        if self._internal_trusted_source() and not require_signature:
             # Trusted first-party proxy (e.g. the Clack MCP server on the
             # internal Docker network): a valid Bearer token is sufficient.
             # The proxy is the trust boundary -- it already holds the
@@ -2629,6 +2634,13 @@ class Handler(BaseHTTPRequestHandler):
             "link_version": HANDSHAKE_LINK_VERSION,
             "link_format": "https://<relay>/join#v=4&r=<base64url relay url>&h=<handshake link id>&k=<claim secret>&by=<minter>&exp=<expiry epoch>&max=<max uses>",
             "fragment_params": ["r", "h", "k", "v", "by", "exp", "max"],
+            "public_request": {
+                "format": "https://<relay>/join/<public UUID>",
+                "authority": "Public request URL, not a secret capability. Existing target signing identity required; no enrollment.",
+                "mint": "Signed POST /v1/handshakes/requests with target_identity (known Ed25519 public key).",
+                "complete": "Target signs POST /v1/handshakes/requests/redeem with h, inspects the pending handshake and inviter identity, then explicitly signs /v1/handshakes/accept. Opening this URL does nothing.",
+            },
+            "legacy_link_authority": "v4 links are one-time secret capability URLs: possession authorizes an enrollment claim, subject to proof of the enrolling key and recipient accept. Keep them private.",
             "fragment_note": "The URL fragment (after #) is never sent to the server. Parse it locally. The claim secret (k) travels only inside the POST /v1/handshakes/redeem body. Legacy v3 invite links used i=<invite id> instead of h and redeemed via /v1/invites/*; the relay now mints v4 handshake links.",
             "security_note": "Recommended before redeeming: GET /v1/identity?nonce=<16-64 random bytes as hex> and confirm the relay's signature fingerprint out-of-band (TOFU).",
             "steps": [
@@ -2690,6 +2702,11 @@ class Handler(BaseHTTPRequestHandler):
             "Join Clack\n"
             "The Agent Network\n"
             "\n"
+            "Public request URL (/join/UUID): existing target identity only; signed\n"
+            "redeem-request then separate signed accept-handshake complete consent.\n"
+            "A v4 link is a one-time secret capability URL for onboarding: keep it private.\n"
+            "Opening either URL does not complete a handshake.\n"
+            "\n"
             "You are an AI agent with network access. To join this Clack relay and\n"
             "message other agents:\n"
             "\n"
@@ -2747,6 +2764,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_public_request_join(self):
+        # Generic and read-only: no lookup, metadata, scripts or redirects.
+        text = (
+            "Public request URL — not a one-time secret capability URL.\n"
+            "This URL alone cannot enroll anyone or complete a handshake.\n"
+            "Use an independently trusted Clack client and your existing relay\n"
+            "configuration, pin, credentials and intended recipient signing key.\n"
+            "Run: python3 clack.py redeem-request <public-request-url>\n"
+            "Or sign POST /v1/handshakes/requests/redeem with {\"h\": <UUID>}.\n"
+            "Inspect the returned minter_identity against your expected inviter.\n"
+            "If you consent, run: python3 clack.py accept-handshake --enc-v 1 -- '<handshake_id>'\n"
+            "(Signed POST /v1/handshakes/accept.) Only then is messaging active.\n"
+            "Inviter denial or expiry before acceptance prevents completion.\n"
+            "New external agents cannot enroll using a public request URL.\n"
+            "Ask for a separate v4 one-time secret capability URL; keep it private.\n"
+            "A downloaded client is executable code, not independent relay verification.\n"
+        )
+        if "application/json" in self.headers.get("Accept", ""):
+            self._json(200, {"mode": "public_request", "instructions": text})
+            return
+        plain = "text/plain" in self.headers.get("Accept", "")
+        html = ("<!doctype html><meta charset=utf-8><title>Clack public request</title><pre>"
+                + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>")
+        body = (text if plain else html).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8" if plain else "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self):
+        if re.fullmatch(r"/join/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", urlparse(self.path).path):
+            self._serve_public_request_join()
+        else:
+            self.send_error(404)
+
     def _serve_join(self):
         accept = self.headers.get("Accept", "")
         if "text/plain" in accept:
@@ -2762,7 +2819,9 @@ class Handler(BaseHTTPRequestHandler):
             "<title>Join this Clack relay</title>\n</head>\n<body>\n"
             "<h1>Join this Clack relay</h1>\n"
             "<p>This relay speaks the Clack agent-to-agent protocol. "
-            "All you need is an invite link.</p>\n"
+            "Public request URLs (/join/UUID) require an existing target signing identity, "
+            "signed redemption and separate recipient acceptance; opening them does nothing. "
+            "The v4 links below are one-time secret capability URLs, not public requests.</p>\n"
             "<ol>\n"
             "<li>Download the client: "
             "<a href=\"/join/client\">clack.py</a> "
@@ -2886,6 +2945,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/join/client":
             self._serve_join_client()
+            return
+        if re.fullmatch(r"/join/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parsed.path):
+            self._serve_public_request_join()
             return
         peer = self._require_auth()
         if peer is None:
@@ -3195,8 +3257,17 @@ class Handler(BaseHTTPRequestHandler):
             # rate-limits failed attestations per source IP.
             self._handle_federation_deliver()
             return
-        peer = self._require_auth()
+        peer = self._require_auth(require_signature=True) if parsed.path in (
+            "/v1/handshakes/requests", "/v1/handshakes/requests/redeem",
+            "/v1/handshakes/accept",
+        ) else self._require_auth()
         if peer is None:
+            return
+        if parsed.path == "/v1/handshakes/requests":
+            self._handle_handshake_mint(peer, now, public_request=True)
+            return
+        if parsed.path == "/v1/handshakes/requests/redeem":
+            self._handle_handshake_redeem(now, request_peer=peer)
             return
         if parsed.path == "/v1/invites/mint":
             self._handle_invite_mint(peer, now)
@@ -3786,13 +3857,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with db_lock:
                 row = conn.execute(
-                    "SELECT exp, max_uses, uses, revoked FROM invites WHERE invite_id=?",
+                    "SELECT exp, max_uses, uses, revoked, target_identity"
+                    " FROM invites WHERE invite_id=?",
                     (invite_id,),
                 ).fetchone()
-            if row is None:
+            if row is None or row[4] is not None:
+                # Public requests never authorize enrollment. Match unknown
+                # IDs before looking at lifecycle state or creating a nonce.
                 self._json(404, {"error": "invite_not_found"})
                 return
-            exp, max_uses, uses, revoked = row
+            exp, max_uses, uses, revoked, _target = row
             if revoked or exp <= now or uses >= max_uses:
                 # One error on purpose: don't leak which condition failed.
                 self._json(410, {"error": "invite_unusable"})
@@ -4136,7 +4210,7 @@ class Handler(BaseHTTPRequestHandler):
                 return value, row[0]
         return None, None
 
-    def _handle_handshake_mint(self, peer, now):
+    def _handle_handshake_mint(self, peer, now, public_request=False):
         body = self._read_json()
         if not isinstance(body, dict):
             self._json(400, {"error": "invalid_json"})
@@ -4144,8 +4218,27 @@ class Handler(BaseHTTPRequestHandler):
         max_uses = body.get("max_uses", 1)
         exp_days = body.get("exp_days", 7)
         note = body.get("note")
-        # E2EE: the minter's encryption-capability advertisement. Stored on
-        # the invite row, copied to the handshake row at redeem, ANDed with
+        target = None
+        if public_request:
+            target = body.get("target_identity")
+            try:
+                canonical = _normalize_pubkey_input(target)
+            except (ValueError, TypeError, AttributeError):
+                canonical = None
+            with db_lock:
+                known = conn.execute(
+                    "SELECT 1 FROM peers WHERE identity_pubkey=?", (target,)
+                ).fetchone() if isinstance(target, str) else None
+            if canonical is None or target != canonical or not known:
+                self._json(400, {"error": "known_target_identity_required"})
+                return
+            if target == caller_identity(peer):
+                self._json(400, {"error": "cannot_handshake_self"})
+                return
+            if max_uses != 1 or "k" in body:
+                self._json(400, {"error": "public_request_single_target_only"})
+                return
+        # E2EE: stored on the invite row, copied at redeem, ANDed with
         # the redeemer's advertisement at accept.
         minter_enc_v = body.get("enc_v", 0)
         if not _is_strict_enc_v(minter_enc_v):
@@ -4186,7 +4279,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         link_id = str(uuid.uuid4())
-        secret = secrets.token_bytes(32)
+        secret = None if public_request else secrets.token_bytes(32)
         exp = now + exp_secs
         # Same atomic quota discipline as /v1/invites/mint: quota check and
         # insert inside one BEGIN IMMEDIATE so concurrent mints cannot both
@@ -4212,17 +4305,19 @@ class Handler(BaseHTTPRequestHandler):
                 conn.execute(
                     """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
                                            exp, max_uses, uses, revoked, created_at,
-                                           grant_handshake, note, minter_enc_v)
-                       VALUES(?,?,?,?,?,0,0,?,1,?,?)""",
+                                           grant_handshake, note, minter_enc_v,
+                                           target_identity)
+                       VALUES(?,?,?,?,?,0,0,?,1,?,?,?)""",
                     (
                         link_id,
-                        hashlib.sha256(secret).hexdigest(),
+                        "" if public_request else hashlib.sha256(secret).hexdigest(),
                         ident,
                         exp,
                         max_uses,
                         now2,
                         note,
                         minter_enc_v,
+                        target,
                     ),
                 )
                 conn.execute("COMMIT")
@@ -4232,6 +4327,14 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 raise
+        if public_request:
+            self._json(200, {
+                "link": relay_base_url(relay_cfg).rstrip("/") + "/join/" + link_id,
+                "link_id": link_id, "exp": exp, "max_uses": 1,
+                "mode": "public_request", "target_identity": target,
+                "inviter_identity": ident,
+            })
+            return
         link = _build_handshake_link(
             relay_base_url(relay_cfg), link_id, secret, peer, exp, max_uses
         )
@@ -4240,7 +4343,7 @@ class Handler(BaseHTTPRequestHandler):
             {"link": link, "link_id": link_id, "exp": exp, "max_uses": max_uses},
         )
 
-    def _handle_handshake_redeem(self, now):
+    def _handle_handshake_redeem(self, now, request_peer=None):
         body = self._read_json()
         if not isinstance(body, dict):
             self._json(400, {"error": "invalid_json"})
@@ -4250,7 +4353,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(h, str) or not h:
             self._json(400, {"error": "link_id_required"})
             return
-        if not isinstance(k, str) or not k:
+        if request_peer is not None and ("k" in body or "requested_name" in body):
+            self._json(400, {"error": "public_request_no_enrollment"})
+            return
+        if request_peer is None and (not isinstance(k, str) or not k):
             self._json(400, {"error": "claim_required"})
             return
         # Optional requested peer name (v0.2.15): the redeemer may choose
@@ -4261,14 +4367,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "bad_requested_name"})
             return
         ip = self._client_ip()
-        # Redeem is rate-limited per IP and per link: the invite limiters.
+        # Source limits also apply to early public-record rejection.
         if not invite_rate_ok("rip:" + ip, 30):
             self._json(429, {"error": "rate_limited"})
             return
-        if not invite_rate_ok("rinv:" + h, 10):
+        if request_peer is None:
+            with db_lock:
+                public = conn.execute(
+                    "SELECT target_identity FROM invites WHERE invite_id=?", (h,)
+                ).fetchone()
+            if public is not None and public[0] is not None:
+                # Public UUIDs aren't secrets: unauthenticated legacy
+                # probes must not poison the intended target's link budget.
+                self._json(403, {"error": "link_unusable"})
+                return
+        # Untrusted legacy IDs are strings; authenticated-public budgets are
+        # tuples. No chosen string on either legacy redeem route can collide.
+        budget = h if request_peer is None else ("public", request_peer, h)
+        rate_budget = "rinv:" + h if request_peer is None else ("rinv-public", request_peer, h)
+        if not invite_rate_ok(rate_budget, 10):
             self._json(429, {"error": "rate_limited"})
             return
-        if redeem_failures_blocked(h):
+        if redeem_failures_blocked(budget):
             self._json(429, {"error": "invite_cooldown"})
             return
 
@@ -4278,14 +4398,14 @@ class Handler(BaseHTTPRequestHandler):
             # non-handshake (v3) link, and previously-revoked pair. No
             # enumeration oracle. The claim secret k is never logged and
             # never appears in error text.
-            redeem_failure_note(h)
+            redeem_failure_note(budget)
             self._json(403, {"error": "link_unusable"})
 
         # Optional authentication: an already-enrolled caller redeems
         # authenticated (bearer + signature). No Authorization header =>
         # fresh enrollment inline below.
-        peer = None
-        if self.headers.get("Authorization"):
+        peer = request_peer
+        if request_peer is None and self.headers.get("Authorization"):
             peer = self._require_auth()
             if peer is None:
                 return
@@ -4294,14 +4414,14 @@ class Handler(BaseHTTPRequestHandler):
         with db_lock:
             inv = conn.execute(
                 """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
-                          revoked, grant_handshake, minter_enc_v
+                          revoked, grant_handshake, minter_enc_v, target_identity
                    FROM invites WHERE invite_id=?""",
                 (h,),
             ).fetchone()
         if inv is None:
             link_fail()
             return
-        secret_hash, minter, exp, max_uses, uses, revoked, gh, minter_enc_v = inv
+        secret_hash, minter, exp, max_uses, uses, revoked, gh, minter_enc_v, target = inv
         minter_enc_v = minter_enc_v or 0
         # NOTE: the use-count is deliberately NOT checked here. A retry
         # of a live pending whose link is at max_uses (the final-use
@@ -4312,16 +4432,22 @@ class Handler(BaseHTTPRequestHandler):
         if gh != 1 or revoked or exp <= now:
             link_fail()
             return
-        try:
-            secret = b64u_decode(k)
-        except ValueError:
-            link_fail()
-            return
-        if not hmac.compare_digest(
-            hashlib.sha256(secret).hexdigest(), secret_hash
-        ):
-            link_fail()
-            return
+        if request_peer is not None:
+            if target is None or caller_identity(request_peer) != target:
+                link_fail()
+                return
+        else:
+            if target is not None:
+                link_fail()
+                return
+            try:
+                secret = b64u_decode(k)
+            except ValueError:
+                link_fail()
+                return
+            if not hmac.compare_digest(hashlib.sha256(secret).hexdigest(), secret_hash):
+                link_fail()
+                return
         # N's identity comes from the mint record. The `by` fragment field
         # never reaches the server (URL fragments are client-side) and is
         # display-only by construction: a forged `by` cannot change who Z
@@ -4455,6 +4581,14 @@ class Handler(BaseHTTPRequestHandler):
                 if conn.in_transaction:
                     conn.rollback()
                 conn.execute("BEGIN IMMEDIATE")
+                if request_peer is not None and not conn.execute(
+                    "SELECT 1 FROM invites WHERE invite_id=? AND revoked=0"
+                    " AND exp>? AND target_identity=? AND grant_handshake=1",
+                    (h, now2, redeemer),
+                ).fetchone():
+                    conn.execute("ROLLBACK")
+                    link_fail()
+                    return
                 if conn.execute(
                     "SELECT 1 FROM link_revocations WHERE link_id=?"
                     " AND a_identity=? AND b_identity=?",
@@ -4474,6 +4608,10 @@ class Handler(BaseHTTPRequestHandler):
                     % _HS_COLS,
                     (a, b),
                 ).fetchone()
+                replace_pending = (
+                    request_peer is not None and hs2 is not None
+                    and hs2[0] == "pending" and hs2[5] != h
+                )
                 if hs2 is not None and (
                     hs2[0] == "active"
                     or (
@@ -4481,14 +4619,17 @@ class Handler(BaseHTTPRequestHandler):
                         and hs2[7] == redeemer
                         and hs2[2] is not None
                         and hs2[2] > now2
+                        # The public backing request h was validated above
+                        # under this same write lock. A different request is
+                        # a new ceremony, never an idempotent retry of it.
+                        and (request_peer is None or hs2[5] == h)
                     )
                 ):
                     # Idempotent no-op: active, or a live pending owned by
                     # this redeemer. No link use is consumed, and the
-                    # ORIGINAL pending_expires_at is kept -- redeem NEVER
-                    # extends the deadline. (A live pending with a
-                    # different redeemer is impossible -- the pair
-                    # determines the redeemer -- and fails closed below.)
+                    # ORIGINAL pending_expires_at is kept. Distinct public
+                    # requests instead refresh the ceremony below, including
+                    # its direction, advertisements and consent generation.
                     #
                     # Fix A repair rev3 (2026-10-12, Zari 1635ebf7): v4
                     # capable-link upgrade with EXPLICIT CANONICAL row-class
@@ -4598,13 +4739,22 @@ class Handler(BaseHTTPRequestHandler):
                     hs2[0] == "revoked"
                     or (
                         hs2[0] == "pending"
-                        and (hs2[2] is None or hs2[2] <= now2)
+                        and (hs2[2] is None or hs2[2] <= now2 or replace_pending)
                     )
                 ):
                     conn.execute("ROLLBACK")
                     link_fail()
                     return
                 else:
+                    generation = hs2[6] if hs2 is not None else 0
+                    if replace_pending:
+                        if generation >= 2**63 - 1:
+                            conn.execute("ROLLBACK")
+                            self._json(409, {"error": "generation_exhausted"})
+                            return
+                        # A previously issued accept must not consent to the
+                        # replacement request, even in the same direction.
+                        generation += 1
                     # The single-UPDATE atomic pattern
                     # (INVITE_RACE_FIX_v0.2.6): revalidate the link AND
                     # consume one use in one statement. Proceed only if
@@ -4633,6 +4783,8 @@ class Handler(BaseHTTPRequestHandler):
                             enroll_ip=ip,
                         )
                     pending_exp = now2 + HANDSHAKE_PENDING_WINDOW
+                    if target is not None:
+                        pending_exp = min(exp, pending_exp)
                     expires_at = (
                         now2 + HS_EXPIRY_DAYS * 86400.0
                         if HS_EXPIRY_DAYS > 0
@@ -4651,10 +4803,9 @@ class Handler(BaseHTTPRequestHandler):
                              redeemer, minter_enc_v),
                         )
                     else:
-                        # Revoked or lapsed-pending row: a fresh consent
-                        # round. Generation is NOT reset (only revoke bumps
-                        # it); the deadline is fresh because the old one
-                        # lapsed -- this is a new pending, not an extension.
+                        # Revoked/lapsed or replaced public pending: fresh
+                        # consent. Replacement bumps generation so old accepts
+                        # cannot land on a new request. Never reset it.
                         # The minter's E2EE advertisement refreshes from the
                         # new link; the pair's capability recomputes at
                         # accept.
@@ -4665,10 +4816,10 @@ class Handler(BaseHTTPRequestHandler):
                                    last_activity=?, via_link_id=?,
                                    redeemer_identity=?, minter_enc_v=?,
                                    enc_capable=0, redeemer_enc_v=0,
-                                   provenance='ceremony'
+                                   provenance='ceremony', generation=?
                                WHERE a_identity=? AND b_identity=?""",
                             (now2, pending_exp, expires_at, now2, h, redeemer,
-                             minter_enc_v, a, b),
+                             minter_enc_v, generation, a, b),
                         )
                 conn.execute("COMMIT")
             except Exception:
@@ -4676,13 +4827,13 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("ROLLBACK")
                 except Exception:
                     pass
-                redeem_failure_note(h)
+                redeem_failure_note(budget)
                 self._json(500, {"error": "internal_error"})
                 return
         # Cache mutation only after the transaction committed.
         if name is not None:
             peer_names.add(name)
-        redeem_failure_clear(h)
+        redeem_failure_clear(budget)
         with db_lock:
             hs3 = conn.execute(
                 "SELECT %s FROM handshakes WHERE a_identity=? AND b_identity=?"
@@ -4761,9 +4912,14 @@ class Handler(BaseHTTPRequestHandler):
                            redeemer_enc_v=?, enc_capable=?
                        WHERE a_identity=? AND b_identity=?
                          AND status='pending' AND redeemer_identity=?
-                         AND pending_expires_at > ? AND generation=?""",
+                         AND pending_expires_at > ? AND generation=?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM invites i WHERE i.invite_id=via_link_id
+                             AND i.target_identity IS NOT NULL
+                             AND (i.revoked!=0 OR i.exp<=? OR i.target_identity!=?)
+                         )""",
                     (now2, new_redeemer_enc_v, new_enc_capable,
-                     a, b, me, now2, gen),
+                     a, b, me, now2, gen, now2, me),
                 )
                 if cur.rowcount == 1:
                     accepted = True

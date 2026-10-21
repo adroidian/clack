@@ -9,8 +9,9 @@ import subprocess
 import sys
 import tempfile
 
-RELAY_CLI = os.path.expanduser("~/workspace/clack-relay/relay-cli.py")
-E2EE_SRC = os.path.expanduser("~/workspace/clack-relay/e2ee.py")
+HERE = os.path.dirname(os.path.abspath(__file__))
+RELAY_CLI = os.path.join(HERE, "relay-cli.py")
+E2EE_SRC = os.path.join(HERE, "e2ee.py")
 
 PASS = 0
 FAIL = 0

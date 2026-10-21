@@ -385,9 +385,54 @@ class ClackClient:
             raise ClackError(f"redeem did not return handshake_id: {result}")
         return hid
 
-    def accept_handshake(self, handshake_id):
-        return self._request("POST", "/v1/handshakes/accept",
-                             {"handshake_id": handshake_id})
+    def mint_handshake_request(self, target_identity, exp_days=7, enc_v=0):
+        """Mint a public, single-use request for an already-enrolled identity.
+
+        Returns the relay response (link, link_id, exp, target/inviter identities).
+        Not enrollment and not acceptance. Fresh agents must use v4 capability
+        onboarding. Non-idempotent: do not blindly retry an unknown outcome.
+        """
+        from .requests import validate_request_options
+        try:
+            validate_request_options(target_identity, exp_days, enc_v)
+        except ValueError as exc:
+            raise ClackError(str(exc)) from exc
+        self._require_request_identity()
+        return self._request("POST", "/v1/handshakes/requests", {
+            "target_identity": target_identity, "exp_days": exp_days, "enc_v": enc_v,
+        })
+
+    def redeem_handshake_request(self, url):
+        """Redeem a same-configured-origin public URL into a pending handshake.
+
+        Returns the pending handshake object. Does NOT accept, enroll, change
+        identity, or upgrade relay trust. Explicit accept_handshake is separate.
+        Non-idempotent: reconcile list_handshakes after an unknown outcome.
+        """
+        from .requests import parse_request_url
+        try:
+            handle = parse_request_url(url, self.relay_url)
+        except ValueError as exc:
+            raise ClackError(str(exc)) from exc
+        self._require_request_identity()
+        return self._request("POST", "/v1/handshakes/requests/redeem", {"h": handle})
+
+    def _require_request_identity(self):
+        if not self._seed or not self.token or not self.peer_name:
+            raise ClackError("Public requests require an existing enrolled signing identity; "
+                             "use v4 capability onboarding for a new agent")
+
+    def accept_handshake(self, handshake_id, enc_v=None):
+        """Explicitly consent to a pending handshake; optionally advertise E2EE."""
+        body = {"handshake_id": handshake_id}
+        if enc_v is not None:
+            from .requests import validate_request_enc_v
+            try:
+                validate_request_enc_v(enc_v)
+            except ValueError as exc:
+                raise ClackError(str(exc)) from exc
+            body["enc_v"] = enc_v
+        return self._request("POST", "/v1/handshakes/accept", body)
 
     def list_handshakes(self):
         return self._request("GET", "/v1/handshakes", idempotent=True)

@@ -125,7 +125,7 @@ its own sqlite migrations at startup.
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Image: python:3.12-slim + pinned v0.2.11 bundle, non-root `clack` user, HEALTHCHECK on `/health`. |
+| `Dockerfile` | Image: python:3.12-slim + checksum-pinned v1.1.0 bundle, non-root `clack` user, HEALTHCHECK on `/health`. |
 | `docker-compose.yml` | Homelab service: bridge networking w/ loopback-published port, named volume, restart policy. |
 | `docker-entrypoint.sh` | Owns `/data`, generates first-run config, drops privileges. |
 | `init-config.py` | First-run config generator (RSA identity key, public-relay defaults). |
@@ -133,4 +133,4 @@ its own sqlite migrations at startup.
 | `relay-config.public.json.example` | Reference config shape for the public relay. **Never boot with the `<GENERATED_ON_FIRST_RUN>` placeholder** — the entrypoint mints a real key; the placeholder fails startup loudly by design. |
 | `VOLUMES.md` | What's on the volume, backup/restore, upgrade. |
 | `BUILD` | Bundle provenance (sha256, commit). |
-| `clack-relay-bundle-v0.2.10.tar.gz` | Pinned build input — copied from the v0.2.10 release artifacts. |
+| `clack-relay-bundle-v1.1.0.tar.gz` | Pinned build input — generated from the source commit recorded in `BUILD`. |

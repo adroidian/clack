@@ -14,7 +14,9 @@ Tools:
     clack_peers           — list enrolled peers
     clack_mint_handshake  — mint a handshake link
     clack_redeem_handshake — redeem a handshake link (URL or h/k)
-    clack_accept_handshake — accept a pending handshake
+    clack_mint_handshake_request — public target-bound request for enrolled peers
+    clack_redeem_handshake_request — pending only; no enrollment or acceptance
+    clack_accept_handshake — explicitly accept a pending handshake (optional enc_v)
 """
 
 import json
@@ -95,12 +97,35 @@ TOOLS = [
         },
     },
     {
+        "name": "clack_mint_handshake_request",
+        "description": "Mint a public single-use request URL for a known enrolled identity. Not enrollment or acceptance; new agents require v4 secret-capability onboarding.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "target_identity": {"type": "string", "description": "Canonical enrolled Ed25519 public key (base64url)"},
+                "exp_days": {"type": "number", "default": 7},
+                "enc_v": {"type": "integer", "enum": [0, 1], "default": 0},
+            },
+            "required": ["target_identity"],
+        },
+    },
+    {
+        "name": "clack_redeem_handshake_request",
+        "description": "Redeem a public /join/UUID URL using the existing configured identity and relay. Returns pending handshake only. Explicit clack_accept_handshake consent is required separately; never auto-accept.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"url": {"type": "string"}},
+            "required": ["url"],
+        },
+    },
+    {
         "name": "clack_accept_handshake",
         "description": "Accept a pending handshake by ID.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "handshake_id": {"type": "string"},
+                "enc_v": {"type": "integer", "enum": [0, 1], "description": "Explicit encryption capability advertisement"},
             },
             "required": ["handshake_id"],
         },
@@ -129,7 +154,15 @@ def handle_tool(name, args):
             else:
                 hid = client.redeem_handshake({"h": args["h"], "k": args["k"]})
             return {"handshake_id": hid}
+        elif name == "clack_mint_handshake_request":
+            return client.mint_handshake_request(args["target_identity"],
+                                                 exp_days=args.get("exp_days", 7),
+                                                 enc_v=args.get("enc_v", 0))
+        elif name == "clack_redeem_handshake_request":
+            return client.redeem_handshake_request(args["url"])
         elif name == "clack_accept_handshake":
+            if "enc_v" in args:
+                return client.accept_handshake(args["handshake_id"], enc_v=args["enc_v"])
             return client.accept_handshake(args["handshake_id"])
         else:
             return {"error": f"Unknown tool: {name}"}
@@ -158,7 +191,7 @@ def main():
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "clack-mcp", "version": "1.0.0"},
+                    "serverInfo": {"name": "clack-mcp", "version": "1.1.0"},
                     "capabilities": {"tools": {}},
                 },
             }

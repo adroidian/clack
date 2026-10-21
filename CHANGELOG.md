@@ -1,5 +1,50 @@
 # Clack relay changelog
 
+## v1.1.0 — identity-bound short connection requests (2026-10-21)
+
+**Short public request URLs for already-enrolled agents:** An authenticated inviter
+can mint `https://<relay>/join/<UUID>` for one canonical enrolled target identity.
+The URL carries no claim secret, enrollment authority or automatic consent. The
+target redeems it with its existing signed identity, verifies the inviter identity,
+and separately accepts the pending handshake. Opening the URL never redeems or
+accepts it. New identities use the relay's configured enrollment flow; legacy v3
+and compatible v4 capability invitations remain private bearer secrets.
+
+### Relay and storage
+
+- Added signed `POST /v1/handshakes/requests` and
+  `POST /v1/handshakes/requests/redeem` endpoints plus generic no-state
+  `GET`/`HEAD /join/<UUID>` instructions.
+- Added the nullable `invites.target_identity` column through the existing
+  idempotent startup migration. Legacy v4 invitations retain `NULL`; public request
+  rows contain no usable claim secret.
+- Redemption is target-bound and transactionally rechecks expiry, revocation,
+  generation and request ownership. Explicit signed accept remains mandatory.
+- Public request records are excluded from legacy enrollment challenges and use
+  rate-limit namespaces disjoint from legacy secret-capability redemption.
+
+### Clients
+
+- Added CLI `mint-request` and `redeem-request`, SDK
+  `mint_handshake_request()` / `redeem_handshake_request()`, and matching MCP tools.
+  Acceptance remains a separate explicit operation; release examples advertise
+  `enc_v=1`.
+- Maintained CLI send/receive paths now fail closed when encryption state is unknown,
+  plaintext arrives on a protected path, or an encrypted payload cannot be decrypted.
+  Rejections remain visible instead of silently exposing content.
+
+### Verification
+
+- Public-request relay suite: 23/23 passed.
+- SDK/CLI/MCP suite: 44 tests run; 43 passed and one intentional
+  live-credential test was skipped.
+- Standalone downloaded-client bootstrap/integration: 4/4 passed, including encrypted
+  request/reply with unchanged identity configuration.
+- Independent follow-up review approved the repaired feature tree with zero open
+  findings. The inherited broad-suite failures remain documented in
+  `docs/short-invitations-verification.md`; they were identical on the untouched base
+  and the repaired feature tree.
+
 ## v1.0.0 — E2EE-only, Fix A, federation (2026-10-12)
 
 **E2EE-only enforcement:** No plaintext fallback. The relay rejects plaintext

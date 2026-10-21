@@ -14,6 +14,9 @@ Two config flavors (auto-detected):
             the key file on the next save.
 
 Invite-link onboarding (v0.2.5 MVP):
+  mint-request TARGET_IDENTITY  public request for an enrolled target (no secret)
+  redeem-request URL           existing identity only; returns pending, no accept
+  accept-handshake ID           separate explicit consent (--enc-v 0 or 1)
   keygen                     create an ed25519 identity (mode 600)
   mint-invite                mint a shareable join link (any authed peer)
   redeem <link>              full join flow: confirm -> keygen -> challenge ->
@@ -27,11 +30,16 @@ Agent self-enrollment (v0.2.9):
                              (invite/pow/open); --invite-id/--secret select
                              the invite gate explicitly.
 
-Mandatory request signing (v0.2.12): every authenticated request carries
-BOTH the Bearer token AND Ed25519 signatures, added automatically:
+Request signing (v0.2.12): ordinary post-enrollment operations carry BOTH
+the Bearer token AND an Ed25519 signature, added automatically:
   X-Clack-Scheme: 1, X-Clack-Key: <peer name>, X-Clack-Nonce: <ts>:<32hex>,
   X-Clack-Sig: hex(Ed25519_sign(seed, "clack-ed25519-v1\n"+METHOD+"\n"+
   path_and_query+"\n"+sha256_hex(raw_body)+"\n"+nonce))
+
+The Bearer token remains identity authority: `register-key` deliberately uses
+token-only bootstrap auth and can register or rotate the signing key. Operators
+can also configure a narrow trusted-network signature exemption. Protect the
+token and private key as separate control credentials.
 
 Never print a token or private key.
 """
@@ -715,11 +723,11 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/0.2.17"
+    return cfg.get("user_agent") or "ClackRelay-CLI/1.1.0"
 
 
-# --- Mandatory Ed25519 request signing (v0.2.12) ------------------------------
-# Mirrors relay.py: every authenticated request carries
+# --- Ed25519 request signing (v0.2.12) ----------------------------------------
+# Mirrors relay.py: ordinary post-enrollment requests carry
 #   X-Clack-Scheme: 1
 #   X-Clack-Key: <peer name, must match the Bearer token's peer>
 #   X-Clack-Nonce: <unix_seconds>:<32 hex chars random>
@@ -727,10 +735,10 @@ def user_agent(cfg):
 # with canonical bytes
 #   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
 # Signs only when the config carries an identity seed AND a peer_name (i.e.
-# post-enrollment). The pre-enrollment calls (challenge/enroll/redeem) have
-# no peer_name yet, so they stay unsigned; the relay's unsigned endpoints
-# accept them. Legacy token configs have no seed and are never signed --
-# the relay answers those 401s; upgrade the client and re-enroll.
+# post-enrollment). Pre-enrollment calls have no peer_name and stay unsigned.
+# `register-key` is a separate bearer-only bootstrap/rotation authority, and
+# an operator may explicitly exempt selected trusted-network traffic. Public
+# request mint, redeem and accept never honor that network exemption.
 SIGN_SCHEME_ID = "clack-ed25519-v1"
 
 
@@ -766,62 +774,159 @@ def signing_seed(cfg):
     return seed if len(seed) == 32 else None
 
 
-def _e2ee_handshake_for_peer(cfg, peer_name, base_url):
+def _e2ee_handshake_state_for_peer(cfg, peer_name, base_url):
     """Look up the handshake with peer_name via GET /v1/handshakes.
 
-    Returns (peer_identity_b64, enc_capable) for the matching pair, or
-    (None, 0) when there is no handshake or no usable identity key.
-    peer_identity is the b64 Ed25519 pubkey; enc_capable is 0/1 from the
-    relay's capability negotiation."""
-    code, out = req(cfg, "GET", "/v1/handshakes", base=base_url)
+    Returns (state, peer_identity_b64, enc_capable) where state is one of:
+
+      "capable"   -- active handshake, valid 32-byte Ed25519 identity key,
+                     enc_capable negotiated: encrypt.
+      "incapable" -- active handshake, valid identity key, enc_capable NOT
+                     negotiated: verified-incapable compatibility; the caller
+                     may send plaintext (dual-mode transition).
+      "unknown"   -- anything else: HTTP error, malformed/unparseable body,
+                     no matching handshake row, inactive row, missing or
+                     invalid identity key. The caller MUST stop without
+                     sending; unknown state must never fall through to
+                     plaintext.
+
+    KIT-SCOPED PATCH (e2ee-kit-v1.0.1), carried into v1.1.0: the maintained
+    upstream relay-cli maps every one of these cases to (None, 0) and needs
+    the same fix. See SOURCE-CONTRACT.md.
+    """
+    try:
+        code, out = req(cfg, "GET", "/v1/handshakes", base=base_url)
+    except Exception:
+        return "unknown", None, 0
     if not (200 <= code < 300) or not isinstance(out, dict):
-        return None, 0
-    for hs in out.get("handshakes", []):
+        return "unknown", None, 0
+    rows = out.get("handshakes", [])
+    if not isinstance(rows, list):
+        return "unknown", None, 0
+    for hs in rows:
         if not isinstance(hs, dict):
             continue
         # Match by name hint (what the user typed) or raw peer name.
         if hs.get("peer_name_hint") != peer_name and hs.get("peer") != peer_name:
             continue
         if hs.get("status") != "active":
-            return None, 0
+            return "unknown", None, 0
         ident = hs.get("peer_identity")
         if not isinstance(ident, str) or not ident:
-            return None, 0
+            return "unknown", None, 0
         try:
             raw = b64u_decode(ident)
         except Exception:
-            return None, 0
+            return "unknown", None, 0
         if len(raw) != 32:
             # Legacy name-based identity: no Ed25519 key to convert.
-            return None, 0
-        return ident, hs.get("enc_capable") or 0
-    return None, 0
+            return "unknown", None, 0
+        capable = hs.get("enc_capable") or 0
+        if capable:
+            return "capable", ident, capable
+        return "incapable", ident, 0
+    return "unknown", None, 0
+
+
+def _e2ee_handshake_for_peer(cfg, peer_name, base_url):
+    """Look up the handshake with peer_name via GET /v1/handshakes.
+
+    Returns (peer_identity_b64, enc_capable) for the matching pair, or
+    (None, 0) when there is no handshake or no usable identity key.
+    peer_identity is the b64 Ed25519 pubkey; enc_capable is 0/1 from the
+    relay's capability negotiation.
+
+    KIT-SCOPED PATCH (e2ee-kit-v1.0.1), carried into v1.1.0: compatibility
+    wrapper over _e2ee_handshake_state_for_peer; preserves the historical
+    (ident, capable) shape. Callers that need to distinguish
+    verified-incapable from unknown/error state MUST use
+    _e2ee_handshake_state_for_peer instead -- (None, 0) here conflates
+    both, and unknown must never fall through to plaintext.
+    """
+    state, ident_b64, capable = _e2ee_handshake_state_for_peer(
+        cfg, peer_name, base_url)
+    if state == "unknown":
+        return None, 0
+    return ident_b64, capable
 
 
 class E2EEError(RuntimeError):
-    """Encryption was negotiated but failed: fail closed, never fall back."""
+    """Negotiated encryption failed, or the negotiation state is unknown:
+    fail closed, never fall back to plaintext."""
     pass
+
+
+def _require_send_identity(cfg):
+    """Hard prerequisite check for the CLI `send` path (kit-scoped).
+
+    Raises E2EEError when the config claims the identity kind but is
+    missing its signing seed or its peer_name: the send path must STOP
+    hard BEFORE any /v1/send -- no plaintext fallback from the main
+    path, ever. A config that cannot prove its identity must never emit
+    a message that looks like it came from that identity in the clear.
+
+    Legacy (non-identity) token configs are NOT subject to this check:
+    they carry no E2EE identity at all, plaintext is their only mode,
+    and the relay answers their signed endpoints with 401s (the existing
+    upgrade-and-re-enroll path). Verified-incapable pairs are likewise
+    unaffected: this check is about the SENDER's identity prerequisites,
+    not the pair's negotiated capability -- an explicitly verified
+    incapable pair still sends plaintext (dual-mode), never promoted to
+    verified-capable.
+
+    KIT-SCOPED PATCH (e2ee-kit-v1.0.2), carried into v1.1.0: the maintained
+    upstream relay-cli still allows the missing-prerequisite plaintext
+    fall-through and needs this same fix. See SOURCE-CONTRACT.md.
+    """
+    if not is_identity_cfg(cfg):
+        return
+    if signing_seed(cfg) is None:
+        raise E2EEError(
+            "refusing to send: identity config is missing its signing "
+            "seed (no plaintext fallback)")
+    if not cfg.get("peer_name"):
+        raise E2EEError(
+            "refusing to send: identity config is missing peer_name "
+            "(no plaintext fallback)")
 
 
 def _e2ee_encrypt_for(cfg, peer_name, plaintext, base_url):
     """Encrypt plaintext for peer_name when the pair is enc_capable.
 
     Returns (envelope_dict, None) on success, (None, reason) when the pair
-    never negotiated enc_capable (dual-mode transition: caller may send
-    plaintext). Raises E2EEError when the pair IS enc_capable but encryption
-    fails -- fail closed, never silently send plaintext when encryption was
-    negotiated.
+    VERIFIED incapable (active handshake, valid identity key, enc_capable
+    not negotiated -- dual-mode transition: caller may send plaintext).
+    Raises E2EEError when the sender identity prerequisites are missing
+    (no signing seed / no peer_name on an identity config), when the
+    handshake state is unknown/unavailable (HTTP error, malformed,
+    no/inactive row, bad identity key), or when the pair IS enc_capable
+    but encryption fails -- fail closed, never silently send plaintext
+    when the negotiation outcome is not a positively verified incapable
+    pair.
+
+    KIT-SCOPED PATCH (e2ee-kit-v1.0.1), carried into v1.1.0: unknown state
+    previously fell through to (None, reason) and callers sent plaintext.
+    KIT-SCOPED PATCH (e2ee-kit-v1.0.2), carried into v1.1.0: missing sender
+    prerequisites now raise here as well (defense in depth; the CLI main
+    send path checks first via _require_send_identity). Legacy non-identity
+    configs keep the historical (None, reason) shape.
     """
+    _require_send_identity(cfg)
     seed = signing_seed(cfg)
     if seed is None:
+        # Legacy non-identity config: no E2EE identity at all.
         return None, "no signing seed"
     sender_name = cfg.get("peer_name")
     if not sender_name:
+        # Legacy non-identity config without a peer name.
         return None, "no peer_name"
-    ident_b64, capable = _e2ee_handshake_for_peer(cfg, peer_name, base_url)
-    if ident_b64 is None:
-        return None, "no active handshake with identity key"
-    if not capable:
+    state, ident_b64, capable = _e2ee_handshake_state_for_peer(
+        cfg, peer_name, base_url)
+    if state == "unknown":
+        raise E2EEError(
+            "refusing: handshake state for %r is unknown/unavailable "
+            "(no plaintext fallback)" % (peer_name,))
+    if state == "incapable":
         return None, "pair not enc_capable"
     try:
         recip_x25519 = e2ee.ed25519_pub_to_x25519_pub(b64u_decode(ident_b64))
@@ -835,28 +940,104 @@ def _e2ee_encrypt_for(cfg, peer_name, plaintext, base_url):
     return env, None
 
 
-def _e2ee_decrypt_poll_messages(cfg, messages):
-    """Decrypt enc_v=1 messages in a poll/fetch payload in place.
+def _e2ee_receive_admission(cfg, messages, base_url=None):
+    """Decide which inbound messages may enter caller-visible state.
 
-    On success the message's text becomes the plaintext and
-    was_encrypted=True is set. On failure the envelope is kept and
-    decrypt_error is set -- surfaced distinctly, never silent."""
+    Returns (kept, rejections). `kept` is the subset that may be handed
+    downstream; `rejections` carries {"id","from","reason","peer_state"} for
+    every message refused, so a refusal is always visible and attributable
+    rather than a silent drop.
+
+    Fail-closed, mirroring the send-side table in _e2ee_encrypt_for:
+
+      peer "incapable" -- POSITIVELY VERIFIED incapable (active handshake,
+        valid key, enc_capable not negotiated). Plaintext inbound is allowed,
+        the dual-mode counterpart of the send path's verified-incapable
+        plaintext send.
+      peer "capable"   -- encryption is required. Plaintext refused.
+      peer "unknown"   -- refused. Unknown must never be treated as incapable,
+        exactly as unknown must never fall through to plaintext on send.
+
+    Capability is looked up once per distinct sender and cached for the poll;
+    _e2ee_handshake_state_for_peer performs a network call per invocation.
+
+    Legacy non-identity configs carry no E2EE identity at all. They keep the
+    historical behaviour, mirroring the _require_send_identity carve-out: this
+    check governs an identity config's inbound handling, it does not invent an
+    identity for configs that never had one.
+
+    KIT-SCOPED PATCH (receive-side fail-closed, PR 2): previously every
+    unencrypted message was passed through untouched and every decrypt failure
+    was retained and handed to the caller carrying decrypt_error. Neither is
+    fail-closed; both are corrected here.
+    """
+    if not is_identity_cfg(cfg):
+        # No E2EE identity configured: historical behaviour, nothing to enforce.
+        return list(messages), []
     seed = signing_seed(cfg)
-    if seed is None:
-        return
     my_name = cfg.get("peer_name") or ""
+    kept, rejections = [], []
+    state_cache = {}
+    if seed is None:
+        # Identity config with no signing seed cannot decrypt anything. Refuse
+        # rather than pass plaintext through as though it were acceptable.
+        for m in messages:
+            rejections.append({
+                "id": m.get("id") if isinstance(m, dict) else None,
+                "from": m.get("from") if isinstance(m, dict) else None,
+                "reason": "identity config has no signing seed; refusing inbound",
+                "peer_state": "unknown",
+            })
+        return kept, rejections
     for m in messages:
-        if not isinstance(m, dict) or not m.get("enc_v"):
+        if not isinstance(m, dict):
+            rejections.append({"id": None, "from": None,
+                               "reason": "non-dict message entry",
+                               "peer_state": "unknown"})
+            continue
+        sender_name = m.get("from") or ""
+        if not m.get("enc_v"):
+            # Unencrypted inbound: admissible ONLY for a verified-incapable pair.
+            if sender_name not in state_cache:
+                state_cache[sender_name] = _e2ee_handshake_state_for_peer(
+                    cfg, sender_name, base_url)[0]
+            state = state_cache[sender_name]
+            if state == "incapable":
+                kept.append(m)
+            else:
+                rejections.append({
+                    "id": m.get("id"), "from": sender_name,
+                    "reason": ("plaintext refused: pair enc_capable"
+                               if state == "capable"
+                               else "plaintext refused: pair state unknown"),
+                    "peer_state": state,
+                })
             continue
         try:
-            env_text = m.get("text") or ""
-            env = json.loads(env_text)
-            sender_name = m.get("from") or ""
+            env = json.loads(m.get("text") or "")
             pt_bytes = e2ee.decrypt_envelope(seed, env, sender_name, my_name)
             m["text"] = pt_bytes.decode("utf-8")
             m["was_encrypted"] = True
+            kept.append(m)
         except Exception as ex:
-            m["decrypt_error"] = "%s: %s" % (type(ex).__name__, ex)
+            # REFUSED, not retained-with-a-flag. The envelope is not handed on.
+            rejections.append({
+                "id": m.get("id"), "from": sender_name,
+                "reason": "decrypt failed: %s: %s" % (type(ex).__name__, ex),
+                "peer_state": "capable",
+            })
+    return kept, rejections
+
+
+def _e2ee_decrypt_poll_messages(cfg, messages, base_url=None):
+    """Backwards-compatible wrapper: decrypt in place, keep only admitted.
+
+    Retained so existing callers and downstream tooling keep working. Returns
+    (kept, rejections); `messages` is filtered in place to the admitted subset.
+    """
+    kept, rejections = _e2ee_receive_admission(cfg, messages, base_url=base_url)
+    messages[:] = kept
+    return kept, rejections
 
 
 def sign_headers(cfg, method, path, body_bytes):
@@ -1189,6 +1370,10 @@ def _curl_req(cfg, method, url, headers, data, timeout):
 
 
 def req(cfg, method, path, body=None, base=None):
+    # Consent mutations must not resend the same nonce after an ambiguous
+    # failure. Reconcile server state instead of silently replaying a POST.
+    public_request = path in ("/v1/handshakes/requests", "/v1/handshakes/requests/redeem",
+                              "/v1/handshakes/accept")
     origin = (base or base_url(cfg)).rstrip("/")
     token = auth_token(cfg)
     level = _ensure_origin_verified(origin, cfg)
@@ -1218,6 +1403,8 @@ def req(cfg, method, path, body=None, base=None):
         try:
             return _curl_req(cfg, method, url, headers, data, timeout=130)
         except Exception as e:
+            if public_request and not isinstance(e, FileNotFoundError):
+                raise RuntimeError("Public request outcome UNKNOWN; reconcile handshakes before retrying") from e
             print("curl transport failed (%s), falling back to Python"
                   % type(e).__name__, file=sys.stderr)
 
@@ -1250,6 +1437,8 @@ def req(cfg, method, path, body=None, base=None):
         except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                 ConnectionError, TimeoutError) as e:
             last_exc = e
+            if public_request:
+                raise RuntimeError("Public request outcome UNKNOWN; reconcile handshakes before retrying") from e
             if attempt < 2:
                 time.sleep(1 + attempt)
                 # Rebuild the request: urllib Request objects are single-use
@@ -1331,7 +1520,7 @@ def fetch_relay_identity(relay_url, cfg=None):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
-    The configured user_agent is sent (default ClackRelay-CLI/0.2.17):
+    The configured user_agent is sent (default ClackRelay-CLI/1.1.0):
     Cloudflare-fronted relays 403 Python-urllib's default signature, so a
     bare _open() fails closed before any normal operation can run.
 
@@ -1634,6 +1823,88 @@ def parse_link(link):
     return fields
 
 
+def parse_request_url(link, relay_url):
+    """Validate locally BEFORE any signed request; never trust URL metadata."""
+    def split_origin(value):
+        if (type(value) is not str or not value
+                or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+                or "?" in value or "#" in value or "\\" in value):
+            raise ValueError("request URL must be a clean absolute URL")
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            raise ValueError("request URL requires an HTTP(S) origin without credentials")
+        parsed.port
+        return parsed
+    configured = split_origin(relay_url)
+    supplied = split_origin(link)
+    if configured.path not in ("", "/"):
+        raise ValueError("configured relay must be an origin")
+    if (supplied.scheme, supplied.netloc.lower()) != (
+            configured.scheme, configured.netloc.lower()):
+        raise ValueError("request URL origin differs from configured relay")
+    if not supplied.path.startswith("/join/"):
+        raise ValueError("request URL must be exactly /join/<canonical UUID>")
+    handle = supplied.path[len("/join/"):]
+    try:
+        canonical = str(uuid.UUID(handle))
+    except (ValueError, AttributeError):
+        raise ValueError("request URL requires a canonical UUID") from None
+    if handle != canonical:
+        raise ValueError("request URL requires a canonical UUID")
+    return handle
+
+
+def cmd_public_request(args, cfg):
+    """Use only an existing enrolled identity; never enroll or auto-accept."""
+    try:
+        origin = base_url(cfg)
+        # Overrides must not silently move existing credentials to another relay.
+        if args.base_url and args.base_url.rstrip("/") != origin:
+            raise ValueError("public requests require the configured relay, not --base-url")
+        if args.cmd == "redeem-request":
+            handle = parse_request_url(args.link, origin)
+            path, body = "/v1/handshakes/requests/redeem", {"h": handle}
+        elif args.cmd == "mint-request":
+            import re
+            import math
+            target = args.target_identity
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{43}", target)
+                    or len(b64u_decode(target)) != 32
+                    or b64u_encode(b64u_decode(target)) != target):
+                raise ValueError("target_identity must be a canonical Ed25519 public key (base64url)")
+            if not math.isfinite(args.exp_days) or args.exp_days <= 0:
+                raise ValueError("exp_days must be a positive finite number")
+            path = "/v1/handshakes/requests"
+            body = {"target_identity": target, "exp_days": args.exp_days,
+                    "enc_v": args.enc_v}
+        else:
+            path = "/v1/handshakes/accept"
+            body = {"handshake_id": args.handshake_id}
+            if args.enc_v is not None:
+                body["enc_v"] = args.enc_v
+        if (not is_identity_cfg(cfg) or not auth_token(cfg)
+                or not cfg.get("peer_name") or signing_seed(cfg) is None):
+            raise ValueError("public requests require an existing enrolled signing identity; "
+                             "use v4 capability onboarding for a new agent")
+        if not cfg.get("relay_identity_fingerprint"):
+            raise ValueError("public requests require an existing configured relay pin; "
+                             "establish relay trust separately before using this command")
+    except (ValueError, KeyError) as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    try:
+        code, out = req(cfg, "POST", path, body, base=origin)
+    except RuntimeError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    print(json.dumps(out, indent=2))
+    if 200 <= code < 300 and args.cmd == "redeem-request":
+        print("Pending only: review the handshake, then explicitly run accept-handshake HANDSHAKE_ID.",
+              file=sys.stderr)
+    return 0 if 200 <= code < 300 else 1
+
+
 def cmd_mint_invite(args, cfg):
     body = {
         "expiry_seconds": int(args.expiry_hours * 3600),
@@ -1760,7 +2031,7 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.17",
+            "user_agent": "ClackRelay-CLI/1.1.0",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -2088,7 +2359,7 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/0.2.17",
+            "user_agent": "ClackRelay-CLI/1.1.0",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -2264,6 +2535,17 @@ def main():
     m.add_argument("--max-uses", type=int, default=1)
     m.add_argument("--expiry-hours", type=float, default=24.0)
 
+    mr = sub.add_parser("mint-request", help="mint a public request for a known enrolled identity")
+    mr.add_argument("target_identity", help="canonical Ed25519 public key (base64url)")
+    mr.add_argument("--exp-days", type=float, default=7)
+    mr.add_argument("--enc-v", type=int, choices=(0, 1), default=0)
+    rr = sub.add_parser("redeem-request", help="redeem a public URL into a pending handshake (no acceptance)")
+    rr.add_argument("link", help="same-configured-relay /join/UUID URL")
+    ah = sub.add_parser("accept-handshake", help="explicitly consent to a pending handshake")
+    ah.add_argument("handshake_id")
+    ah.add_argument("--enc-v", type=int, choices=(0, 1), default=None,
+                    help="explicit capability advertisement; omission leaves an active pair unchanged")
+
     rd = sub.add_parser("redeem", help="redeem an invite link (full join flow)")
     rd.add_argument("link", help="the invite link (or its #fragment payload)")
 
@@ -2295,6 +2577,8 @@ def main():
         return cmd_enroll(args)
 
     cfg = load_config(args.config)
+    if args.cmd in ("mint-request", "redeem-request", "accept-handshake"):
+        return cmd_public_request(args, cfg)
     token = auth_token(cfg)
     if not token and args.cmd in ("mint-invite", "invite-list", "invite-revoke",
                                   "poll", "receipts", "watch", "send", "ack"):
@@ -2308,7 +2592,20 @@ def main():
         # E2EE: decrypt enc_v=1 messages in place; failures are surfaced
         # as decrypt_error on the message, never silent.
         if 200 <= code < 300 and isinstance(out, dict):
-            _e2ee_decrypt_poll_messages(cfg, out.get("messages", []))
+            _kept, _rej = _e2ee_decrypt_poll_messages(
+                cfg, out.get("messages", []), base_url=args.base_url)
+            out["messages"] = _kept
+            # Rejections are reported, never silent: a sender-side regression
+            # must show up as an explicit refusal rather than as no traffic.
+            if _rej:
+                out["rejected"] = _rej
+                print("refused %d inbound message(s) on fail-closed policy:"
+                      % len(_rej), file=sys.stderr)
+                for _r in _rej:
+                    print("  from=%s id=%s peer_state=%s reason=%s"
+                          % (_r.get("from"), _r.get("id"),
+                             _r.get("peer_state"), _r.get("reason")),
+                          file=sys.stderr)
     elif args.cmd == "receipts":
         code, out = req(cfg, "GET",
                         "/v1/receipts?since=%s&limit=%d" % (args.since, args.limit),
@@ -2321,6 +2618,18 @@ def main():
         else:
             code, out = req(cfg, "GET", "/v1/watch", base=args.base_url)
     elif args.cmd == "send":
+        # KIT-SCOPED PATCH (e2ee-kit-v1.0.2), carried into v1.1.0: missing
+        # sender identity prerequisites (seed/peer_name) stop hard BEFORE any
+        # send -- no plaintext fallback from the main path, ever, not even
+        # with --plaintext. A broken identity config is unusable for signed
+        # relay operation; the relay would 401 unsigned requests anyway.
+        # Verified-incapable pairs and legacy token configs are unaffected
+        # (see _require_send_identity).
+        try:
+            _require_send_identity(cfg)
+        except E2EEError as ex:
+            print("error: refusing to send: %s" % ex, file=sys.stderr)
+            return 1
         body = {"id": args.id or str(uuid.uuid4()), "to": args.to}
         if args.topic:
             body["topic"] = args.topic
@@ -2328,15 +2637,27 @@ def main():
             body["in_reply_to"] = args.in_reply_to
         # E2EE: encrypt when the pair is enc_capable (automatic), unless
         # --plaintext forces the legacy path. Falls back to plaintext with
-        # a stderr note only when the pair never negotiated enc_capable
-        # (dual-mode transition). If the pair IS enc_capable but encryption
-        # fails, _e2ee_encrypt_for raises E2EEError: fail closed, never
-        # silently send plaintext when encryption was negotiated.
+        # a stderr note only when the pair is VERIFIED incapable (active
+        # handshake, valid identity key, enc_capable not negotiated --
+        # dual-mode transition). Unknown/unavailable handshake state or a
+        # negotiated-but-failed encryption raises E2EEError: fail closed,
+        # never silently send plaintext without a verified incapable pair.
+        # KIT-SCOPED PATCH (e2ee-kit-v1.0.1), carried into v1.1.0.
+        # _require_send_identity ran above -- a missing seed/peer_name never
+        # reaches this branch.
         if args.plaintext:
             body["text"] = args.text
         else:
-            env, reason = _e2ee_encrypt_for(cfg, args.to, args.text,
-                                           base_url=args.base_url)
+            try:
+                env, reason = _e2ee_encrypt_for(cfg, args.to, args.text,
+                                               base_url=args.base_url)
+            except E2EEError as ex:
+                # KIT-SCOPED PATCH (e2ee-kit-v1.0.1), carried into v1.1.0:
+                # unknown handshake state or negotiated-but-failed
+                # encryption stops the send entirely -- never a plaintext
+                # fallback.
+                print("error: refusing to send: %s" % ex, file=sys.stderr)
+                return 1
             if env is not None:
                 body["enc"] = env
                 print("note: sending encrypted (pair enc_capable)",

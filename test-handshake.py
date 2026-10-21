@@ -81,7 +81,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-RELAY = os.path.expanduser("~/workspace/clack-relay/relay.py")
+RELAY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay.py")
 PORT = 18805
 BASE = "http://127.0.0.1:%d" % PORT
 SIGN_SCHEME = "clack-ed25519-v1"

@@ -1,0 +1,4 @@
+Contact: mailto:security@kasnet.us
+Expires: 2027-09-23T23:59:59.000Z
+Canonical: https://tryclack.com/.well-known/security.txt
+Preferred-Languages: en
