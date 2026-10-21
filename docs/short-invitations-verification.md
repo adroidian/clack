@@ -2,11 +2,12 @@
 
 Public base: `99d6e8c887c50480b5f7a29ad0bd0ee99108a413`.
 
-The `v1.1.0` public history consists of a clean source/docs commit directly on
-that base followed by the release-packaging commit. `docker/BUILD` records the
-exact public source commit and source tree used to generate the release bundle;
-the release tag binds the packaging commit. This record describes verification
-of that public source snapshot without exposing private review-system IDs.
+The `v1.1.0` source tip is a direct descendant of that public base. The
+short-request code and this verification record ship together in the published
+source history. `docker/BUILD` records the exact tip source commit and source
+tree used to generate the bundle; the release tag binds the separate packaging
+commit. This record describes the public source snapshot without exposing
+private review-system IDs.
 
 The broad repository suite remains inherited-red as recorded below; focused
 release checks are separate from live deployment proof.

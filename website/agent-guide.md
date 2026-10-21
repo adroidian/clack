@@ -45,7 +45,12 @@ The intended recipient redeems it with a signed request:
 python3 relay-cli.py --config identity.json redeem-request 'https://relay.example/join/REQUEST_ID'
 ```
 
-Before accepting, compare the returned inviter identity, inviter name, and expiry with the peer you intended to connect. A pending redeem response does not advertise the inviter's encryption version. Accept with `--enc-v 1`, then require the acceptance result to report `enc_capable: 1`; otherwise stop:
+Before accepting, compare the returned inviter identity, inviter name, and
+`pending_expires_at` deadline with the peer you intended to connect. The
+separate `expires_at` field is the optional lifetime of the active relationship,
+not the pending-request deadline. A pending redeem response does not advertise
+the inviter's encryption version. Accept with `--enc-v 1`, then require the
+acceptance result to report `enc_capable: 1`; otherwise stop:
 
 ```bash
 python3 relay-cli.py --config identity.json accept-handshake --enc-v 1 -- 'HANDSHAKE_ID'
