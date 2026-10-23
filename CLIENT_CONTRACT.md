@@ -1,5 +1,31 @@
 # Clack Relay — Client Contract (v1.1.0)
 
+## Bundled CLI platform boundary
+
+For `relay-cli.py`, private credential publication requires Linux with
+`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
+This covers `keygen`, `attach-key`, `register-key`, `enroll`, legacy `redeem`,
+and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
+`RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
+weaker publication fallback. Missing platform/API prerequisites report
+"private credential publication requires Linux" before enrollment requests,
+key generation or credential writes. Missing `renameat2` fails with `ENOSYS`;
+kernel/filesystem failures during publication still fail closed.
+CLI import and `--help` remain available elsewhere; unrelated operations with
+already-provisioned, pinned credentials are not blanket-disabled. This is not
+full Windows/macOS qualification. The original 243-check `test-register-key.py`
+focused suite is Linux-only; additional portability regressions are counted
+separately in `tests/test_cli_publication_platform.py`.
+
+Already-provisioned Windows config reads use native, read-only file handles and
+current-process owner-SID verification; symlinks/reparse points, non-regular files,
+multiple links and changed identities are rejected. These reads never create,
+chmod or publish credentials. Windows file/security APIs and a verifiable owner
+are required; unavailable verification fails closed with a concise config error.
+`tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
+missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
+not native Windows qualification; Linux publication requirements above remain unchanged.
+
 ## What's new in v1.1.0: short public requests
 
 Known enrolled identities can use a public `/join/<UUID>` request, not a secret
@@ -52,16 +78,41 @@ Full details under "End-to-end encryption" below.
 - **Self-service signing-key registration.** A token-only peer no longer
   needs the operator to provision its Ed25519 key or to re-enroll.
   `POST /v1/register-key` accepts your Ed25519 public key (raw 43-char
-  base64url, or PEM SPKI — the relay normalizes) on Bearer <redacted>
-  alone. It is the ONE authenticated endpoint exempt from request signing,
-  because it is the upgrade path for token-only peers. The key binds
-  immediately and persists (config-managed peers are written through to
-  `relay-config.json`); rotation is supported — re-POST a new key and the
-  response tells you whether it rotated (`"rotated": true/false`).
+  base64url, or PEM SPKI — the relay normalizes). Bearer-only registration is
+  accepted only while no valid key exists, because that is the token-only
+  bootstrap path. Once a valid key is stored, both same-key re-registration
+  and server-API rotation require a normal request signature by the CURRENT
+  stored key; the canonical body hash binds the proposed key. A `200` response
+  echoes the exact canonical accepted `identity_pubkey` and means the DB update
+  completed and, for a config-managed peer, the fsynced config candidate was
+  atomically published and its parent directory fsynced.
+  Self-enrolled/dynamic peers remain DB-only and startup reconciliation preserves
+  their rows. Pre-publication failures restore the prior logical authority state;
+  ambiguous post-publication failures latch `503 registration_fail_stop`
+  until restart reconciles config and DB. The response tells you whether an
+  authorized server-API rotation occurred (`"rotated": true/false`); missing or
+  invalid runtime key state is bootstrap/recovery and reports `false`.
   Until you register, signed endpoints return `401 upgrade_required`.
-  CLI shortcut: `relay-cli.py --config <cfg> register-key` (generates a
-  keypair when missing, upgrades a legacy token config in place, and
-  registers the key in one step).
+  The bundled `relay-cli.py --config <cfg> register-key` command is deliberately
+  limited to token-only bootstrap or same-key re-registration. It can generate
+  a keypair while upgrading a legacy token config, but for an existing identity
+  it derives the public key from the usable local seed and refuses a missing,
+  malformed, or mismatched seed before any network request. One OS-lifetime
+  operation lock covers the complete command. First-contact TOFU is durably
+  pinned under that lock before the pending baseline is frozen; an active pending
+  transaction cannot perform an unjournaled pin write. For bootstrap the CLI then
+  atomically writes and fsyncs a mode-0600 pending journal containing the exact
+  recovery seed. It sends `register-key` once; transport uncertainty and every
+  5xx retain that journal. A concurrent invocation fails closed before candidate
+  generation or network activity. A later invocation uses the read-only status
+  endpoint to prove exact-candidate acceptance or absence before it publishes or
+  sends again. Accepted config/key artifacts are installed config-first through
+  deterministic mode-0600 stages, byte-and-inode CAS, reversible exchange or
+  no-replace, parent-directory fsync, and a restart-recoverable `publishing`
+  phase. Operator config replacements are preserved and prevent key publication.
+  Every existing credential-bearing config, key, pending, quarantine, stage, or
+  audit-lock path must resolve to an owned regular single-link inode. It does not
+  perform key rotation.
 - **Handshake redeem accepts `pubkey`.** Fresh enrollments via
   `/v1/handshakes/redeem` can now carry an optional `pubkey` field
   (raw base64url or PEM SPKI) alongside `identity_pubkey` — the
@@ -78,11 +129,11 @@ Full details under "End-to-end encryption" below.
   `X-Clack-Sig: <hex>`), verified against the peer's stored Ed25519 key.
   Token-only ordinary requests are rejected (`401 missing_signature`); peers
   with no stored key get `401 upgrade_required`. Bearer-only `register-key`
-  bootstraps or rotates that signing key, and operators may explicitly exempt
-  selected trusted-network traffic. Public request mint, redeem and accept do
-  not honor the network exemption. Nonces are single-use, expire after 600s,
-  and tolerate 120s of future clock skew. Full scheme under "Authentication"
-  below.
+  bootstraps only when no valid key exists; a valid current key must sign any
+  re-registration or rotation. Operators may explicitly exempt selected
+  trusted-network traffic. Public request mint, redeem and accept do not honor
+  the network exemption. Nonces are single-use, expire after 600s, and tolerate
+  120s of future clock skew. Full scheme under "Authentication" below.
 - **Operator key map** (`"identity_pubkeys"` in `relay-config.json`):
   `{peer_name: base64url(32-byte Ed25519 pubkey)}` lets the operator
   upgrade token-only config peers to signing without re-enrollment.
@@ -92,8 +143,9 @@ Full details under "End-to-end encryption" below.
   private key in a separate mode-600 file (`identity_privkey_path`,
   default `<config>.key`); the config records only the path. Old configs
   with an inline `identity_privkey` are migrated into the key file on
-  next save. The CLI auto-signs ordinary authenticated requests once the key
-  exists; `register-key` remains bearer-token bootstrap authority.
+  next save. The CLI auto-signs authenticated requests once the key exists,
+  including `register-key`; Bearer-only authority is limited to bootstrap when
+  the relay has no valid key for the peer.
 - **Relay security hardening** (external review fixes): revoked peers'
   names are tombstoned so a fresh identity can never inherit a retired
   name's queued mail or webhook (operator re-adding the name clears the
@@ -103,8 +155,9 @@ Full details under "End-to-end encryption" below.
   nonce expires in flight is rejected (`401 stale_nonce`) and never
   recorded; the per-peer rate budget is charged only after a signature
   verifies (bad unsigned ordinary requests use a separate 300/min per-IP
-  bucket and never burn the peer's budget; the bearer token can still rotate
-  the signing key and must be protected as identity authority); identity
+  bucket and never burn the peer's budget; the bearer token can bootstrap a
+  key only while no valid key exists, cannot rotate a valid key, and must
+  still be protected as bootstrap authority); identity
   keys must be prime-order Ed25519 points (small-order / malformed keys
   are rejected at enrollment with `400 bad_identity`, and any pre-fix
   rows fail closed at request time with `401 upgrade_required`); the
@@ -301,27 +354,48 @@ for your peer at enrollment. Rules:
   `unknown_key` (X-Clack-Key missing or not your peer), `upgrade_required`.
 - `upgrade_required`: the relay has no Ed25519 key for your peer (legacy
   token-only peer), or the stored key is not a valid prime-order Ed25519
-  point. Register your key with `POST /v1/register-key` (Bearer <redacted>
-  only — no signature needed); no re-enrollment required.
-- **Bootstrap authority — `POST /v1/register-key` (signature-exempt):** this
-  endpoint authenticates with your Bearer <redacted> ONLY and deliberately
-  skips request-signature verification, because it is the upgrade path for
-  token-only peers. Send `{"pubkey": "<43-char base64url Ed25519 pubkey
-  | PEM SPKI>"}`, get `200 {"registered": true, "peer": "<name>",
-  "rotated": <bool>}`. The key must be a valid prime-order Ed25519 point
-  (garbage → `400 bad_pubkey`; missing → `400 pubkey_required`;
-  missing/bad token → `401`). It binds immediately and persists, so your
-  NEXT request can be signed. Rotation: POST a new key any time; the old key
-  stops verifying at once. Treat the bearer token as identity authority, not
-  as a harmless second factor. Operators may also explicitly configure a
-  trusted-network exemption for selected legacy traffic; public request mint,
-  redeem and accept always require signatures.
-- Rate limit: 60 requests/minute per token, charged only after your
-  signature verifies → `429 {"error":"rate_limited"}`. Requests rejected
-  before signature verification (bad/absent signature, unknown key) are
-  counted against a separate 300/min per-IP bucket instead. That prevents bad
-  unsigned ordinary requests from burning your budget; it does not make a
-  stolen bearer harmless because the bearer can rotate the signing key.
+  point. Register a key with `POST /v1/register-key`; Bearer auth alone is
+  enough in this no-valid-key bootstrap/recovery state, with no re-enrollment.
+  A malformed config-managed key refuses relay startup; this recovery behavior
+  applies to a missing key or an invalid stored runtime row, not to a lost
+  private key while a valid public key remains registered.
+- **Conditional authority — `POST /v1/register-key`:** send
+  `{"pubkey": "<43-char base64url Ed25519 pubkey | PEM SPKI>"}` and receive
+  `200 {"registered": true, "peer": "<name>", "rotated": <bool>,
+  "identity_pubkey": "<canonical accepted key>"}`. The
+  proposed key must be a valid prime-order Ed25519 point (garbage →
+  `400 bad_pubkey`; missing → `400 pubkey_required`; missing/bad token →
+  `401`). When no valid key exists, the Bearer token bootstraps the first key.
+  When a valid key exists, the request MUST carry the normal X-Clack signature
+  made by that CURRENT key, over canonical bytes whose body hash binds the
+  proposed key. This applies even when re-registering the same key. An unsigned
+  replacement returns `401 missing_signature`; a signature made by the
+  proposed/new or any attacker key returns `401 bad_signature`. Current-key
+  authorization, comparison, nonce reservation, and identity update are
+  serialized with other enrollment identity writers. For config-managed peers,
+  no config is published ahead of the DB: an interprocess registration lock and
+  exact startup/current byte checks reject live config drift with
+  `409 config_changed_restart_required`. That rejection preserves the current
+  config bytes, DB authority, and signed nonce state; restart applies the
+  operator edit. Other pre-publication storage failures restore the prior
+  DB/config state, while an uncertain post-replace durability result latches a
+  process-wide fail-stop until restart reconciliation. All POSTs are refused,
+  and every enrollment identity writer checks the latch again while holding the
+  shared writer lock. A `200` is returned only after DB commit, config temp-file
+  fsync, atomic replace, and parent-directory fsync have completed. After a
+  successful rotation the old key stops verifying immediately. There
+  is no bearer-only lost-key bypass or operator recovery API. Operators may
+  explicitly configure a trusted-network exemption for selected ordinary
+  legacy traffic; it does not bypass register-key's current-key requirement.
+- Rate limit: 60 requests/minute per token, charged only after the required
+  signature verifies (or after a valid no-key bootstrap request) →
+  `429 {"error":"rate_limited"}`. Requests rejected before signature
+  verification (bad/absent signature, unknown key) are counted against a
+  separate 300/min per-IP bucket instead. That prevents unsigned replacement
+  attempts made with a stolen bearer from burning the peer's signed-request
+  budget. The bearer remains sensitive because it can bootstrap when no valid
+  key exists and may be accepted by an explicitly trusted ordinary-traffic
+  proxy exemption.
 - Revocation: if your peer is removed from the relay, your bearer stops
   authenticating on the next relay restart (the peer table is rebuilt from
   config transactionally at startup); the removed peer's queued messages
@@ -333,7 +407,8 @@ for your peer at enrollment. Rules:
 Aaron distributes tokens. Tokens are per-peer and must not be shared or
 printed anywhere. Your Ed25519 private key never leaves your machine and
 is never sent to the relay — only the public key is transmitted: once at
-enrollment, and again any time you rotate it via `POST /v1/register-key`.
+enrollment, and again during a current-key-authorized rotation via
+`POST /v1/register-key`.
 
 ## Endpoints
 
@@ -475,28 +550,70 @@ curl -H "Authorization: Bearer <token>" https://<base>/v1/peers
 → {"peers":["mercedes","nugget","sigrid","vesper","zari"]}
 ```
 
-### POST /v1/register-key (auth, signature-exempt)
+### POST /v1/register-key (auth; conditionally signed)
 
-Registers (or rotates) your Ed25519 signing key. Bearer <redacted> ONLY —
-no request signature required or checked; this is the ONE authenticated
-endpoint exempt from signing, because it is the upgrade path for
-token-only peers.
+Registers (or rotates) your Ed25519 signing key. Bearer auth is always
+required. A request may omit its signature only when the peer has no valid
+stored key. If a valid key exists, the request must be signed by that CURRENT
+key, including same-key re-registration; the canonical body hash binds the
+proposed key.
 
 ```
-curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+# Initial bootstrap only (no valid key is stored yet):
+curl -X POST -H "Authorization: Bearer ***" -H "Content-Type: application/json" \
   -d '{"pubkey":"<43-char base64url Ed25519 public key>"}' \
   https://<base>/v1/register-key
-→ {"registered":true,"peer":"<your peer name>","rotated":false}
+→ {"registered":true,"peer":"<your peer name>","rotated":false,
+   "identity_pubkey":"<same canonical key you proposed>"}
 ```
 
 - `pubkey` accepts raw 43-char base64url OR a PEM SPKI block — both are
   normalized to the same canonical key. It must be a valid prime-order
   Ed25519 point.
-- The key binds immediately: your next request can (and must) be signed.
-- Rotation: POST a new key any time → `"rotated": true`; the old key stops
-  verifying at once. Re-POSTing the current key → `"rotated": false`.
+- Treat `200` as acceptance only when `registered` is exactly `true`, `peer`
+  matches the authenticated peer, and `identity_pubkey` exactly equals the
+  canonical candidate. Then the key is bound and the next ordinary request must
+  be signed. A `503 registration_fail_stop` has an uncertain result; retain the
+  candidate, let the operator restart the relay, and reconcile with status
+  rather than guessing which key won or repeating the mutation.
+- Re-registration: sign the request with the current key. Re-POSTing that key
+  returns `"rotated": false`.
+- Rotation: sign the body proposing the new key with the current/old key →
+  `"rotated": true`; the old key stops verifying at once. A new-key signature
+  cannot authorize its own installation. This is a server protocol operation;
+  the bundled CLI intentionally supports bootstrap and same-key registration,
+  not rotation.
 - Failures: `400 pubkey_required` (missing field), `400 bad_pubkey`
-  (not a valid Ed25519 key), `401` (missing/bad token).
+  (not a valid Ed25519 key), `401 unauthorized` (missing/bad token), or the
+  normal signing errors (`missing_signature`, `bad_signature`, `replay`,
+  `stale_nonce`) when a valid current key exists. `409 identity_in_use` means
+  another peer already owns the proposed key. `500 storage_failed` or
+  `persist_failed` means the prior DB/config authority state was restored;
+  `409 config_changed_restart_required` means the on-disk operator config no
+  longer matches this process's startup authority; its bytes were not replaced,
+  and the relay must restart before registration is retried. `503
+  registration_fail_stop` means publication could not be classified or made
+  durably certain and all POST/identity-writing service remains closed until
+  restart.
+
+### GET /v1/register-key/status (Bearer auth; read-only reconciliation)
+
+Returns the authenticated peer's current valid registration state without
+requiring the possibly accepted candidate signature:
+
+```
+→ {"registered":true,"peer":"<your peer name>",
+   "identity_pubkey":"<canonical current key>"}
+```
+
+When no valid key exists, `registered` is `false` and `identity_pubkey` is
+`null`. This endpoint is for a client that already retained its private pending
+candidate. Compare both `peer` and the full canonical key. If they match, finish
+local key/config publication. If no valid key exists, a new send decision may
+reuse the retained candidate. If a different valid key exists, do not replace it;
+quarantine the pending candidate for operator inspection. A malformed response,
+transport error, non-200 status, or fail-stop before restart leaves the pending
+journal untouched.
 
 ### POST /v1/send (auth)
 

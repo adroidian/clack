@@ -126,17 +126,41 @@ ack-queryability fix are for.
   endpoints for token-only peers. No config knob to disable.
 - **Fix:** self-service registration. `POST /v1/register-key` accepts the
   peer's Ed25519 public key (raw 43-char base64url or PEM SPKI, validated
-  and normalized) on Bearer-token auth alone — deliberately exempt from
-  request signing, since it IS the upgrade path. Key binds immediately and
-  persists (config-managed peers through to `relay-config.json`,
-  atomic write); rotation supported (`rotated` flag in the response).
+  and normalized) on Bearer-token auth alone only when no valid key exists,
+  since that is the token-only upgrade path. Once a valid key exists,
+  same-key re-registration and server-API rotation require a canonical request
+  signature by the current stored key; a Bearer alone or proposed/new-key
+  signature cannot replace it. Registration is serialized with every runtime
+  enrollment identity writer. The proposed key and signed nonce commit in one
+  DB transaction; an interprocess config lock and exact startup/current byte
+  checks reject operator-config drift before it can overwrite a revocation or
+  consume a nonce. A config-managed candidate is fsynced before DB commit, then
+  atomically published and followed by a parent-directory fsync. Failures before
+  publication restore the exact prior logical DB/config state. An uncertain
+  post-replace or failed-compensation outcome latches a process-wide fail-stop:
+  all POSTs and all runtime identity writers remain blocked until restart
+  reconciliation instead of continuing with guessed authority. A successful
+  response echoes the exact canonical accepted `identity_pubkey`; a
+  current-key-authorized replacement also reports the `rotated` flag.
   Handshake redeem also accepts an optional `pubkey` so fresh enrollments
-  register their key in the same round trip. CLI gains `register-key`
-  (keygen + config upgrade + POST). Operator key provisioning is no longer
-  required for the signing upgrade; peers (1) keygen, (2) register-key,
-  (3) sign — no re-enrollment.
-- **Location:** `relay.py` (`_handle_register_key`, `_normalize_pubkey_input`,
-  `_persist_identity_pubkey`, redeem `pubkey`); `relay-cli.py`
+  register their key in the same round trip. Before a legacy token-only
+  bootstrap request, the CLI acquires an OS-lifetime operation lock and resolves
+  first-contact TOFU before it durably stores a mode-0600 pending candidate seed.
+  The lock spans pending inspection, send/status, local publication, and
+  quarantine, so a concurrent process cannot replace the recoverable candidate.
+  It sends the mutation once, retains pending state on uncertain/5xx outcomes,
+  reconciles the exact peer/key through the read-only status endpoint, and
+  publishes config then key through a journaled byte/inode CAS with reversible
+  exchange and crash compensation. Concurrent operator config replacement is
+  preserved and blocks key publication. Existing credential paths must be owned,
+  regular, and single-link; external hardlinks fail closed before use. An existing
+  identity must have a usable seed whose derived public key matches its config.
+  The command otherwise refuses before network access and supports same-key
+  re-registration, not rotation.
+  Operator key provisioning is no longer required for the initial signing
+  upgrade; peers (1) keygen, (2) register-key, (3) sign — no re-enrollment.
+- **Location:** `relay.py` (`_handle_register_key`, `_store_registered_key`,
+  `_EnrollmentIdentityLocks`, config stage/publish helpers); `relay-cli.py`
   (`cmd_register_key`); tests in `test-register-key.py`.
 - **Supersedes:** the old peer checklist in the private cutover runbook — that
   checklist is now the self-service flow, awaiting the operator's go-ahead

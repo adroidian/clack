@@ -36,20 +36,31 @@ the Bearer token AND an Ed25519 signature, added automatically:
   X-Clack-Sig: hex(Ed25519_sign(seed, "clack-ed25519-v1\n"+METHOD+"\n"+
   path_and_query+"\n"+sha256_hex(raw_body)+"\n"+nonce))
 
-The Bearer token remains identity authority: `register-key` deliberately uses
-token-only bootstrap auth and can register or rotate the signing key. Operators
-can also configure a narrow trusted-network signature exemption. Protect the
-token and private key as separate control credentials.
+`register-key` permits Bearer-only bootstrap only when the relay has no valid
+key for the peer. For an existing identity, the command derives the public key
+from the configured current private seed and can only submit that same key; it
+does not expose rotation. The server API rejects any later re-registration or
+rotation unless the current key authorizes the proposed body. Operators can
+also configure a narrow trusted-network signature exemption for ordinary
+traffic. Protect the token and private key as separate control credentials.
 
 Never print a token or private key.
 """
 import argparse
 import base64
+import ctypes
 import datetime
+import errno
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 import http.client
 import json
 import os
+import socket
+import stat
 import sys
 import time
 import urllib.error
@@ -689,9 +700,155 @@ def b64u_decode(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _windows_config_api():
+    """Load native read/security APIs lazily; import/help need none of these."""
+    if sys.platform != "win32" or not hasattr(ctypes, "WinDLL"):
+        raise OSError(errno.ENOSYS, "secure Windows config reads require the native Windows file/security APIs")
+    DWORD, BOOL, HANDLE = ctypes.c_uint32, ctypes.c_int32, ctypes.c_void_p
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("low", DWORD), ("high", DWORD)]
+
+    class FILE_INFO(ctypes.Structure):
+        _fields_ = [("attributes", DWORD), ("created", FILETIME),
+                    ("accessed", FILETIME), ("written", FILETIME),
+                    ("volume", DWORD), ("size_high", DWORD), ("size_low", DWORD),
+                    ("links", DWORD), ("index_high", DWORD), ("index_low", DWORD)]
+
+    class TOKEN_USER(ctypes.Structure):
+        _fields_ = [("sid", HANDLE), ("attributes", DWORD)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+    pointer = ctypes.POINTER
+    for library, name, arguments, result in (
+            (kernel, "CreateFileW", [ctypes.c_wchar_p, DWORD, DWORD, HANDLE, DWORD, DWORD, HANDLE], HANDLE),
+            (kernel, "GetFileType", [HANDLE], DWORD),
+            (kernel, "GetFileInformationByHandle", [HANDLE, pointer(FILE_INFO)], BOOL),
+            (kernel, "ReadFile", [HANDLE, HANDLE, DWORD, pointer(DWORD), HANDLE], BOOL),
+            (kernel, "CloseHandle", [HANDLE], BOOL),
+            (kernel, "GetCurrentProcess", [], HANDLE),
+            (kernel, "LocalFree", [HANDLE], HANDLE),
+            (security, "GetSecurityInfo", [HANDLE, DWORD, DWORD, pointer(HANDLE), HANDLE, HANDLE, HANDLE, pointer(HANDLE)], DWORD),
+            (security, "OpenProcessToken", [HANDLE, DWORD, pointer(HANDLE)], BOOL),
+            (security, "GetTokenInformation", [HANDLE, DWORD, HANDLE, DWORD, pointer(DWORD)], BOOL),
+            (security, "EqualSid", [HANDLE, HANDLE], BOOL)):
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, result
+    return kernel, security, DWORD, FILE_INFO, TOKEN_USER
+
+
+def _windows_config_components(path):
+    """Reject symlinks/junctions/reparse points, including ancestor components."""
+    drive, rest = os.path.splitdrive(path)
+    current = drive + os.sep if rest.startswith(os.sep) else drive
+    for part in (part for part in rest.split(os.sep) if part):
+        current = os.path.join(current, part) if current else part
+        st = os.lstat(current)  # read-only: never create missing parents
+        if (stat.S_ISLNK(st.st_mode)
+                or getattr(st, "st_file_attributes", 0) & 0x400):
+            raise ValueError("config path contains a symlink or Windows reparse point: %s" % current)
+
+
+def _read_windows_private_config(path):
+    """Read an existing caller-owned regular file; no publication or chmod.
+
+    Native handles avoid relying on Windows' meaningless Unix UID fields or
+    version-dependent CRT inode values. Denying write/delete sharing keeps the
+    opened object stable. Owner SID, link count, reparse state and identity are
+    re-attested before any JSON or credentials are used.
+    """
+    kernel, security, DWORD, FILE_INFO, TOKEN_USER = _windows_config_api()
+    absolute = _private_abs(path)
+    invalid = ctypes.c_void_p(-1).value
+
+    def failure(operation, code=None):
+        if code is None:
+            code = ctypes.get_last_error()
+        return OSError(code, "secure Windows config read failed: " + operation, absolute)
+
+    def open_existing():
+        # GENERIC_READ | READ_CONTROL; FILE_SHARE_READ only; OPEN_EXISTING;
+        # FILE_FLAG_OPEN_REPARSE_POINT (do not follow a final reparse point).
+        handle = kernel.CreateFileW(absolute, 0x80020000, 1, None, 3, 0x00200000, None)
+        if handle in (None, invalid):
+            raise failure("CreateFileW")
+        return handle
+
+    def information(handle):
+        info = FILE_INFO()
+        if kernel.GetFileType(handle) != 1:  # FILE_TYPE_DISK
+            raise ValueError("config is not a disk file")
+        if not kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
+            raise failure("GetFileInformationByHandle")
+        if info.attributes & (0x10 | 0x400) or info.links != 1:
+            raise ValueError("config must be a single-link regular file without reparse points")
+        return (info.volume, info.index_high, info.index_low,
+                info.size_high, info.size_low, info.written.high, info.written.low,
+                info.created.high, info.created.low, info.attributes, info.links)
+
+    def owned_by_caller(handle):
+        owner, descriptor, token = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        try:
+            code = security.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner),
+                                            None, None, None, ctypes.byref(descriptor))
+            if code or not owner.value or not descriptor.value:
+                raise failure("GetSecurityInfo(owner)", code or errno.EACCES)
+            if not security.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
+                raise failure("OpenProcessToken")
+            needed = DWORD()
+            security.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+            if not ctypes.sizeof(TOKEN_USER) <= needed.value <= 65536:
+                raise ValueError("Windows token user information is unavailable or invalid")
+            buffer = ctypes.create_string_buffer(needed.value)
+            if not security.GetTokenInformation(token, 1, buffer, needed.value, ctypes.byref(needed)):
+                raise failure("GetTokenInformation(TokenUser)")
+            user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+            if not user.sid or not security.EqualSid(owner, user.sid):
+                raise ValueError("config file is not owned by the current Windows user")
+        finally:
+            if token.value:
+                kernel.CloseHandle(token)
+            if descriptor.value:
+                kernel.LocalFree(descriptor)
+
+    _windows_config_components(absolute)
+    handle = open_existing()
+    try:
+        before = information(handle)
+        owned_by_caller(handle)
+        chunks = []
+        while True:
+            buffer, count = ctypes.create_string_buffer(65536), DWORD()
+            if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(count), None):
+                raise failure("ReadFile")
+            if count.value > len(buffer):
+                raise ValueError("invalid Windows config read length")
+            if not count.value:
+                break
+            chunks.append(buffer.raw[:count.value])
+        data = b"".join(chunks)
+        if information(handle) != before or len(data) != (before[3] << 32 | before[4]):
+            raise ValueError("config file changed while it was read")
+        owned_by_caller(handle)
+        _windows_config_components(absolute)
+        visible = open_existing()
+        try:
+            if information(visible) != before:
+                raise ValueError("config path changed while it was read")
+        finally:
+            kernel.CloseHandle(visible)
+        return data
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def load_config(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    if callable(getattr(os, "geteuid", None)):
+        raw = _read_private_regular(path, correct_mode=False)
+    else:
+        raw = _read_windows_private_config(path)
+    return json.loads(raw.decode("utf-8"))
 
 
 def is_identity_cfg(cfg):
@@ -736,8 +893,11 @@ def user_agent(cfg):
 #   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
 # Signs only when the config carries an identity seed AND a peer_name (i.e.
 # post-enrollment). Pre-enrollment calls have no peer_name and stay unsigned.
-# `register-key` is a separate bearer-only bootstrap/rotation authority, and
-# an operator may explicitly exempt selected trusted-network traffic. Public
+# `register-key` is bearer-only only for initial bootstrap. Because req() uses
+# this same helper, an existing identity naturally signs same-key registration;
+# cmd_register_key derives and submits exactly that seed's public key and does
+# not expose rotation. The relay still enforces current-key authorization.
+# An operator may explicitly exempt selected trusted-network traffic. Public
 # request mint, redeem and accept never honor that network exemption.
 SIGN_SCHEME_ID = "clack-ed25519-v1"
 
@@ -1064,32 +1224,513 @@ def sign_headers(cfg, method, path, body_bytes):
     }
 
 
+_LOCAL_REPLACE = os.replace
+_LOCAL_FSYNC = os.fsync
+_LOCAL_UNLINK = os.unlink
+_LOCAL_PUBLICATION_HOOK = None
+_REGISTER_KEY_JOURNAL_KIND = "clack-register-key-pending-v1"
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_AT_FDCWD = -100
+_LIBC = ctypes.CDLL(None, use_errno=True) if sys.platform == "linux" else None
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = (
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    _RENAMEAT2.restype = ctypes.c_int
+
+
+PRIVATE_PUBLICATION_REQUIREMENT = (
+    "private credential publication requires Linux with fcntl.flock, os.geteuid, "
+    "abstract AF_UNIX sockets and renameat2; run enrollment/key setup in a "
+    "supported Linux environment"
+)
+
+
+def _require_private_publication_platform():
+    """Reject unsupported enrollment/publication before local or remote effects."""
+    if (sys.platform != "linux" or fcntl is None
+            or not hasattr(fcntl, "flock") or not hasattr(os, "geteuid")
+            or not hasattr(socket, "AF_UNIX") or _RENAMEAT2 is None):
+        raise OSError(errno.ENOSYS, PRIVATE_PUBLICATION_REQUIREMENT)
+
+
+def _local_publication_event(name):
+    hook = _LOCAL_PUBLICATION_HOOK
+    if hook is not None:
+        hook(name)
+
+
+def _private_abs(path):
+    if not isinstance(path, str) or not path:
+        raise ValueError("private artifact path must be a non-empty string")
+    return os.path.abspath(path)
+
+
+def _renameat2(source, destination, flags):
+    """Linux atomic namespace transition used for CAS-style publication."""
+    if _RENAMEAT2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is required for private publication")
+    result = _RENAMEAT2(
+        _AT_FDCWD, os.fsencode(source), _AT_FDCWD, os.fsencode(destination), flags)
+    if result != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), destination)
+
+
+def _rename_exchange(source, destination):
+    return _renameat2(source, destination, _RENAME_EXCHANGE)
+
+
+def _rename_noreplace(source, destination):
+    return _renameat2(source, destination, _RENAME_NOREPLACE)
+
+
+# Explicit seams let the regression suite inject a mutation immediately before
+# the kernel operation, below every Python-level precondition check.
+_LOCAL_RENAME_EXCHANGE = _rename_exchange
+_LOCAL_RENAME_NOREPLACE = _rename_noreplace
+
+
+def _reject_symlink_components(path):
+    """Reject every existing symlink component, including the destination."""
+    absolute = _private_abs(path)
+    drive, rest = os.path.splitdrive(absolute)
+    current = drive + os.sep if absolute.startswith(os.sep) else drive
+    for part in [p for p in rest.split(os.sep) if p]:
+        current = os.path.join(current, part) if current else part
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError("private artifact path contains a symlink: %s" % current)
+    return absolute
+
+
+def _ensure_private_parent(path):
+    absolute = _private_abs(path)
+    parent = os.path.dirname(absolute) or "."
+    _reject_symlink_components(parent)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    _reject_symlink_components(parent)
+    if not stat.S_ISDIR(os.lstat(parent).st_mode):
+        raise ValueError("private artifact parent is not a directory: %s" % parent)
+    return absolute, parent
+
+
+def _validate_private_destination(path, must_exist=False):
+    absolute, parent = _ensure_private_parent(path)
+    try:
+        st = os.lstat(absolute)
+    except FileNotFoundError:
+        if must_exist:
+            raise ValueError("private artifact does not exist: %s" % absolute)
+        return absolute, parent, None
+    if stat.S_ISLNK(st.st_mode):
+        raise ValueError("private artifact destination is a symlink: %s" % absolute)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("private artifact destination is not a regular file: %s"
+                         % absolute)
+    if st.st_nlink != 1:
+        raise ValueError("private artifact destination has %d hardlinks: %s"
+                         % (st.st_nlink, absolute))
+    if st.st_uid != os.geteuid():
+        raise ValueError("private artifact destination is not owned by this user: %s"
+                         % absolute)
+    return absolute, parent, st
+
+
+def _paths_alias(first, second):
+    a = _private_abs(first)
+    b = _private_abs(second)
+    if os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b)):
+        return True
+    if os.path.lexists(a) and os.path.lexists(b):
+        try:
+            return os.path.samefile(a, b)
+        except OSError:
+            pass
+    return False
+
+
+def _file_snapshot(st, data):
+    return {
+        "dev": st.st_dev,
+        "ino": st.st_ino,
+        "mode": stat.S_IMODE(st.st_mode),
+        "uid": st.st_uid,
+        "nlink": st.st_nlink,
+        "size": st.st_size,
+        "data": bytes(data),
+    }
+
+
+def _same_file_snapshot(first, second):
+    return (
+        first is not None and second is not None
+        and first["dev"] == second["dev"]
+        and first["ino"] == second["ino"]
+        and first["mode"] == second["mode"]
+        and first["uid"] == second["uid"]
+        and first["nlink"] == second["nlink"]
+        and first["size"] == second["size"]
+        and first["data"] == second["data"]
+    )
+
+
+def _fsync_parent(path, label):
+    parent = os.path.dirname(_private_abs(path)) or "."
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(parent, flags)
+    try:
+        _local_publication_event(label + ":before_dir_fsync")
+        _LOCAL_FSYNC(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_private_regular_snapshot(path, correct_mode=False):
+    absolute, _parent, opening_path_st = _validate_private_destination(
+        path, must_exist=True)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(absolute, flags)
+    mode_changed = False
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or st.st_uid != os.geteuid()):
+            raise ValueError("private artifact is not a single-link owned regular file: %s"
+                             % absolute)
+        if (opening_path_st.st_dev, opening_path_st.st_ino) != (st.st_dev, st.st_ino):
+            raise ValueError("private artifact changed while it was opened: %s"
+                             % absolute)
+        if correct_mode and stat.S_IMODE(st.st_mode) != 0o600:
+            # Recheck link count through the held descriptor immediately before
+            # chmod so an outside hardlink can never inherit a mode mutation.
+            if os.fstat(fd).st_nlink != 1:
+                raise ValueError("private artifact gained a hardlink: %s" % absolute)
+            os.fchmod(fd, 0o600)
+            _LOCAL_FSYNC(fd)
+            mode_changed = True
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        st = os.fstat(fd)
+        visible = os.lstat(absolute)
+        if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1
+                or visible.st_nlink != 1
+                or (visible.st_dev, visible.st_ino) != (st.st_dev, st.st_ino)):
+            raise ValueError("private artifact changed while it was read: %s"
+                             % absolute)
+        snapshot = _file_snapshot(st, data)
+    finally:
+        os.close(fd)
+    if mode_changed:
+        _fsync_parent(absolute, "chmod")
+    return data, snapshot
+
+
+def _read_private_regular(path, correct_mode=False):
+    data, _snapshot = _read_private_regular_snapshot(
+        path, correct_mode=correct_mode)
+    return data
+
+
+def _snapshot_at_path(path, correct_mode=False):
+    _data, snapshot = _read_private_regular_snapshot(
+        path, correct_mode=correct_mode)
+    return snapshot
+
+
+def _require_snapshot(path, expected, label):
+    actual = _snapshot_at_path(path, correct_mode=False)
+    if not _same_file_snapshot(actual, expected):
+        raise ValueError("%s changed at the publication boundary" % label)
+    return actual
+
+
+def _correct_private_mode(path):
+    if os.path.lexists(_private_abs(path)):
+        _read_private_regular(path, correct_mode=True)
+
+
+def _safe_unlink_snapshot(path, expected):
+    """Remove only the exact single-link inode held by this transaction."""
+    _require_snapshot(path, expected, "private artifact")
+    _LOCAL_UNLINK(path)
+
+
+def _atomic_publish_private(path, data, label, expected_snapshot=None):
+    """Durably publish bytes with reversible CAS semantics.
+
+    Existing destinations are exchanged with the staged inode. The displaced
+    inode is then compared with the snapshot captured before staging; drift is
+    exchanged back before failure. Absent destinations use RENAME_NOREPLACE.
+    """
+    _require_private_publication_platform()
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("private artifact data must be bytes")
+    absolute, parent, current_st = _validate_private_destination(path)
+    if expected_snapshot is None and current_st is not None:
+        _old_data, expected_snapshot = _read_private_regular_snapshot(
+            absolute, correct_mode=True)
+    elif expected_snapshot is not None:
+        _require_snapshot(absolute, expected_snapshot, label + " destination")
+    expected_absent = expected_snapshot is None
+    tmp = os.path.join(
+        parent,
+        ".%s.%s-%s.tmp" % (
+            os.path.basename(absolute), label, _secrets.token_hex(8)),
+    )
+    fd = None
+    stage_snapshot = None
+    transitioned = False
+    displaced_snapshot = None
+    try:
+        _local_publication_event(label + ":before_stage_open")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= (getattr(os, "O_CLOEXEC", 0)
+                  | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(tmp, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        view = memoryview(bytes(data))
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while staging %s" % label)
+            view = view[written:]
+        stage_snapshot = _file_snapshot(os.fstat(fd), bytes(data))
+        _local_publication_event(label + ":after_stage_write")
+        _local_publication_event(label + ":before_file_fsync")
+        _LOCAL_FSYNC(fd)
+        stage_snapshot = _file_snapshot(os.fstat(fd), bytes(data))
+        os.close(fd)
+        fd = None
+        _local_publication_event(label + ":before_replace")
+        if _ACTIVE_REGISTER_KEY_OPERATION is not None:
+            _assert_register_key_operation()
+        _require_snapshot(tmp, stage_snapshot, label + " stage")
+        if expected_absent:
+            _absolute, _parent, late_st = _validate_private_destination(absolute)
+            if late_st is not None:
+                raise ValueError("%s destination appeared before publication" % label)
+            _LOCAL_RENAME_NOREPLACE(tmp, absolute)
+            transitioned = True
+        else:
+            _require_snapshot(absolute, expected_snapshot, label + " destination")
+            _LOCAL_RENAME_EXCHANGE(tmp, absolute)
+            transitioned = True
+            candidate_now = _snapshot_at_path(absolute)
+            displaced_snapshot = _snapshot_at_path(tmp)
+            if (not _same_file_snapshot(candidate_now, stage_snapshot)
+                    or not _same_file_snapshot(
+                        displaced_snapshot, expected_snapshot)):
+                # Restore the exact mapping observed by the kernel transition,
+                # including a finite substitution injected inside the syscall
+                # seam. Never overwrite or delete that foreign inode.
+                before_inverse_candidate = candidate_now
+                before_inverse_displaced = displaced_snapshot
+                _LOCAL_RENAME_EXCHANGE(tmp, absolute)
+                transitioned = False
+                restored_destination = _snapshot_at_path(absolute)
+                restored_stage = _snapshot_at_path(tmp)
+                if (not _same_file_snapshot(
+                            restored_destination, before_inverse_displaced)
+                        or not _same_file_snapshot(
+                            restored_stage, before_inverse_candidate)):
+                    raise OSError(
+                        "publication compensation could not prove exact restoration")
+                raise ValueError("%s destination changed during publication" % label)
+        _local_publication_event(label + ":after_replace")
+        if _ACTIVE_REGISTER_KEY_OPERATION is not None:
+            _assert_register_key_operation()
+        _fsync_parent(absolute, label)
+        actual = _snapshot_at_path(absolute, correct_mode=True)
+        if not _same_file_snapshot(actual, stage_snapshot):
+            raise OSError("published %s inode/bytes do not match staged bytes" % label)
+        if not expected_absent:
+            _safe_unlink_snapshot(tmp, displaced_snapshot)
+            _fsync_parent(absolute, label + "-hold-retire")
+        return absolute
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        # Cleanup is capability-bound: remove only our staged inode or the
+        # proven displaced prior inode. A substituted/hardlinked path remains.
+        try:
+            if os.path.lexists(tmp):
+                if transitioned and displaced_snapshot is not None:
+                    _safe_unlink_snapshot(tmp, displaced_snapshot)
+                elif (not transitioned and stage_snapshot is not None):
+                    _safe_unlink_snapshot(tmp, stage_snapshot)
+        except (OSError, ValueError):
+            pass
+        raise
+
+
+_ACTIVE_REGISTER_KEY_OPERATION = None
+_REGISTER_KEY_PENDING_ACTIVE = False
+
+
+class _RegisterKeyOperationLock:
+    """Process-lifetime exclusion for one logical register-key config.
+
+    The abstract Unix socket is authoritative, so replacing an inode-backed
+    lock pathname cannot admit a second process. An optional existing mode-0600
+    lock file is treated only as an audit artifact and is never created or
+    repaired by this command. Kernel socket/flock lifetime defines staleness:
+    normal return, exception, or process death releases ownership.
+    """
+
+    def __init__(self, config_path):
+        _require_private_publication_platform()
+        self.config_path = _private_abs(config_path)
+        self.lock_path = self.config_path + ".register-key.lock"
+        digest = hashlib.sha256(
+            (str(os.geteuid()) + "\0" + self.config_path).encode("utf-8")
+        ).hexdigest()
+        self.socket_name = "\0clack-register-key-v1-" + digest
+        self._socket = None
+        self._lock_fd = None
+        self._lock_snapshot = None
+
+    def __enter__(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.set_inheritable(False)
+        try:
+            sock.bind(self.socket_name)
+        except OSError as exc:
+            sock.close()
+            if exc.errno == errno.EADDRINUSE:
+                raise ValueError(
+                    "another register-key operation is already active for %s"
+                    % self.config_path) from exc
+            raise
+        self._socket = sock
+        try:
+            lock_parent = os.path.dirname(self.lock_path) or "."
+            _reject_symlink_components(lock_parent)
+            if not os.path.isdir(lock_parent):
+                raise ValueError(
+                    "register-key lock parent must already be a directory: %s"
+                    % lock_parent)
+            _absolute, _parent, st = _validate_private_destination(
+                self.lock_path)
+            if st is not None:
+                if stat.S_IMODE(st.st_mode) != 0o600:
+                    raise ValueError(
+                        "register-key audit lock must already be mode 0600: %s"
+                        % self.lock_path)
+                flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+                flags |= (getattr(os, "O_NOFOLLOW", 0)
+                          | getattr(os, "O_NONBLOCK", 0))
+                fd = os.open(self.lock_path, flags)
+                try:
+                    opened = os.fstat(fd)
+                    if (not stat.S_ISREG(opened.st_mode)
+                            or opened.st_nlink != 1
+                            or opened.st_uid != os.geteuid()
+                            or (opened.st_dev, opened.st_ino)
+                               != (st.st_dev, st.st_ino)):
+                        raise ValueError(
+                            "register-key audit lock changed while opening")
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise ValueError(
+                            "register-key audit lock is held by another process") from exc
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    chunks = []
+                    while True:
+                        chunk = os.read(fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    opened = os.fstat(fd)
+                    self._lock_snapshot = _file_snapshot(opened, data)
+                    self._lock_fd = fd
+                    fd = None
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+            self.assert_held()
+            return self
+        except Exception:
+            self.__exit__(None, None, None)
+            raise
+
+    def assert_held(self):
+        if self._socket is None or self._socket.fileno() < 0:
+            raise ValueError("register-key operation lock is not held")
+        if self._lock_snapshot is None:
+            if os.path.lexists(self.lock_path):
+                _validate_private_destination(self.lock_path)
+                raise ValueError(
+                    "register-key audit lock appeared during the operation")
+        else:
+            _require_snapshot(
+                self.lock_path, self._lock_snapshot,
+                "register-key audit lock")
+        return True
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._lock_fd)
+                self._lock_fd = None
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+        return False
+
+
+def _assert_register_key_operation():
+    operation = _ACTIVE_REGISTER_KEY_OPERATION
+    if operation is None:
+        raise ValueError("register-key operation lock is not held")
+    operation.assert_held()
+    return operation
+
+
+def _private_json_bytes(value):
+    return (json.dumps(value, indent=2) + "\n").encode("utf-8")
+
+
 def _write_key_file(path, seed):
-    """Write the b64u seed to path with mode 600. Private key material:
-    never printed, never transmitted."""
-    d = os.path.dirname(os.path.abspath(path))
-    if d:
-        os.makedirs(d, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(b64u_encode(seed) + "\n")
+    """Atomically publish a mode-0600 b64u seed and fsync its directory."""
+    return _atomic_publish_private(
+        path, (b64u_encode(seed) + "\n").encode("ascii"), "key")
 
 
 def _save_identity_config(path, cfg, seed, key_path=None):
-    """Persist an identity config (mode 600) with the private key in a
-    separate mode-600 key file. cfg records identity_privkey_path; any
-    legacy inline identity_privkey is migrated into the file."""
-    kp = key_path or cfg.get("identity_privkey_path") or (path + ".key")
+    """Atomically publish key then config, rejecting unsafe destinations."""
+    _require_private_publication_platform()
+    cp = _private_abs(path)
+    kp = _private_abs(
+        key_path or cfg.get("identity_privkey_path") or (path + ".key"))
+    if _paths_alias(cp, kp):
+        raise ValueError("config and private key paths must name different files")
+    _validate_private_destination(cp)
+    _validate_private_destination(kp)
+    _correct_private_mode(cp)
+    _correct_private_mode(kp)
     cfg.pop("identity_privkey", None)
     cfg["identity_privkey_path"] = kp
     _write_key_file(kp, seed)
-    d = os.path.dirname(os.path.abspath(path))
-    if d:
-        os.makedirs(d, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-        f.write("\n")
+    _atomic_publish_private(cp, _private_json_bytes(cfg), "config")
 
 
 # --- Fail-closed transport (v0.2.12, Flint review F1/F2/F5) -------------------
@@ -1166,27 +1807,27 @@ def _is_loopback_url(url):
 
 
 def _persist_tofu_pin(cfg, fingerprint):
-    """Persist a first-contact TOFU pin so later runs enforce it (F1). The
-    private key is untouched (it lives in its own mode-600 key file); only
-    the JSON config gains relay_identity_fingerprint."""
-    cfg["relay_identity_fingerprint"] = fingerprint
+    """CAS-publish first-contact trust before any pending mutation exists."""
+    _require_private_publication_platform()
+    if _REGISTER_KEY_PENDING_ACTIVE:
+        raise ValueError(
+            "refusing TOFU config write during an active register-key transaction")
     path = _config_path
     if not path:
-        return
+        raise ValueError("cannot persist relay identity pin without a config path")
+    raw, snapshot = _read_private_regular_snapshot(path, correct_mode=True)
     try:
-        d = os.path.dirname(os.path.abspath(path))
-        if d:
-            os.makedirs(d, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-            f.write("\n")
-        # O_CREAT mode applies only on create; the config holds bearer
-        # tokens, so enforce 0600 on rewrite too.
-        os.chmod(path, 0o600)
-    except OSError as e:
-        print("warning: could not save relay identity pin to %s: %s"
-              % (path, e), file=sys.stderr)
+        live_cfg = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("cannot pin relay identity into malformed live config") from exc
+    if live_cfg != cfg:
+        raise ValueError("live config changed before relay identity pin publication")
+    updated = dict(cfg)
+    updated["relay_identity_fingerprint"] = fingerprint
+    _atomic_publish_private(
+        path, _private_json_bytes(updated), "config",
+        expected_snapshot=snapshot)
+    cfg["relay_identity_fingerprint"] = fingerprint
 
 
 def _ensure_origin_verified(origin, cfg):
@@ -1369,11 +2010,18 @@ def _curl_req(cfg, method, url, headers, data, timeout):
         raise
 
 
+class UnknownMutationOutcome(RuntimeError):
+    """A non-idempotent request may have reached the relay."""
+
+
 def req(cfg, method, path, body=None, base=None):
-    # Consent mutations must not resend the same nonce after an ambiguous
-    # failure. Reconcile server state instead of silently replaying a POST.
+    # These mutations must never be resent after an ambiguous transport
+    # failure. register-key has no application id; its retained candidate is
+    # reconciled with the read-only status endpoint before any later send.
     public_request = path in ("/v1/handshakes/requests", "/v1/handshakes/requests/redeem",
                               "/v1/handshakes/accept")
+    register_mutation = method.upper() == "POST" and path == "/v1/register-key"
+    unknown_sensitive = public_request or register_mutation
     origin = (base or base_url(cfg)).rstrip("/")
     token = auth_token(cfg)
     level = _ensure_origin_verified(origin, cfg)
@@ -1403,8 +2051,10 @@ def req(cfg, method, path, body=None, base=None):
         try:
             return _curl_req(cfg, method, url, headers, data, timeout=130)
         except Exception as e:
-            if public_request and not isinstance(e, FileNotFoundError):
-                raise RuntimeError("Public request outcome UNKNOWN; reconcile handshakes before retrying") from e
+            if unknown_sensitive and not isinstance(e, FileNotFoundError):
+                what = "register-key" if register_mutation else "public request"
+                raise UnknownMutationOutcome(
+                    "%s outcome UNKNOWN; reconcile before retrying" % what) from e
             print("curl transport failed (%s), falling back to Python"
                   % type(e).__name__, file=sys.stderr)
 
@@ -1412,12 +2062,11 @@ def req(cfg, method, path, body=None, base=None):
     r = urllib.request.Request(url, data=data, method=method)
     for k, v in headers.items():
         r.add_header(k, v)
-    # Retry on transient connection drops. The relay/Cloudflare occasionally
-    # drops mid-read (IncompleteRead) or closes without response
-    # (RemoteDisconnected) after processing. For idempotent GETs, retry is safe.
-    # For POSTs, the caller must use stable IDs (relay dedupes on id+sender).
+    # Retry on transient connection drops only when the request is safe to
+    # replay. register-key and consent mutations make exactly one attempt.
+    attempts = 1 if unknown_sensitive else 3
     last_exc = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             with _open(r, timeout=130) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -1437,9 +2086,11 @@ def req(cfg, method, path, body=None, base=None):
         except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                 ConnectionError, TimeoutError) as e:
             last_exc = e
-            if public_request:
-                raise RuntimeError("Public request outcome UNKNOWN; reconcile handshakes before retrying") from e
-            if attempt < 2:
+            if unknown_sensitive:
+                what = "register-key" if register_mutation else "public request"
+                raise UnknownMutationOutcome(
+                    "%s outcome UNKNOWN; reconcile before retrying" % what) from e
+            if attempt < attempts - 1:
                 time.sleep(1 + attempt)
                 # Rebuild the request: urllib Request objects are single-use
                 # after a failed open on some Python versions.
@@ -1623,6 +2274,7 @@ def check_relay_identity(relay_url, cfg):
 
 
 def cmd_keygen(args):
+    _require_private_publication_platform()
     if os.path.exists(args.config) and not args.force:
         print("refusing to overwrite existing %s (use --force)" % args.config,
               file=sys.stderr)
@@ -1653,6 +2305,7 @@ def cmd_attach_key(args, cfg):
     "identity_pubkeys" map before the relay will accept signed requests.
     Idempotent: a config that already has a usable seed is left alone.
     """
+    _require_private_publication_platform()
     if is_identity_cfg(cfg) and signing_seed(cfg) is not None:
         pub = b64u_decode(cfg["identity_pubkey"])
         print("already has a signing key: %s" % args.config)
@@ -1714,16 +2367,847 @@ def cmd_attach_key(args, cfg):
     return 0
 
 
-def cmd_register_key(args, cfg):
-    """Self-service Ed25519 key registration (v0.2.17).
+def _register_key_pending_path(config_path):
+    return _private_abs(config_path) + ".register-key.pending"
 
-    Ensures the identity file carries a signing keypair (generating one
-    when missing, like attach-key), then POSTs the public key to
-    /v1/register-key with bearer-token auth. The endpoint is
-    signature-exempt -- it IS the upgrade path for token-only peers --
-    so this works before the client can sign. Reports whether the relay
-    recorded a fresh registration or a rotation.
-    """
+
+def _blob_encode(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def _blob_decode(value, field):
+    if type(value) is not str:
+        raise ValueError("pending journal %s must be base64 text" % field)
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ValueError("pending journal %s is malformed" % field) from exc
+
+
+def _canonical_candidate_pub(value):
+    if type(value) is not str:
+        return None
+    try:
+        raw = b64u_decode(value)
+    except Exception:
+        return None
+    if len(raw) != 32 or b64u_encode(raw) != value:
+        return None
+    return value
+
+
+def _snapshot_token(snapshot):
+    return {
+        name: snapshot[name]
+        for name in ("dev", "ino", "mode", "uid", "nlink", "size")
+    }
+
+
+def _validate_snapshot_token(token, field):
+    required = ("dev", "ino", "mode", "uid", "nlink", "size")
+    if (type(token) is not dict
+            or set(token) != set(required)
+            or any(type(token.get(name)) is not int for name in required)
+            or token["mode"] != 0o600
+            or token["uid"] != os.geteuid()
+            or token["nlink"] != 1
+            or token["size"] < 0):
+        raise ValueError("register-key pending %s token is invalid" % field)
+    return token
+
+
+def _snapshot_matches_token(snapshot, token, data):
+    return (
+        snapshot is not None
+        and all(snapshot[name] == token[name]
+                for name in ("dev", "ino", "mode", "uid", "nlink", "size"))
+        and snapshot["data"] == bytes(data)
+    )
+
+
+def _register_key_stage_path(journal, role):
+    if role not in ("config", "key"):
+        raise ValueError("unknown register-key publication role")
+    target = journal["config_path"] if role == "config" else journal["key_path"]
+    parent = os.path.dirname(target) or "."
+    return os.path.join(
+        parent,
+        ".%s.register-key-%s.%s-stage"
+        % (os.path.basename(target), journal["transaction_id"], role),
+    )
+
+
+def _register_key_quarantine_path(path, journal):
+    return "%s.rejected-%s" % (path, journal["transaction_id"])
+
+
+def _write_register_key_journal(path, journal):
+    _assert_register_key_operation()
+    _atomic_publish_private(path, _private_json_bytes(journal), "journal")
+
+
+def _validate_register_key_journal(journal, config_path):
+    if type(journal) is not dict or journal.get("kind") != _REGISTER_KEY_JOURNAL_KIND:
+        raise ValueError("invalid register-key pending journal kind")
+    required_text = (
+        "transaction_id", "phase", "config_path", "key_path", "peer",
+        "request_base", "identity_pubkey", "identity_seed",
+        "base_config_sha256", "base_config_bytes", "target_config_bytes",
+        "token_sha256",
+    )
+    if any(type(journal.get(name)) is not str for name in required_text):
+        raise ValueError("register-key pending journal has invalid field types")
+    if journal["phase"] not in (
+            "prepared", "requesting", "accepted", "publishing", "published"):
+        raise ValueError("register-key pending journal has invalid phase")
+    transaction_id = journal["transaction_id"]
+    if (len(transaction_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in transaction_id)):
+        raise ValueError("register-key pending transaction id is invalid")
+    if journal["config_path"] != _private_abs(config_path):
+        raise ValueError("register-key pending journal belongs to another config")
+    seed = b64u_decode(journal["identity_seed"])
+    if (len(seed) != 32 or b64u_encode(seed) != journal["identity_seed"]
+            or b64u_encode(_publickey(seed)) != journal["identity_pubkey"]):
+        raise ValueError("register-key pending seed/public key mismatch")
+    if _canonical_candidate_pub(journal["identity_pubkey"]) is None:
+        raise ValueError("register-key pending public key is not canonical")
+    base_bytes = _blob_decode(journal["base_config_bytes"], "base_config_bytes")
+    if hashlib.sha256(base_bytes).hexdigest() != journal["base_config_sha256"]:
+        raise ValueError("register-key pending base config digest mismatch")
+    target_bytes = _blob_decode(journal["target_config_bytes"], "target_config_bytes")
+    try:
+        target = json.loads(target_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("register-key pending target config is malformed") from exc
+    if (type(target) is not dict
+            or target.get("kind") != IDENTITY_KIND
+            or target.get("peer_name") != journal["peer"]
+            or target.get("identity_pubkey") != journal["identity_pubkey"]
+            or _private_abs(target.get("identity_privkey_path"))
+               != journal["key_path"]):
+        raise ValueError("register-key pending target config binding mismatch")
+    token = auth_token(target)
+    if (not token or hashlib.sha256(token.encode("utf-8")).hexdigest()
+            != journal["token_sha256"]):
+        raise ValueError("register-key pending token binding mismatch")
+    publication = journal.get("publication")
+    if journal["phase"] == "publishing" or publication is not None:
+        required_publication = {
+            "config_stage", "config_expected", "config_state",
+            "key_stage", "key_expected", "key_state",
+        }
+        if type(publication) is not dict or set(publication) != required_publication:
+            raise ValueError("register-key pending publication state is invalid")
+        _validate_snapshot_token(
+            publication["config_stage"], "config publication stage")
+        _validate_snapshot_token(
+            publication["config_expected"], "config publication baseline")
+        _validate_snapshot_token(
+            publication["key_stage"], "key publication stage")
+        if publication["config_state"] not in ("base", "target"):
+            raise ValueError("register-key pending config publication state is invalid")
+        if publication["key_state"] not in ("absent", "prior", "candidate"):
+            raise ValueError("register-key pending key publication state is invalid")
+        if publication["key_state"] == "absent":
+            if publication["key_expected"] is not None:
+                raise ValueError("register-key absent-key publication token is invalid")
+        else:
+            _validate_snapshot_token(
+                publication["key_expected"], "key publication baseline")
+    return seed, target, base_bytes, target_bytes
+
+
+def _load_register_key_journal(path, config_path):
+    raw = _read_private_regular(path, correct_mode=True)
+    try:
+        journal = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("register-key pending journal is malformed") from exc
+    _validate_register_key_journal(journal, config_path)
+    return journal
+
+
+def _journal_update(path, journal, **changes):
+    updated = dict(journal)
+    updated.update(changes)
+    _validate_register_key_journal(updated, updated["config_path"])
+    _write_register_key_journal(path, updated)
+    return updated
+
+
+def _journal_phase(path, journal, phase):
+    return _journal_update(path, journal, phase=phase)
+
+
+def _pending_request_cfg(journal):
+    seed, target, _base, _target_bytes = _validate_register_key_journal(
+        journal, journal["config_path"])
+    request_cfg = dict(target)
+    request_cfg.pop("identity_privkey_path", None)
+    request_cfg["identity_privkey"] = b64u_encode(seed)
+    return request_cfg
+
+
+def _validate_register_key_artifacts(path, journal):
+    """Re-attest every credential-bearing name before a boundary."""
+    operation = _assert_register_key_operation()
+    _validate_private_destination(journal["config_path"], must_exist=True)
+    _validate_private_destination(path, must_exist=True)
+    _validate_private_destination(journal["key_path"])
+    operation.assert_held()
+    stage_paths = [
+        _register_key_stage_path(journal, "config"),
+        _register_key_stage_path(journal, "key"),
+    ]
+    for stage_path in stage_paths:
+        _validate_private_destination(stage_path)
+    quarantine = _register_key_quarantine_path(path, journal)
+    _absolute, _parent, quarantine_st = _validate_private_destination(quarantine)
+    if quarantine_st is not None:
+        raise ValueError("register-key quarantine destination already exists")
+    paths = [journal["config_path"], path, journal["key_path"]] + stage_paths
+    normalized = [_private_abs(item) for item in paths]
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("register-key artifact paths must be distinct")
+    return True
+
+
+def _register_key_status(journal, args):
+    _validate_register_key_artifacts(
+        _register_key_pending_path(journal["config_path"]), journal)
+    request_cfg = _pending_request_cfg(journal)
+    _assert_register_key_operation()
+    try:
+        code, out = req(
+            request_cfg, "GET", "/v1/register-key/status",
+            base=args.base_url or journal["request_base"],
+        )
+    except Exception as exc:
+        return "unavailable", None, {"error": type(exc).__name__}
+    if code != 200:
+        return "unavailable", code, out
+    if (type(out) is not dict or out.get("peer") != journal["peer"]
+            or type(out.get("registered")) is not bool):
+        return "malformed", code, out
+    accepted = out.get("identity_pubkey")
+    if out["registered"] is False:
+        if accepted is not None:
+            return "malformed", code, out
+        return "absent", code, out
+    if _canonical_candidate_pub(accepted) is None:
+        return "malformed", code, out
+    if accepted == journal["identity_pubkey"]:
+        return "candidate", code, out
+    return "different", code, out
+
+
+def _pending_artifacts_match(journal):
+    try:
+        seed, _target, _base, target_bytes = _validate_register_key_journal(
+            journal, journal["config_path"])
+        key_bytes = (b64u_encode(seed) + "\n").encode("ascii")
+        return (
+            _read_private_regular(journal["key_path"], correct_mode=True) == key_bytes
+            and _read_private_regular(journal["config_path"], correct_mode=True)
+            == target_bytes
+            and stat.S_IMODE(os.lstat(journal["key_path"]).st_mode) == 0o600
+            and stat.S_IMODE(os.lstat(journal["config_path"]).st_mode) == 0o600
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _optional_private_snapshot(path, correct_mode=False):
+    _absolute, _parent, st = _validate_private_destination(path)
+    if st is None:
+        return None
+    return _snapshot_at_path(path, correct_mode=correct_mode)
+
+
+def _stage_register_key_artifact(path, data, label):
+    existing = _optional_private_snapshot(path)
+    if existing is not None:
+        if existing["mode"] != 0o600 or existing["data"] != bytes(data):
+            raise ValueError("register-key %s stage is occupied by foreign state"
+                             % label)
+        return existing
+    fd = None
+    snapshot = None
+    try:
+        _local_publication_event(label + ":before_stage_open")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= (getattr(os, "O_CLOEXEC", 0)
+                  | getattr(os, "O_NOFOLLOW", 0)
+                  | getattr(os, "O_NONBLOCK", 0))
+        fd = os.open(path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        view = memoryview(bytes(data))
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while staging %s" % label)
+            view = view[written:]
+        snapshot = _file_snapshot(os.fstat(fd), bytes(data))
+        _local_publication_event(label + ":after_stage_write")
+        _local_publication_event(label + ":before_file_fsync")
+        _LOCAL_FSYNC(fd)
+        snapshot = _file_snapshot(os.fstat(fd), bytes(data))
+        os.close(fd)
+        fd = None
+        _require_snapshot(path, snapshot, label + " stage")
+        _fsync_parent(path, label + "-stage")
+        return snapshot
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        try:
+            if snapshot is not None and os.path.lexists(path):
+                _safe_unlink_snapshot(path, snapshot)
+        except (OSError, ValueError):
+            pass
+        raise
+
+
+def _publication_materials(journal):
+    seed, _target, base_bytes, target_bytes = _validate_register_key_journal(
+        journal, journal["config_path"])
+    candidate_key = (b64u_encode(seed) + "\n").encode("ascii")
+    if journal.get("prior_key_exists") is True:
+        prior_key = _blob_decode(
+            journal.get("prior_key_bytes"), "prior_key_bytes")
+    elif journal.get("prior_key_exists") is False:
+        prior_key = None
+    else:
+        raise ValueError("register-key pending prior-key marker is invalid")
+    return base_bytes, target_bytes, prior_key, candidate_key
+
+
+def _prepare_register_key_publication(path, journal):
+    if journal["phase"] in ("publishing", "published"):
+        return _adopt_restored_publication_baselines(path, journal)
+    base_bytes, target_bytes, prior_key, candidate_key = \
+        _publication_materials(journal)
+    key_stage_path = _register_key_stage_path(journal, "key")
+    config_stage_path = _register_key_stage_path(journal, "config")
+    key_stage = _stage_register_key_artifact(
+        key_stage_path, candidate_key, "key")
+    config_stage = _stage_register_key_artifact(
+        config_stage_path, target_bytes, "config")
+    _validate_register_key_artifacts(path, journal)
+    current_config = _snapshot_at_path(
+        journal["config_path"], correct_mode=True)
+    if current_config["data"] == base_bytes:
+        config_state = "base"
+    elif current_config["data"] == target_bytes:
+        config_state = "target"
+    else:
+        raise ValueError(
+            "local config changed while register-key was pending; retained journal")
+    current_key = _optional_private_snapshot(
+        journal["key_path"], correct_mode=True)
+    if current_key is None:
+        if prior_key is not None:
+            raise ValueError(
+                "local key disappeared while register-key was pending; retained journal")
+        key_state = "absent"
+        key_expected = None
+    elif current_key["data"] == candidate_key:
+        key_state = "candidate"
+        key_expected = _snapshot_token(current_key)
+    elif prior_key is not None and current_key["data"] == prior_key:
+        key_state = "prior"
+        key_expected = _snapshot_token(current_key)
+    else:
+        raise ValueError(
+            "local key changed while register-key was pending; retained journal")
+    publication = {
+        "config_stage": _snapshot_token(config_stage),
+        "config_expected": _snapshot_token(current_config),
+        "config_state": config_state,
+        "key_stage": _snapshot_token(key_stage),
+        "key_expected": key_expected,
+        "key_state": key_state,
+    }
+    return _journal_update(
+        path, journal, phase="publishing", publication=publication)
+
+
+def _adopt_restored_publication_baselines(path, journal):
+    """Allow an operator to restore exact baseline bytes on a new inode."""
+    if journal["phase"] != "publishing":
+        return journal
+    base_bytes, _target_bytes, prior_key, candidate_key = \
+        _publication_materials(journal)
+    publication = dict(journal["publication"])
+    changed = False
+    config_stage = _optional_private_snapshot(
+        _register_key_stage_path(journal, "config"))
+    current_config = _snapshot_at_path(journal["config_path"])
+    if (publication["config_state"] == "base"
+            and config_stage is not None
+            and _snapshot_matches_token(
+                config_stage, publication["config_stage"],
+                _blob_decode(journal["target_config_bytes"],
+                             "target_config_bytes"))
+            and current_config["data"] == base_bytes
+            and not _snapshot_matches_token(
+                current_config, publication["config_expected"], base_bytes)):
+        publication["config_expected"] = _snapshot_token(current_config)
+        changed = True
+    key_stage = _optional_private_snapshot(
+        _register_key_stage_path(journal, "key"))
+    current_key = _optional_private_snapshot(journal["key_path"])
+    if (publication["key_state"] == "prior"
+            and prior_key is not None
+            and key_stage is not None
+            and _snapshot_matches_token(
+                key_stage, publication["key_stage"], candidate_key)
+            and current_key is not None
+            and current_key["data"] == prior_key
+            and not _snapshot_matches_token(
+                current_key, publication["key_expected"], prior_key)):
+        publication["key_expected"] = _snapshot_token(current_key)
+        changed = True
+    if changed:
+        return _journal_update(path, journal, publication=publication)
+    return journal
+
+
+def _transition_register_key_artifact(journal, role):
+    base_bytes, target_bytes, prior_key, candidate_key = \
+        _publication_materials(journal)
+    publication = journal["publication"]
+    if role == "config":
+        destination = journal["config_path"]
+        stage_path = _register_key_stage_path(journal, "config")
+        stage_token = publication["config_stage"]
+        expected_token = publication["config_expected"]
+        state = publication["config_state"]
+        candidate_data = target_bytes
+        expected_data = target_bytes if state == "target" else base_bytes
+        already_candidate = state == "target"
+    elif role == "key":
+        destination = journal["key_path"]
+        stage_path = _register_key_stage_path(journal, "key")
+        stage_token = publication["key_stage"]
+        expected_token = publication["key_expected"]
+        state = publication["key_state"]
+        candidate_data = candidate_key
+        expected_data = (candidate_key if state == "candidate" else prior_key)
+        already_candidate = state == "candidate"
+    else:
+        raise ValueError("unknown register-key publication role")
+
+    current = _optional_private_snapshot(destination)
+    stage = _optional_private_snapshot(stage_path)
+    if already_candidate:
+        if not _snapshot_matches_token(current, expected_token, candidate_data):
+            raise ValueError("local %s changed while register-key was pending"
+                             % role)
+        return {"changed": False, "kind": "already", "role": role}
+
+    # A completed transition after a crash: the staged inode is canonical and
+    # the baseline is retained at the deterministic stage name (or absent for
+    # a destination that was initially absent).
+    if _snapshot_matches_token(current, stage_token, candidate_data):
+        if state == "absent":
+            if stage is not None:
+                raise ValueError("unexpected key stage after completed publication")
+        elif _snapshot_matches_token(stage, expected_token, expected_data):
+            return {"changed": False, "kind": "completed", "role": role}
+        else:
+            # A process may have died after the kernel exchange but before the
+            # immediate mismatch compensation. The canonical candidate token
+            # proves which side of that finite exchange we are observing. Put
+            # the displaced (possibly operator-supplied) inode back at the
+            # canonical name, retain the candidate at the stage name, and fail
+            # closed for an explicit later reconciliation.
+            if stage is None:
+                raise ValueError(
+                    "%s publication hold disappeared after transition" % role)
+            before_destination = current
+            before_stage = stage
+            _LOCAL_RENAME_EXCHANGE(stage_path, destination)
+            restored_destination = _snapshot_at_path(destination)
+            restored_stage = _snapshot_at_path(stage_path)
+            if (not _same_file_snapshot(restored_destination, before_stage)
+                    or not _same_file_snapshot(
+                        restored_stage, before_destination)):
+                raise OSError(
+                    "%s crash-window compensation is uncertain" % role)
+            _fsync_parent(destination, role + "-crash-compensate")
+            raise ValueError(
+                "%s changed in an interrupted publication exchange" % role)
+        return {"changed": False, "kind": "completed", "role": role}
+
+    stage_ready = _snapshot_matches_token(stage, stage_token, candidate_data)
+    if state == "absent":
+        destination_ready = current is None
+    else:
+        destination_ready = _snapshot_matches_token(
+            current, expected_token, expected_data)
+    if not stage_ready or not destination_ready:
+        raise ValueError(
+            "local %s changed while register-key was pending; retained journal"
+            % role)
+
+    _local_publication_event(role + ":before_replace")
+    _assert_register_key_operation()
+    # The event hook is an adversarial boundary: re-attest after it.
+    stage = _snapshot_at_path(stage_path)
+    current = _optional_private_snapshot(destination)
+    if (not _snapshot_matches_token(stage, stage_token, candidate_data)
+            or (state == "absent" and current is not None)
+            or (state != "absent" and not _snapshot_matches_token(
+                current, expected_token, expected_data))):
+        raise ValueError("%s publication boundary drift" % role)
+
+    if state == "absent":
+        _LOCAL_RENAME_NOREPLACE(stage_path, destination)
+        kind = "noreplace"
+        after_destination = _snapshot_at_path(destination)
+        if not _snapshot_matches_token(
+                after_destination, stage_token, candidate_data):
+            raise OSError("%s publication did not install staged inode" % role)
+    else:
+        _LOCAL_RENAME_EXCHANGE(stage_path, destination)
+        kind = "exchange"
+        after_destination = _snapshot_at_path(destination)
+        after_stage = _snapshot_at_path(stage_path)
+        if (not _snapshot_matches_token(
+                    after_destination, stage_token, candidate_data)
+                or not _snapshot_matches_token(
+                    after_stage, expected_token, expected_data)):
+            # Exact inverse restores whatever finite substitution the kernel
+            # actually exchanged; then prove both names before failing.
+            before_inverse_destination = after_destination
+            before_inverse_stage = after_stage
+            _LOCAL_RENAME_EXCHANGE(stage_path, destination)
+            restored_destination = _snapshot_at_path(destination)
+            restored_stage = _snapshot_at_path(stage_path)
+            if (not _same_file_snapshot(
+                        restored_destination, before_inverse_stage)
+                    or not _same_file_snapshot(
+                        restored_stage, before_inverse_destination)):
+                raise OSError(
+                    "%s publication compensation is uncertain" % role)
+            raise ValueError("%s changed inside publication syscall" % role)
+    _local_publication_event(role + ":after_replace")
+    _fsync_parent(destination, role)
+    _assert_register_key_operation()
+    final_destination = _snapshot_at_path(destination)
+    if not _snapshot_matches_token(
+            final_destination, stage_token, candidate_data):
+        raise OSError("%s publication failed exact readback" % role)
+    return {"changed": True, "kind": kind, "role": role}
+
+
+def _rollback_register_key_transition(journal, transition):
+    if not transition or not transition.get("changed"):
+        return
+    role = transition["role"]
+    publication = journal["publication"]
+    _base, target_bytes, prior_key, candidate_key = _publication_materials(journal)
+    if role == "config":
+        destination = journal["config_path"]
+        stage_path = _register_key_stage_path(journal, "config")
+        stage_token = publication["config_stage"]
+        candidate_data = target_bytes
+        expected_token = publication["config_expected"]
+        expected_data = _blob_decode(
+            journal["base_config_bytes"], "base_config_bytes")
+    else:
+        destination = journal["key_path"]
+        stage_path = _register_key_stage_path(journal, "key")
+        stage_token = publication["key_stage"]
+        candidate_data = candidate_key
+        expected_token = publication["key_expected"]
+        expected_data = prior_key
+    if transition["kind"] == "noreplace":
+        current = _snapshot_at_path(destination)
+        if not _snapshot_matches_token(current, stage_token, candidate_data):
+            raise OSError("cannot prove key publication rollback source")
+        _LOCAL_RENAME_NOREPLACE(destination, stage_path)
+        if (_optional_private_snapshot(destination) is not None
+                or not _snapshot_matches_token(
+                    _snapshot_at_path(stage_path), stage_token, candidate_data)):
+            raise OSError("key publication rollback is uncertain")
+    elif transition["kind"] == "exchange":
+        current = _snapshot_at_path(destination)
+        held = _snapshot_at_path(stage_path)
+        if (not _snapshot_matches_token(current, stage_token, candidate_data)
+                or not _snapshot_matches_token(
+                    held, expected_token, expected_data)):
+            raise OSError("cannot prove %s publication rollback mapping" % role)
+        _LOCAL_RENAME_EXCHANGE(stage_path, destination)
+        if (not _snapshot_matches_token(
+                    _snapshot_at_path(destination), expected_token, expected_data)
+                or not _snapshot_matches_token(
+                    _snapshot_at_path(stage_path), stage_token, candidate_data)):
+            raise OSError("%s publication rollback is uncertain" % role)
+    _fsync_parent(destination, role + "-rollback")
+
+
+def _cleanup_register_key_stages(journal):
+    for role in ("key", "config"):
+        stage_path = _register_key_stage_path(journal, role)
+        snapshot = _optional_private_snapshot(stage_path)
+        if snapshot is not None:
+            _safe_unlink_snapshot(stage_path, snapshot)
+            _fsync_parent(stage_path, role + "-stage-retire")
+
+
+def _retire_register_key_journal(path):
+    try:
+        snapshot = _snapshot_at_path(path)
+        _local_publication_event("journal:before_retire")
+        _assert_register_key_operation()
+        _safe_unlink_snapshot(path, snapshot)
+        _fsync_parent(path, "journal-retire")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        # Artifacts are already fully durable. Retention is safe; a published
+        # journal that survives can be verified and retired on the next run.
+        print("warning: published register-key journal retained: %s" % exc,
+              file=sys.stderr)
+
+
+def _quarantine_register_key_journal(path, journal):
+    destination = _register_key_quarantine_path(path, journal)
+    _validate_register_key_artifacts(path, journal)
+    source_snapshot = _snapshot_at_path(path)
+    _local_publication_event("journal:before_quarantine")
+    _validate_register_key_artifacts(path, journal)
+    _require_snapshot(path, source_snapshot, "register-key pending journal")
+    _LOCAL_RENAME_NOREPLACE(path, destination)
+    moved = _snapshot_at_path(destination)
+    if (not _same_file_snapshot(moved, source_snapshot)
+            or os.path.lexists(path)):
+        raise OSError("register-key quarantine transition failed exact readback")
+    _fsync_parent(destination, "journal-quarantine")
+    return destination
+
+
+def _publish_accepted_register_key(path, journal):
+    journal = _prepare_register_key_publication(path, journal)
+    if journal["phase"] == "published":
+        if not _pending_artifacts_match(journal):
+            raise ValueError("published register-key artifacts no longer match")
+        _cleanup_register_key_stages(journal)
+        _retire_register_key_journal(path)
+        return journal
+    _validate_register_key_artifacts(path, journal)
+    _transition_register_key_artifact(journal, "config")
+    # Config is authoritative. Re-attest it immediately before the key
+    # transition; a concurrent operator replacement therefore blocks the key.
+    _transition_register_key_artifact(journal, "config")
+    key_transition = _transition_register_key_artifact(journal, "key")
+    try:
+        _transition_register_key_artifact(journal, "config")
+    except (OSError, ValueError):
+        # A drift discovered after the key syscall must not leave the candidate
+        # published. Restore the exact prior/absent key mapping when provable.
+        _rollback_register_key_transition(journal, key_transition)
+        raise
+    _transition_register_key_artifact(journal, "key")
+    if not _pending_artifacts_match(journal):
+        raise OSError("published register-key artifacts failed exact readback")
+    published = _journal_phase(path, journal, "published")
+    _cleanup_register_key_stages(published)
+    _retire_register_key_journal(path)
+    return published
+
+
+def _finish_accepted_register_key(path, journal):
+    try:
+        accepted = journal
+        if journal["phase"] not in ("accepted", "publishing", "published"):
+            accepted = _journal_phase(path, journal, "accepted")
+        _publish_accepted_register_key(path, accepted)
+    except (OSError, ValueError) as exc:
+        print("register-key accepted by relay, but local publication is pending: %s"
+              % exc, file=sys.stderr)
+        return 1
+    if journal.get("generated"):
+        print("generated signing keypair; private key: %s (mode 600; never leaves this machine)"
+              % journal["key_path"])
+    print("registered signing key for peer %r" % journal["peer"])
+    print("pubkey: %s" % journal["identity_pubkey"])
+    return 0
+
+
+def _send_register_key_candidate(path, journal, args):
+    try:
+        requesting = _journal_phase(path, journal, "requesting")
+        _validate_register_key_artifacts(path, requesting)
+        request_cfg = _pending_request_cfg(requesting)
+        _assert_register_key_operation()
+    except (OSError, ValueError) as exc:
+        print("could not durably mark register-key request pending: %s" % exc,
+              file=sys.stderr)
+        return 1
+    try:
+        code, out = req(
+            request_cfg, "POST", "/v1/register-key",
+            {"pubkey": requesting["identity_pubkey"]},
+            base=args.base_url or requesting["request_base"],
+        )
+    except Exception as exc:
+        print("register-key outcome UNKNOWN; pending candidate retained at %s: %s"
+              % (path, type(exc).__name__), file=sys.stderr)
+        return 1
+    exact_acceptance = (
+        code == 200
+        and type(out) is dict
+        and out.get("registered") is True
+        and out.get("peer") == requesting["peer"]
+        and out.get("identity_pubkey") == requesting["identity_pubkey"]
+        and type(out.get("rotated")) is bool
+    )
+    if exact_acceptance:
+        return _finish_accepted_register_key(path, requesting)
+    if code >= 500:
+        print("register-key returned HTTP %d; pending candidate retained at %s"
+              % (code, path), file=sys.stderr)
+        return 1
+    if code == 200:
+        print("register-key response did not bind the exact candidate/peer; "
+              "pending candidate retained for reconciliation", file=sys.stderr)
+        return 1
+    # A non-5xx rejection is retired only after the read-only status endpoint
+    # proves that this exact candidate is not the relay's current valid key.
+    state, _status_code, _status = _register_key_status(requesting, args)
+    if state == "candidate":
+        return _finish_accepted_register_key(path, requesting)
+    if state in ("absent", "different"):
+        try:
+            quarantine = _quarantine_register_key_journal(path, requesting)
+        except (OSError, ValueError) as exc:
+            print("register-key rejected, but pending candidate could not be "
+                  "quarantined safely: %s" % exc, file=sys.stderr)
+            return 1
+        print("register-key failed: HTTP %d %s; rejected candidate quarantined at %s"
+              % (code, json.dumps(out), quarantine), file=sys.stderr)
+        return 1
+    print("register-key failed: HTTP %d %s; status reconciliation unavailable, "
+          "pending candidate retained at %s" % (code, json.dumps(out), path),
+          file=sys.stderr)
+    return 1
+
+
+def _resume_register_key(path, journal, args):
+    if journal["phase"] == "published":
+        try:
+            _publish_accepted_register_key(path, journal)
+        except (OSError, ValueError) as exc:
+            print("published register-key state retained for safe restart: %s"
+                  % exc, file=sys.stderr)
+            return 1
+        print("registered signing key for peer %r" % journal["peer"])
+        print("pubkey: %s" % journal["identity_pubkey"])
+        return 0
+    if journal["phase"] == "prepared":
+        return _send_register_key_candidate(path, journal, args)
+    try:
+        state, code, out = _register_key_status(journal, args)
+    except (OSError, ValueError) as exc:
+        print("cannot safely reconcile pending register-key candidate: %s" % exc,
+              file=sys.stderr)
+        return 1
+    if state == "candidate":
+        return _finish_accepted_register_key(path, journal)
+    if state == "absent":
+        # This is a new send decision based on a read-only proof that no valid
+        # server key exists, not a blind retry of the uncertain POST.
+        return _send_register_key_candidate(path, journal, args)
+    if state == "different":
+        try:
+            quarantine = _quarantine_register_key_journal(path, journal)
+        except (OSError, ValueError) as exc:
+            print("different relay key found; pending candidate retained: %s" % exc,
+                  file=sys.stderr)
+            return 1
+        print("relay has a different valid key; pending candidate quarantined at %s"
+              % quarantine, file=sys.stderr)
+        return 1
+    print("cannot reconcile pending register-key candidate (HTTP %r %s); retained at %s"
+          % (code, json.dumps(out), path), file=sys.stderr)
+    return 1
+
+
+def _load_register_key_config(config_path):
+    raw = _read_private_regular(config_path, correct_mode=True)
+    try:
+        cfg = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("register-key config is malformed") from exc
+    if type(cfg) is not dict:
+        raise ValueError("register-key config must be a JSON object")
+    return cfg
+
+
+def cmd_register_key(args, cfg=None):
+    """Serialize the complete durable register-key state machine."""
+    _require_private_publication_platform()
+    del cfg  # Caller snapshots are advisory; authority is re-read under lock.
+    global _ACTIVE_REGISTER_KEY_OPERATION, _REGISTER_KEY_PENDING_ACTIVE
+    global _config_path, _selected_peer
+    config_path = _private_abs(args.config)
+    previous_path = _config_path
+    previous_peer = _selected_peer
+    try:
+        with _RegisterKeyOperationLock(config_path) as operation:
+            if _ACTIVE_REGISTER_KEY_OPERATION is not None:
+                raise ValueError("nested register-key operation is not allowed")
+            _ACTIVE_REGISTER_KEY_OPERATION = operation
+            _config_path = config_path
+            _selected_peer = getattr(args, "peer", None)
+            try:
+                return _cmd_register_key_locked(args, config_path)
+            finally:
+                _REGISTER_KEY_PENDING_ACTIVE = False
+                _ACTIVE_REGISTER_KEY_OPERATION = None
+                _config_path = previous_path
+                _selected_peer = previous_peer
+    except (OSError, ValueError) as exc:
+        print("register-key local state is unsafe: %s" % exc, file=sys.stderr)
+        return 1
+
+
+def _cmd_register_key_locked(args, config_path):
+    global _REGISTER_KEY_PENDING_ACTIVE
+    pending_path = _register_key_pending_path(config_path)
+    try:
+        _assert_register_key_operation()
+        _validate_private_destination(config_path, must_exist=True)
+        # Pending is checked before chmod so an unsafe pending alias cannot
+        # cause even a mode mutation to another credential artifact.
+        _validate_private_destination(pending_path)
+        _correct_private_mode(config_path)
+        if os.path.lexists(pending_path):
+            journal = _load_register_key_journal(pending_path, config_path)
+            if getattr(args, "key_path", None) is not None and _private_abs(
+                    args.key_path) != journal["key_path"]:
+                raise ValueError("--key-path differs from retained pending candidate")
+            if getattr(args, "peer", None) not in (None, journal["peer"]):
+                raise ValueError("--peer differs from retained pending candidate")
+            if (_paths_alias(config_path, journal["key_path"])
+                    or _paths_alias(pending_path, journal["key_path"])):
+                raise ValueError("pending/config/key paths must name different files")
+            _validate_register_key_artifacts(pending_path, journal)
+            _REGISTER_KEY_PENDING_ACTIVE = True
+            try:
+                return _resume_register_key(pending_path, journal, args)
+            finally:
+                _REGISTER_KEY_PENDING_ACTIVE = False
+        cfg = _load_register_key_config(config_path)
+    except (OSError, ValueError) as exc:
+        print("register-key local state is unsafe: %s" % exc, file=sys.stderr)
+        return 1
+
+    generated = False
     if is_identity_cfg(cfg):
         peer_name = cfg.get("peer_name")
         if not peer_name:
@@ -1733,7 +3217,31 @@ def cmd_register_key(args, cfg):
         if not cfg.get("service_token"):
             print("no service_token in %s" % args.config, file=sys.stderr)
             return 1
+        existing_key_path = cfg.get("identity_privkey_path")
+        try:
+            if existing_key_path:
+                _validate_private_destination(existing_key_path, must_exist=True)
+                _correct_private_mode(existing_key_path)
+            seed = signing_seed(cfg)
+        except (OSError, ValueError):
+            seed = None
+        if seed is None:
+            print("identity config has no usable signing seed; refusing to "
+                  "replace local credentials", file=sys.stderr)
+            return 1
+        try:
+            derived_pub = b64u_encode(_publickey(seed))
+        except Exception:
+            print("identity signing seed is invalid; refusing registration",
+                  file=sys.stderr)
+            return 1
+        configured_pub = cfg.get("identity_pubkey")
+        if configured_pub is not None and configured_pub != derived_pub:
+            print("identity_pubkey does not match the configured signing "
+                  "seed; refusing before any request", file=sys.stderr)
+            return 1
         new_cfg = dict(cfg)
+        new_cfg["identity_pubkey"] = derived_pub
     else:
         peers = cfg.get("peers") or {}
         peer_name = args.peer
@@ -1764,35 +3272,90 @@ def cmd_register_key(args, cfg):
         if cfg.get("user_agent"):
             new_cfg["user_agent"] = cfg["user_agent"]
         if cfg.get("relay_identity_fingerprint"):
-            new_cfg["relay_identity_fingerprint"] = \
-                cfg["relay_identity_fingerprint"]
-
-    seed = signing_seed(new_cfg)
-    if seed is None:
+            new_cfg["relay_identity_fingerprint"] = cfg["relay_identity_fingerprint"]
         seed, pub = keygen()
-        new_cfg["identity_pubkey"] = b64u_encode(pub)
-        _save_identity_config(args.config, new_cfg, seed,
-                              key_path=getattr(args, "key_path", None))
-        print("generated signing keypair; private key: %s (mode 600; never "
-              "leaves this machine)" % new_cfg["identity_privkey_path"])
-    elif not new_cfg.get("identity_pubkey"):
-        # Seed without a recorded pubkey: derive it and persist.
-        new_cfg["identity_pubkey"] = b64u_encode(_publickey(seed))
-        _save_identity_config(args.config, new_cfg, seed,
-                              key_path=getattr(args, "key_path", None))
-    cfg = new_cfg
-    pub_b64 = new_cfg["identity_pubkey"]
+        derived_pub = b64u_encode(pub)
+        new_cfg["identity_pubkey"] = derived_pub
+        generated = True
 
-    code, out = req(cfg, "POST", "/v1/register-key", {"pubkey": pub_b64},
-                    base=args.base_url)
-    if code == 200 and out.get("registered"):
-        print("registered signing key for peer %r%s"
-              % (peer_name, " (rotated)" if out.get("rotated") else ""))
-        print("pubkey: %s" % pub_b64)
-        return 0
-    print("register-key failed: HTTP %d %s" % (code, json.dumps(out)),
-          file=sys.stderr)
-    return 1
+    try:
+        key_path = _private_abs(
+            getattr(args, "key_path", None)
+            or new_cfg.get("identity_privkey_path")
+            or (config_path + ".key"))
+        if (_paths_alias(config_path, key_path)
+                or _paths_alias(pending_path, key_path)):
+            raise ValueError("config, private key, and pending paths must differ")
+        _validate_private_destination(key_path)
+        _correct_private_mode(key_path)
+
+        # Resolve first-contact trust before freezing the journal baseline. The
+        # pin CAS runs while no pending transaction exists; any attempted TOFU
+        # write after this point is blocked by _REGISTER_KEY_PENDING_ACTIVE.
+        request_origin = (args.base_url or base_url(cfg)).rstrip("/")
+        if not cfg.get("relay_identity_fingerprint"):
+            try:
+                _ensure_origin_verified(request_origin, cfg)
+            except SystemExit:
+                return 1
+            _assert_register_key_operation()
+            _absolute, _parent, pending_st = _validate_private_destination(
+                pending_path)
+            if pending_st is not None:
+                raise ValueError(
+                    "pending journal appeared during relay trust preparation")
+            cfg = _load_register_key_config(config_path)
+            pinned = cfg.get("relay_identity_fingerprint")
+            if not pinned:
+                raise ValueError("relay identity confirmation was not persisted")
+            new_cfg["relay_identity_fingerprint"] = pinned
+
+        base_bytes = _read_private_regular(config_path, correct_mode=True)
+        live_cfg = json.loads(base_bytes.decode("utf-8"))
+        if live_cfg != cfg:
+            raise ValueError("live config changed before pending baseline creation")
+        saved_cfg = dict(new_cfg)
+        saved_cfg.pop("identity_privkey", None)
+        saved_cfg["identity_privkey_path"] = key_path
+        target_bytes = _private_json_bytes(saved_cfg)
+        prior_key_exists = os.path.lexists(key_path)
+        prior_key_bytes = (
+            _read_private_regular(key_path, correct_mode=True)
+            if prior_key_exists else bytes()
+        )
+        token = auth_token(saved_cfg)
+        request_base = (args.base_url or base_url(saved_cfg)).rstrip("/")
+        journal = {
+            "kind": _REGISTER_KEY_JOURNAL_KIND,
+            "transaction_id": _secrets.token_hex(16),
+            "phase": "prepared",
+            "config_path": config_path,
+            "key_path": key_path,
+            "peer": peer_name,
+            "request_base": request_base,
+            "identity_pubkey": derived_pub,
+            "identity_seed": b64u_encode(seed),
+            "base_config_sha256": hashlib.sha256(base_bytes).hexdigest(),
+            "base_config_bytes": _blob_encode(base_bytes),
+            "target_config_bytes": _blob_encode(target_bytes),
+            "token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            "prior_key_exists": prior_key_exists,
+            "prior_key_bytes": _blob_encode(prior_key_bytes),
+            "generated": generated,
+        }
+        _validate_register_key_journal(journal, config_path)
+        _assert_register_key_operation()
+        _REGISTER_KEY_PENDING_ACTIVE = True
+        _write_register_key_journal(pending_path, journal)
+        _validate_register_key_artifacts(pending_path, journal)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _REGISTER_KEY_PENDING_ACTIVE = False
+        print("refusing register-key before request: %s" % exc, file=sys.stderr)
+        return 1
+    try:
+        return _send_register_key_candidate(pending_path, journal, args)
+    finally:
+        _REGISTER_KEY_PENDING_ACTIVE = False
 
 
 def parse_link(link):
@@ -1970,6 +3533,7 @@ def _apply_enrollment_response(cfg, out, what, requested_name=None):
 
 
 def cmd_redeem(args):
+    _require_private_publication_platform()
     try:
         f = parse_link(args.link)
     except ValueError as e:
@@ -2291,6 +3855,7 @@ def _pow_lead_zero(digest):
 
 
 def cmd_enroll(args):
+    _require_private_publication_platform()
     # Resolve the relay URL: explicit --relay wins; otherwise reuse the
     # existing identity config's relay_url (same machine, new enrollment).
     relay_url = args.relay
@@ -2524,10 +4089,10 @@ def main():
                     help="private key file path (mode 600; default: <config>.key)")
 
     rk = sub.add_parser("register-key",
-                        help="self-service Ed25519 key registration: "
-                             "generate a signing key if needed, then register "
-                             "its pubkey with the relay (token auth, no "
-                             "operator involvement)")
+                        help="self-service Ed25519 key registration: bootstrap "
+                             "a legacy token config, or re-register exactly "
+                             "the key derived from an existing identity seed "
+                             "(no key rotation)")
     rk.add_argument("--key-path", default=None,
                     help="private key file path (mode 600; default: <config>.key)")
 
@@ -2563,6 +4128,12 @@ def main():
     rv.add_argument("invite_id")
 
     args = ap.parse_args()
+    if args.cmd in ("keygen", "attach-key", "register-key", "redeem", "enroll"):
+        try:
+            _require_private_publication_platform()
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     global _selected_peer, _config_path
     _selected_peer = args.peer
     # TOFU pin persistence target for _ensure_origin_verified (F1).
@@ -2576,7 +4147,16 @@ def main():
             return cmd_redeem(args)
         return cmd_enroll(args)
 
-    cfg = load_config(args.config)
+    # register-key acquires its process-lifetime operation lock before reading
+    # any config, pending journal, key, or quarantine state.
+    if args.cmd == "register-key":
+        return cmd_register_key(args)
+
+    try:
+        cfg = load_config(args.config)
+    except (OSError, ValueError) as exc:
+        print("cannot read client config: %s" % exc, file=sys.stderr)
+        return 1
     if args.cmd in ("mint-request", "redeem-request", "accept-handshake"):
         return cmd_public_request(args, cfg)
     token = auth_token(cfg)

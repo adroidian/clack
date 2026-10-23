@@ -8,6 +8,7 @@ server never executes, interprets, or acts on message text.
 """
 import base64
 import faulthandler
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -71,8 +72,10 @@ SWEEP_MIN_INTERVAL = 60.0
 #   clack-ed25519-v1\n{METHOD_UPPER}\n{path_and_query}\n{sha256_hex(raw_body)}\n{nonce}
 # Unsigned endpoints: /health, GET /v1/identity, /join, /join/client, and the
 # pre-enrollment POSTs (/v1/invites/challenge, /v1/invites/redeem,
-# /v1/enroll/challenge, /v1/enroll). Everything else: Bearer + valid
-# signature, verified against the peer's stored Ed25519 identity_pubkey.
+# /v1/enroll/challenge, /v1/enroll). POST /v1/register-key permits bearer-only
+# bootstrap only while the peer has no valid stored key; re-registration or
+# rotation requires a signature by the current key. Everything else: Bearer +
+# valid signature, verified against the peer's stored Ed25519 identity_pubkey.
 SIGN_SCHEME_ID = "clack-ed25519-v1"
 NONCE_TTL = 600.0          # seconds a nonce stays valid (and is remembered)
 NONCE_FUTURE_SKEW = 120.0  # seconds of clock skew tolerated into the future
@@ -173,38 +176,209 @@ def _normalize_pubkey_input(s):
     return b64u_encode(key)
 
 
-def _persist_identity_pubkey(peer, pub_b64):
-    """Write one identity_pubkeys entry through to relay-config.json.
+class _ConfigPublishError(OSError):
+    """A config publication failure with an explicit replace boundary."""
 
-    Atomic (tmp file + os.replace) and mode-preserving, so a crash or
-    kill between the DB update and this write cannot corrupt the config.
-    The in-memory relay_cfg is updated only AFTER the disk write
-    succeeds, so a failed write never leaves memory ahead of disk.
-    Raises OSError on failure -- callers fail the request loudly rather
-    than reporting a registration that a restart would lose."""
-    cfg = relay_cfg
-    # Write from a copy: mutate in-memory state only on success.
-    new_cfg = dict(cfg)
-    pubkeys = new_cfg.get("identity_pubkeys")
-    if not isinstance(pubkeys, dict):
-        pubkeys = {}
-        new_cfg["identity_pubkeys"] = pubkeys
-    else:
-        pubkeys = dict(pubkeys)
-        new_cfg["identity_pubkeys"] = pubkeys
-    pubkeys[peer] = pub_b64
-    tmp = CONFIG_PATH + ".tmp"
+    def __init__(self, cause, published):
+        super().__init__(str(cause))
+        self.published = bool(published)
+
+
+class _ConfigDriftError(RuntimeError):
+    """The live relay config no longer matches this process's authority."""
+
+
+class _RegistrationFailStopError(RuntimeError):
+    """A runtime identity writer reached the process-wide fail-stop latch."""
+
+
+# Narrow fault seams used by the scratch register-key suite. Production binds
+# them directly to the OS primitives; tests replace them only in an imported,
+# loopback-only relay instance.
+_CONFIG_REPLACE = os.replace
+_CONFIG_FSYNC = os.fsync
+_CONFIG_STARTUP_BYTES = None
+_CONFIG_STARTUP_DIGEST = None
+
+
+def _read_registration_config_bytes():
+    """Read the live config through a no-follow regular-file descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(CONFIG_PATH, flags)
     try:
-        st_mode = os.stat(CONFIG_PATH).st_mode
-    except OSError:
-        st_mode = None
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(new_cfg, f, indent=2)
-        f.write("\n")
-    if st_mode is not None:
-        os.chmod(tmp, st_mode & 0o7777)
-    os.replace(tmp, CONFIG_PATH)
-    cfg["identity_pubkeys"] = pubkeys
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("relay config is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _capture_registration_config_baseline(raw=None):
+    """Bind registration to the exact config bytes loaded by this process."""
+    global _CONFIG_STARTUP_BYTES, _CONFIG_STARTUP_DIGEST
+    if raw is None:
+        raw = _read_registration_config_bytes()
+    _CONFIG_STARTUP_BYTES = bytes(raw)
+    _CONFIG_STARTUP_DIGEST = hashlib.sha256(raw).hexdigest()
+
+
+class _RegistrationConfigFileLock:
+    """Cross-process registration lock.
+
+    Lock order is registration_lock -> this file lock -> db_lock. Enrollment
+    writers take registration_lock -> db_lock and never acquire this lock.
+    """
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        path = CONFIG_PATH + ".register-key.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError("registration lock is not a regular file")
+            os.fchmod(fd, 0o600)
+            os.fsync(fd)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            os.close(fd)
+            raise
+        self.fd = fd
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+        return False
+
+
+def _fresh_registration_config(peer):
+    """Return exact current bytes/config, or reject drift pending restart."""
+    raw = _read_registration_config_bytes()
+    if _CONFIG_STARTUP_BYTES is None:
+        # Imported scratch servers call this lazily; main() captures the bytes
+        # before init_db and therefore never takes this compatibility branch.
+        _capture_registration_config_baseline(raw)
+    if raw != _CONFIG_STARTUP_BYTES:
+        raise _ConfigDriftError("relay config changed since process startup")
+    try:
+        cfg = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _ConfigDriftError("relay config is no longer valid JSON") from exc
+    if not isinstance(cfg, dict):
+        raise _ConfigDriftError("relay config root is no longer an object")
+    # Re-run the authority-bearing validators against the bytes that would be
+    # merged, rather than trusting the startup object.
+    _parse_identity_pubkeys(cfg)
+    hashes = _parse_peer_hashes(cfg)
+    peers = cfg.get("peers") or {}
+    if not isinstance(peers, dict) or peer not in peers and peer not in hashes:
+        raise _ConfigDriftError("peer is no longer config-managed")
+    return raw, cfg
+
+
+def _stage_identity_pubkey_config(peer, pub_b64, current_raw, current_cfg):
+    """Write and fsync a same-directory config candidate without publishing it.
+
+    Returns ``(tmp_path, pubkeys, candidate_bytes)``. Neither relay-config.json nor in-memory
+    config changes here. The caller can therefore reserve/commit the DB key
+    first, and only then atomically publish a config that can never get ahead
+    of the DB.
+    """
+    new_cfg = dict(current_cfg)
+    raw_pubkeys = new_cfg.get("identity_pubkeys")
+    pubkeys = dict(raw_pubkeys) if isinstance(raw_pubkeys, dict) else {}
+    pubkeys[peer] = pub_b64
+    new_cfg["identity_pubkeys"] = pubkeys
+
+    parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+    tmp = os.path.join(
+        parent,
+        ".%s.register-key-%s.tmp"
+        % (os.path.basename(CONFIG_PATH), secrets.token_hex(8)),
+    )
+    candidate = (json.dumps(new_cfg, indent=2) + "\n").encode("utf-8")
+    fd = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            fd = None
+            f.write(candidate)
+            f.flush()
+            _CONFIG_FSYNC(f.fileno())
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp, pubkeys, candidate
+
+
+def _publish_identity_pubkey_config(tmp, expected_raw, candidate_bytes):
+    """Atomically publish a staged config and fsync its parent directory.
+
+    ``_ConfigPublishError.published`` distinguishes a replace failure (the
+    old config is still authoritative and the DB can be compensated) from a
+    post-replace durability failure (both visible stores are already new, so
+    the relay must fail-stop rather than guessing which state a host crash
+    will retain).
+    """
+    published = False
+    try:
+        if _read_registration_config_bytes() != expected_raw:
+            raise _ConfigDriftError(
+                "relay config changed during register-key publication")
+        _CONFIG_REPLACE(tmp, CONFIG_PATH)
+        published = True
+        parent = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_fd = os.open(parent, flags)
+        try:
+            _CONFIG_FSYNC(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except _ConfigDriftError:
+        raise
+    except OSError as exc:
+        # A wrapped/injected rename can land and then raise. Classify from the
+        # exact visible bytes so a published config is never compensated as if
+        # the old config were still canonical.
+        if not published:
+            try:
+                published = (_read_registration_config_bytes()
+                             == candidate_bytes)
+            except OSError:
+                pass
+        raise _ConfigPublishError(exc, published) from exc
+
+
+def _apply_identity_pubkey_memory(peer, pubkeys, pub_b64, candidate_bytes=None):
+    """Publish in-memory mirrors only after DB and durable config succeed."""
+    relay_cfg["identity_pubkeys"] = pubkeys
+    _IDENTITY_PUBKEYS[peer] = pub_b64
+    if candidate_bytes is not None:
+        _capture_registration_config_baseline(candidate_bytes)
 
 
 # Operator-supplied token hashes for config-managed peers, from the
@@ -450,11 +624,75 @@ CHALLENGE_TTL = 300.0            # 5 minutes, single-use
 LINK_VERSION = 3
 
 db_lock = threading.Lock()
+# Serializes every runtime identity_pubkey writer: register-key plus all three
+# enrollment paths that call _enroll_identity_locked. The lock order is always
+# registration_lock -> db_lock. This prevents enrollment from claiming either
+# side of a DB-first/config-second registration transition.
+registration_lock = threading.Lock()
+# Test-only no-op hooks. Scratch tests replace these in an imported loopback
+# relay to put ThreadingHTTPServer workers on exact barriers. Production
+# leaves all three as None, so they add no scheduler or request behavior.
+_REGISTER_KEY_BEFORE_LOCK_HOOK = None
+_REGISTER_KEY_AFTER_AUTH_HOOK = None
+_ENROLLMENT_BEFORE_IDENTITY_LOCK_HOOK = None
+_registration_fail_stop_lock = threading.Lock()
+_registration_fail_stop_reason = None
+
+
+class _EnrollmentIdentityLocks:
+    """Acquire the one permitted runtime identity-writer lock order.
+
+    The fail-stop check is deliberately *inside* registration_lock. A public
+    writer that passed the request-entry check before a failing registration
+    cannot wait behind that registration and then mutate identity state after
+    the latch is set.
+    """
+
+    def __enter__(self):
+        hook = _ENROLLMENT_BEFORE_IDENTITY_LOCK_HOOK
+        if hook is not None:
+            hook()
+        registration_lock.acquire()
+        try:
+            if _registration_fail_stop() is not None:
+                raise _RegistrationFailStopError("registration fail-stop active")
+            db_lock.acquire()
+        except Exception:
+            registration_lock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        db_lock.release()
+        registration_lock.release()
+        return False
+
+
 rate_lock = threading.Lock()
 rate_hits = {}  # token_sha -> deque[float]
 # R5: per-process cache of stored-peer Ed25519 key validity
-# (pub_b64 -> bool). Keys are immutable within a process lifetime.
+# (pub_b64 -> bool). Entries are keyed by key material, so they remain correct
+# when a peer rotates to a different key during the process lifetime.
 _peer_key_valid = {}
+
+
+def _valid_stored_identity_pubkey(pub_b64):
+    """Return decoded bytes for a valid stored Ed25519 key, else None.
+
+    Missing, malformed, wrong-length, and non-prime-order values all represent
+    an identity that cannot authenticate a signed request. Existing behavior
+    maps those states to upgrade_required and permits register-key bootstrap;
+    a valid key never gets that bearer-only recovery path.
+    """
+    try:
+        pubkey = b64u_decode(pub_b64) if pub_b64 else b""
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if len(pubkey) != 32:
+        return None
+    if pub_b64 not in _peer_key_valid:
+        _peer_key_valid[pub_b64] = ed25519.is_valid_pubkey(pubkey)
+    return pubkey if _peer_key_valid[pub_b64] else None
 # R4: cheap source-level bucket for failed authentication attempts, so a
 # stolen bearer cannot burn a peer's request budget with unsigned garbage.
 auth_fail_lock = threading.Lock()
@@ -473,6 +711,26 @@ _last_sweep = 0.0
 #       sweep touches is covered with zero new guards).
 _sweep_state_lock = threading.Lock()
 _sweep_last_error = None  # None = last sweep ok (or never ran); else "ExcType: msg"
+
+
+def _registration_fail_stop():
+    with _registration_fail_stop_lock:
+        return _registration_fail_stop_reason
+
+
+def _set_registration_fail_stop(reason):
+    """Latch an ambiguous two-store outcome until process restart.
+
+    A restart re-reads the authoritative config into the DB. While the latch is
+    set, health is degraded and every authenticated or mutating POST refuses;
+    continuing on an uncertain identity boundary would be less safe than
+    stopping service.
+    """
+    global _registration_fail_stop_reason
+    with _registration_fail_stop_lock:
+        if _registration_fail_stop_reason is None:
+            _registration_fail_stop_reason = str(reason)
+
 
 # Safety-audit Round 2/3 (Oct 2026, P01/P02/P03): the relay's declared schema
 # is the SINGLE source of truth for structural health. _SCHEMA_DDL holds the
@@ -1351,8 +1609,15 @@ def _start_federation_thread():
 
 
 def load_config():
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    raw = _read_registration_config_bytes()
+    try:
+        cfg = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit("clack-relay: invalid relay-config.json: %s" % exc)
+    if not isinstance(cfg, dict):
+        raise SystemExit("clack-relay: relay-config.json root must be an object")
+    _capture_registration_config_baseline(raw)
+    return cfg
 
 
 def init_db(cfg):
@@ -2316,6 +2581,233 @@ def _nonce_record(conn, nonce, peer, expires_at):
     return "recorded"
 
 
+def _registration_nonce_reserve_locked(nonce, peer, expires_at):
+    """Reserve a verified register-key nonce inside the caller's transaction.
+
+    Unlike the ordinary request helper, this does not commit or prune. A later
+    key/config failure can therefore roll the nonce and identity update back to
+    an exact pre-request logical snapshot.
+    """
+    if conn.execute(
+        "SELECT 1 FROM seen_nonces WHERE nonce=?", (nonce,)
+    ).fetchone():
+        return "replay"
+    live = conn.execute(
+        "SELECT COUNT(*) FROM seen_nonces WHERE expires_at>?", (time.time(),)
+    ).fetchone()[0]
+    if live >= NONCE_STORE_CAP:
+        return "full"
+    conn.execute(
+        "INSERT INTO seen_nonces(nonce, peer, expires_at) VALUES(?,?,?)",
+        (nonce, peer, expires_at),
+    )
+    return "recorded"
+
+
+def _registration_db_update(db, peer, pub_b64):
+    """Narrow injectable DB-write seam for register-key fault regressions."""
+    return db.execute(
+        "UPDATE peers SET identity_pubkey=? WHERE name=?", (pub_b64, peer)
+    )
+
+
+def _registration_db_commit(db):
+    """Narrow injectable commit seam for unknown-outcome fault regressions."""
+    db.commit()
+
+
+def _cleanup_registration_candidate(tmp):
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # The candidate is not authoritative, but inability to retire it is
+            # a storage-health warning. The authority stores remain unchanged.
+            pass
+
+
+def _registration_rollback_locked():
+    try:
+        if conn.in_transaction:
+            conn.rollback()
+        return True
+    except Exception as exc:
+        _set_registration_fail_stop("registration rollback failed: %s" % type(exc).__name__)
+        return False
+
+
+def _registration_compensate_locked(peer, old, proposed, nonce_info,
+                                    nonce_inserted):
+    """Restore the pre-request DB state after a DB-first publication failure.
+
+    Called with registration_lock and db_lock held. Config is still old unless
+    the caller reports a post-replace ambiguity, in which case compensation is
+    deliberately forbidden and the process fail-stops instead.
+    """
+    try:
+        if conn.in_transaction:
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+        ).fetchone()
+        if row is None or row[0] not in (old, proposed):
+            raise sqlite3.OperationalError("registration compensation lost ownership")
+        conn.execute(
+            "UPDATE peers SET identity_pubkey=? WHERE name=?", (old, peer)
+        )
+        if nonce_inserted and nonce_info is not None:
+            conn.execute(
+                "DELETE FROM seen_nonces WHERE nonce=? AND peer=?",
+                (nonce_info[0], peer),
+            )
+        conn.commit()
+        return True
+    except Exception as exc:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+        except Exception:
+            pass
+        _set_registration_fail_stop(
+            "registration compensation failed: %s" % type(exc).__name__)
+        return False
+
+
+def _store_registered_key(peer, old, pub_b64, nonce_info, config_managed):
+    """Serialize and publish one identity key without adopting stale config.
+
+    Lock order is registration_lock (owned by the caller) -> interprocess
+    config lock -> db_lock. A config-managed registration is rejected before
+    nonce reservation when the exact live config bytes differ from those this
+    process loaded. The same bytes are rechecked before commit and replace.
+    """
+    if not config_managed:
+        return _store_registered_key_locked(
+            peer, old, pub_b64, nonce_info, False, None, None)
+    try:
+        with _RegistrationConfigFileLock():
+            current_raw, current_cfg = _fresh_registration_config(peer)
+            return _store_registered_key_locked(
+                peer, old, pub_b64, nonce_info, True,
+                current_raw, current_cfg)
+    except _ConfigDriftError:
+        return "config_changed_restart_required"
+    except OSError:
+        # Lock/open failures occur before DB or nonce mutation.
+        return "storage_failed"
+
+
+def _store_registered_key_locked(peer, old, pub_b64, nonce_info,
+                                 config_managed, current_raw, current_cfg):
+    """DB-first two-store publication under the documented lock order."""
+    tmp = None
+    pubkeys = None
+    candidate_bytes = None
+    updated = False
+    nonce_inserted = False
+    with db_lock:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            if nonce_info is not None:
+                nonce_result = _registration_nonce_reserve_locked(
+                    nonce_info[0], peer, nonce_info[1]
+                )
+                if nonce_result != "recorded":
+                    conn.rollback()
+                    return ("replay" if nonce_result == "replay"
+                            else "nonce_store_full")
+                nonce_inserted = True
+            cur = _registration_db_update(conn, peer, pub_b64)
+            if cur.rowcount != 1:
+                raise sqlite3.OperationalError("register-key peer disappeared")
+            updated = True
+            if config_managed:
+                # Preparing and fsyncing the temp file is not publication; a
+                # fault here rolls the still-open SQLite transaction back.
+                tmp, pubkeys, candidate_bytes = _stage_identity_pubkey_config(
+                    peer, pub_b64, current_raw, current_cfg)
+                if _read_registration_config_bytes() != current_raw:
+                    raise _ConfigDriftError(
+                        "relay config changed before registration commit")
+            _registration_db_commit(conn)
+        except sqlite3.IntegrityError:
+            ok = _registration_rollback_locked()
+            _cleanup_registration_candidate(tmp)
+            return "identity_in_use" if ok else "registration_fail_stop"
+        except _ConfigDriftError:
+            if conn.in_transaction:
+                ok = _registration_rollback_locked()
+            elif updated:
+                ok = _registration_compensate_locked(
+                    peer, old, pub_b64, nonce_info, nonce_inserted)
+            else:
+                ok = True
+            _cleanup_registration_candidate(tmp)
+            return ("config_changed_restart_required" if ok
+                    else "registration_fail_stop")
+        except Exception:
+            # If SQLite still owns the transaction, rollback is exact. If a
+            # commit raised after landing (unknown outcome), compensate from a
+            # fresh transaction before returning a caught storage error.
+            if conn.in_transaction:
+                ok = _registration_rollback_locked()
+            elif updated:
+                ok = _registration_compensate_locked(
+                    peer, old, pub_b64, nonce_info, nonce_inserted
+                )
+            else:
+                ok = True
+            _cleanup_registration_candidate(tmp)
+            return "storage_failed" if ok else "registration_fail_stop"
+
+        if not config_managed:
+            return None
+        try:
+            _publish_identity_pubkey_config(
+                tmp, current_raw, candidate_bytes)
+            tmp = None
+        except _ConfigDriftError:
+            _cleanup_registration_candidate(tmp)
+            if _registration_compensate_locked(
+                    peer, old, pub_b64, nonce_info, nonce_inserted):
+                return "config_changed_restart_required"
+            return "registration_fail_stop"
+        except _ConfigPublishError as exc:
+            _cleanup_registration_candidate(tmp)
+            if exc.published:
+                # DB and visible config are both new, but directory durability
+                # is unknown. Never guess or roll config back after replace.
+                try:
+                    _apply_identity_pubkey_memory(
+                        peer, pubkeys, pub_b64, candidate_bytes)
+                finally:
+                    _set_registration_fail_stop(
+                        "config publication durability uncertain")
+                return "registration_fail_stop"
+            if _registration_compensate_locked(
+                    peer, old, pub_b64, nonce_info, nonce_inserted):
+                return "persist_failed"
+            return "registration_fail_stop"
+        except Exception as exc:
+            _cleanup_registration_candidate(tmp)
+            _set_registration_fail_stop(
+                "config publication outcome unknown: %s" % type(exc).__name__)
+            return "registration_fail_stop"
+        try:
+            _apply_identity_pubkey_memory(
+                peer, pubkeys, pub_b64, candidate_bytes)
+        except Exception as exc:
+            _set_registration_fail_stop(
+                "config memory publication failed: %s" % type(exc).__name__)
+            return "registration_fail_stop"
+        return None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClackRelay/" + VERSION
 
@@ -2371,66 +2863,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _verify_signature(self, peer):
-        """Mandatory Ed25519 request signing (v0.2.12).
+    def _check_signature(self, peer, pub_b64):
+        """Verify request bytes against one explicit stored key, without writes.
 
-        Returns None when the request's signature verifies against the
-        peer's stored Ed25519 identity_pubkey, else a stable error code:
-        missing_signature | unknown_key | upgrade_required | stale_nonce |
-        bad_signature | replay | nonce_store_full. Never raises: malformed
-        input maps to a code, never a dropped connection."""
+        Returns ``(error, nonce_info)`` where nonce_info is
+        ``(nonce, expires_at)`` after a valid signature. Keeping verification
+        separate from nonce publication lets register-key reserve the nonce in
+        the same transaction as its identity update and roll both back on any
+        DB/config failure.
+        """
         h = self.headers
         if h.get("X-Clack-Scheme") != "1":
-            return "missing_signature"
+            return "missing_signature", None
         key_name = h.get("X-Clack-Key")
         if not key_name:
-            return "missing_signature"
+            return "missing_signature", None
         if key_name != peer:
-            # The claimed key identity does not match the Bearer token's
-            # peer: unknown in this authentication context.
-            return "unknown_key"
-        with db_lock:
-            row = conn.execute(
-                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
-            ).fetchone()
-        pub_b64 = row[0] if row else None
-        try:
-            pubkey = b64u_decode(pub_b64) if pub_b64 else b""
-        except (ValueError, TypeError, AttributeError):
-            pubkey = b""
-        if len(pubkey) != 32:
-            # No (or corrupt) Ed25519 key on file: the peer registers one
-            # via POST /v1/register-key. Never silently bypass.
-            return "upgrade_required"
-        # R5: the vendored verifier admits trivial forgeries under
-        # small-order keys. Enrollment and the operator map now reject such
-        # keys, but rows written before the fix could still hold one:
-        # validate once per peer key per process and fail closed instead of
-        # trusting stored bytes. A rejected key means register-key, same as a
-        # missing one.
-        if pub_b64 not in _peer_key_valid:
-            _peer_key_valid[pub_b64] = ed25519.is_valid_pubkey(pubkey)
-        if not _peer_key_valid[pub_b64]:
-            return "upgrade_required"
+            return "unknown_key", None
+        pubkey = _valid_stored_identity_pubkey(pub_b64)
+        if pubkey is None:
+            return "upgrade_required", None
         nonce = h.get("X-Clack-Nonce") or ""
         ts_s, sep, rand = nonce.partition(":")
         if not sep or not NONCE_RAND_RE.match(rand):
-            return "stale_nonce"
+            return "stale_nonce", None
         try:
             ts = float(ts_s)
         except ValueError:
-            return "stale_nonce"
+            return "stale_nonce", None
         now = time.time()
-        # isfinite rejects NaN ("nan" parses but defeats every comparison,
-        # silently passing the window check below).
-        if not math.isfinite(ts) or ts < now - NONCE_TTL or ts > now + NONCE_FUTURE_SKEW:
-            return "stale_nonce"
+        if (not math.isfinite(ts) or ts < now - NONCE_TTL
+                or ts > now + NONCE_FUTURE_SKEW):
+            return "stale_nonce", None
         try:
             sig = bytes.fromhex(h.get("X-Clack-Sig") or "")
         except ValueError:
-            return "bad_signature"
+            return "bad_signature", None
         if len(sig) != 64:
-            return "bad_signature"
+            return "bad_signature", None
         parsed = urlparse(self.path)
         path_q = parsed.path + ("?" + parsed.query if parsed.query else "")
         body = self._read_body()
@@ -2441,29 +2911,37 @@ class Handler(BaseHTTPRequestHandler):
             + hashlib.sha256(body).hexdigest() + "\n"
             + nonce
         ).encode("utf-8")
-        if not ed25519.verify(pubkey, sig, canon):
-            return "bad_signature"
-        # R3: the body read above is client-paced -- recheck freshness now
-        # that the full request has arrived, immediately before the atomic
-        # record. A duplicate that crossed the expiry boundary (and a sweep)
-        # while its body trickled in must be rejected, never recorded.
+        try:
+            verified = ed25519.verify(pubkey, sig, canon)
+        except Exception:
+            verified = False
+        if not verified:
+            return "bad_signature", None
+        # The body read above is client-paced. Recheck immediately before the
+        # caller's atomic nonce reservation.
         now2 = time.time()
-        if (
-            not math.isfinite(ts)
-            or ts < now2 - NONCE_TTL
-            or ts > now2 + NONCE_FUTURE_SKEW
-        ):
-            return "stale_nonce"
-        # Atomic check-and-record: the nonce is marked seen only after a
-        # valid signature, so a bad signature can never burn someone else's
-        # nonce. At capacity the store refuses new requests (fail closed)
-        # rather than evicting a live replay marker (R2).
+        if (not math.isfinite(ts) or ts < now2 - NONCE_TTL
+                or ts > now2 + NONCE_FUTURE_SKEW):
+            return "stale_nonce", None
+        return None, (nonce, ts + NONCE_TTL)
+
+    def _verify_signature(self, peer):
+        """Verify and atomically record a normal signed request nonce."""
         with db_lock:
-            res = _nonce_record(conn, nonce, peer, ts + NONCE_TTL)
-            if res == "replay":
-                return "replay"
-            if res == "full":
-                return "nonce_store_full"
+            row = conn.execute(
+                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+            ).fetchone()
+        pub_b64 = row[0] if row else None
+        err, nonce_info = self._check_signature(peer, pub_b64)
+        if err is not None:
+            return err
+        nonce, expires_at = nonce_info
+        with db_lock:
+            res = _nonce_record(conn, nonce, peer, expires_at)
+        if res == "replay":
+            return "replay"
+        if res == "full":
+            return "nonce_store_full"
         return None
 
     def _client_ip(self):
@@ -2508,6 +2986,9 @@ class Handler(BaseHTTPRequestHandler):
         return any(sock_addr in net for net in _internal_trusted_nets())
 
     def _require_auth(self, require_signature=False):
+        if _registration_fail_stop() is not None:
+            self._json(503, {"error": "registration_fail_stop"})
+            return None
         ip = self._client_ip()
         peer = auth_peer(self.headers)
         if peer is None:
@@ -2549,13 +3030,18 @@ class Handler(BaseHTTPRequestHandler):
         return peer
 
     def _require_token_auth(self):
-        """Bearer-token auth WITHOUT the Ed25519 signature mandate.
+        """Authenticate the register-key Bearer token, but do no mutation.
 
-        Used only by POST /v1/register-key -- the upgrade path for
-        token-only peers, who by definition cannot sign yet. The bearer
-        token is the existing auth factor; binding a key to one's own peer
-        name grants nothing the token doesn't already grant. Missing /
-        invalid token -> 401 like _require_auth."""
+        _handle_register_key decides under registration_lock whether this is
+        a bearer-only bootstrap (no valid stored key) or whether the current
+        stored key must sign. It also charges the per-peer rate budget only
+        after that required signature verifies, preserving the ordinary R4
+        rule that a stolen bearer cannot burn the peer's signed-request budget.
+        Missing/invalid token -> 401 like _require_auth.
+        """
+        if _registration_fail_stop() is not None:
+            self._json(503, {"error": "registration_fail_stop"})
+            return None
         ip = self._client_ip()
         peer = auth_peer(self.headers)
         if peer is None:
@@ -2564,61 +3050,118 @@ class Handler(BaseHTTPRequestHandler):
                 return None
             self._json(401, {"error": "unauthorized"})
             return None
-        if not rate_ok(token_sha_of(self.headers)):
-            self._json(429, {"error": "rate_limited"})
-            return None
         return peer
 
     def _handle_register_key(self, peer, now):
-        """v0.2.17: self-service Ed25519 key registration.
+        """Self-service bootstrap and current-key-authorized registration.
 
-        Bearer-token authenticated, signature-exempt (it IS the upgrade
-        path). Body: {"pubkey": "<raw 43-char b64u | PEM SPKI>"}. The key
-        takes effect immediately (peers.identity_pubkey, which
-        _verify_signature reads) and is persisted: config-managed peers
-        via relay-config.json's identity_pubkeys map (init_db rebuilds
-        their rows from it on restart), self-enrolled peers via their DB
-        row (init_db preserves non-config rows). Rotation allowed --
-        token auth proves ownership."""
+        Every runtime identity writer shares registration_lock. Signed nonce +
+        proposed key are one DB transaction; config-managed peers use a
+        DB-first, durable temp/replace publication with exact compensation on
+        pre-publication failures and fail-stop on ambiguous outcomes.
+        """
         body = self._read_json()
         if not isinstance(body, dict) or not isinstance(body.get("pubkey"), str):
+            if not auth_fail_ok(self._client_ip()):
+                self._json(429, {"error": "rate_limited"})
+                return
             self._json(400, {"error": "pubkey_required"})
             return
         try:
             pub_b64 = _normalize_pubkey_input(body["pubkey"])
         except ValueError:
+            if not auth_fail_ok(self._client_ip()):
+                self._json(429, {"error": "rate_limited"})
+                return
             self._json(400, {"error": "bad_pubkey"})
             return
-        with db_lock:
-            row = conn.execute(
-                "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
-            ).fetchone()
-        old = row[0] if row else None
-        rotated = old is not None and old != pub_b64
-        cfg = relay_cfg
-        config_managed = bool(
-            cfg
-            and (peer in (cfg.get("peers") or {}) or peer in _PEER_HASHES)
-        )
-        if config_managed:
-            # Persist the config FIRST: if the process dies between the
-            # two writes, the restart converges via init_db re-reading
-            # the map (rather than losing a reported registration).
+
+        hook = _REGISTER_KEY_BEFORE_LOCK_HOOK
+        if hook is not None:
             try:
-                _persist_identity_pubkey(peer, pub_b64)
-            except OSError:
-                self._json(500, {"error": "persist_failed"})
+                hook()
+            except Exception:
+                self._json(500, {"error": "test_barrier_failed"})
                 return
-            _IDENTITY_PUBKEYS[peer] = pub_b64
-        with db_lock:
-            conn.execute(
-                "UPDATE peers SET identity_pubkey=? WHERE name=?",
-                (pub_b64, peer),
+
+        with registration_lock:
+            if _registration_fail_stop() is not None:
+                self._json(503, {"error": "registration_fail_stop"})
+                return
+            try:
+                with db_lock:
+                    row = conn.execute(
+                        "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+                    ).fetchone()
+            except sqlite3.Error:
+                self._json(500, {"error": "storage_failed"})
+                return
+            if row is None:
+                self._json(401, {"error": "unauthorized"})
+                return
+            old = row[0]
+            had_valid_key = _valid_stored_identity_pubkey(old) is not None
+            nonce_info = None
+            if had_valid_key:
+                sig_err, nonce_info = self._check_signature(peer, old)
+                if sig_err is not None:
+                    if sig_err == "nonce_store_full":
+                        self._json(503, {"error": "nonce_store_full"})
+                        return
+                    if not auth_fail_ok(self._client_ip()):
+                        self._json(429, {"error": "rate_limited"})
+                        return
+                    self._json(401, {"ok": False, "error": sig_err})
+                    return
+
+            hook = _REGISTER_KEY_AFTER_AUTH_HOOK
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:
+                    self._json(500, {"error": "test_barrier_failed"})
+                    return
+
+            if not rate_ok(token_sha_of(self.headers)):
+                self._json(429, {"error": "rate_limited"})
+                return
+            # "rotated" describes a current-key-authorized replacement. A
+            # missing or invalid runtime key is bootstrap/recovery even when a
+            # malformed non-NULL value happened to occupy the DB column.
+            rotated = had_valid_key and old != pub_b64
+            cfg = relay_cfg
+            config_managed = bool(
+                cfg
+                and (peer in (cfg.get("peers") or {}) or peer in _PEER_HASHES)
             )
-            conn.commit()
-        self._json(
-            200, {"registered": True, "peer": peer, "rotated": rotated}
-        )
+            store_err = _store_registered_key(
+                peer, old, pub_b64, nonce_info, config_managed
+            )
+            if store_err is not None:
+                if store_err == "replay":
+                    self._json(401, {"ok": False, "error": "replay"})
+                elif store_err == "nonce_store_full":
+                    self._json(503, {"error": "nonce_store_full"})
+                elif store_err == "identity_in_use":
+                    self._json(409, {"error": "identity_in_use"})
+                elif store_err == "persist_failed":
+                    self._json(500, {"error": "persist_failed"})
+                elif store_err == "storage_failed":
+                    self._json(500, {"error": "storage_failed"})
+                elif store_err == "config_changed_restart_required":
+                    self._json(
+                        409,
+                        {"error": "config_changed_restart_required"},
+                    )
+                else:
+                    self._json(503, {"error": "registration_fail_stop"})
+                return
+        self._json(200, {
+            "registered": True,
+            "peer": peer,
+            "rotated": rotated,
+            "identity_pubkey": pub_b64,
+        })
 
     # --- Self-contained onboarding (v0.2.8) --------------------------------
     # GET /join and GET /join/client are PUBLIC (no auth). They serve only
@@ -2702,8 +3245,10 @@ class Handler(BaseHTTPRequestHandler):
                     "sha256_hex(body) + \"\\n\" + nonce)). "
                     "POST /v1/send to send, GET /v1/poll?timeout=25 to receive, POST /v1/ack "
                     "to confirm handling. Unsigned requests get 401 missing_signature; "
-                    "peers with no stored key get 401 upgrade_required (register via "
-                    "POST /v1/register-key to fix). Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
+                    "peers with no stored key get 401 upgrade_required (bootstrap via "
+                    "POST /v1/register-key). Once a valid key exists, that endpoint also "
+                    "requires a signature by the current key for re-registration or rotation. "
+                    "Full scheme: CLIENT_CONTRACT.md in the clack-relay repo.",
                 },
             ],
         }
@@ -2765,8 +3310,9 @@ class Handler(BaseHTTPRequestHandler):
             "   more than 120s in the future are rejected, and each nonce is\n"
             "   single-use. Missing/invalid signature -> 401 missing_signature /\n"
             "   bad_signature / replay / stale_nonce; a peer with no stored\n"
-            "   Ed25519 key gets 401 upgrade_required (POST /v1/register-key\n"
-            "   to fix).\n"
+            "   Ed25519 key gets 401 upgrade_required (bootstrap via\n"
+            "   POST /v1/register-key). Once a valid key exists, re-registration\n"
+            "   or rotation must be signed by that current key.\n"
             "4. Full protocol: CLIENT_CONTRACT.md in the clack-relay repo.\n"
             "\n"
             "Enrollment on this relay: " + gates + ".\n"
@@ -2882,6 +3428,13 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         parsed = urlparse(self.path)
         if parsed.path == "/health":
+            # A two-store publication ambiguity is a process-wide fail-stop.
+            # Restart reconciliation re-applies config authority to the DB;
+            # until then the relay must not advertise health.
+            if _registration_fail_stop() is not None:
+                self._json(503, {"ok": False, "error": "health_degraded",
+                                 "check": "registration_fail_stop"})
+                return
             # Fail-closed by construction: the diagnostic reports healthy
             # ONLY when every check it depends on passes. Any structural
             # failure yields an explicit 503, never {"ok": true} and never a
@@ -2964,6 +3517,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         if re.fullmatch(r"/join/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parsed.path):
             self._serve_public_request_join()
+            return
+        if parsed.path == "/v1/register-key/status":
+            # Bearer-authenticated, read-only reconciliation for a client that
+            # retained a pending candidate after an unknown POST outcome. It
+            # intentionally does not require the possibly accepted key: the
+            # whole purpose is to distinguish no-valid-key bootstrap state from
+            # exact-candidate acceptance without retrying the mutation.
+            peer = self._require_token_auth()
+            if peer is None:
+                return
+            if not rate_ok(token_sha_of(self.headers)):
+                self._json(429, {"error": "rate_limited"})
+                return
+            with db_lock:
+                row = conn.execute(
+                    "SELECT identity_pubkey FROM peers WHERE name=?", (peer,)
+                ).fetchone()
+            stored = row[0] if row else None
+            valid = _valid_stored_identity_pubkey(stored)
+            self._json(200, {
+                "registered": valid is not None,
+                "peer": peer,
+                "identity_pubkey": b64u_encode(valid) if valid is not None else None,
+            })
             return
         peer = self._require_auth()
         if peer is None:
@@ -3233,6 +3810,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         now = time.time()
         parsed = urlparse(self.path)
+        if _registration_fail_stop() is not None:
+            self._json(503, {"error": "registration_fail_stop"})
+            return
         # v0.2.5: invite challenge + redeem are pre-enrollment -- the claim
         # secret plus proof-of-possession IS the authentication. v0.2.9 adds
         # the agent self-enrollment pair (/v1/enroll/challenge + /v1/enroll),
@@ -3242,25 +3822,34 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_invite_challenge(now)
             return
         if parsed.path == "/v1/invites/redeem":
-            self._handle_invite_redeem(now)
+            try:
+                self._handle_invite_redeem(now)
+            except _RegistrationFailStopError:
+                self._json(503, {"error": "registration_fail_stop"})
             return
         if parsed.path == "/v1/enroll/challenge":
             self._handle_enroll_challenge(now)
             return
         if parsed.path == "/v1/enroll":
-            self._handle_enroll(now)
+            try:
+                self._handle_enroll(now)
+            except _RegistrationFailStopError:
+                self._json(503, {"error": "registration_fail_stop"})
             return
         if parsed.path == "/v1/handshakes/redeem":
             # Public for new identities, authenticated (bearer + signature)
             # for enrolled ones -- the handler decides from the
             # Authorization header.
-            self._handle_handshake_redeem(now)
+            try:
+                self._handle_handshake_redeem(now)
+            except _RegistrationFailStopError:
+                self._json(503, {"error": "registration_fail_stop"})
             return
         if parsed.path == "/v1/register-key":
-            # v0.2.17: self-service Ed25519 key registration. Bearer-token
-            # authenticated but SIGNATURE-EXEMPT -- it is the upgrade path
-            # for token-only peers, who cannot sign yet. The handler does
-            # its own token-only auth.
+            # v0.2.17: self-service Ed25519 key registration. The handler
+            # permits bearer-only bootstrap only when no valid key exists;
+            # otherwise it verifies the request with the current stored key
+            # before replacing or re-registering it.
             peer = self._require_token_auth()
             if peer is None:
                 return
@@ -3283,7 +3872,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_handshake_mint(peer, now, public_request=True)
             return
         if parsed.path == "/v1/handshakes/requests/redeem":
-            self._handle_handshake_redeem(now, request_peer=peer)
+            try:
+                self._handle_handshake_redeem(now, request_peer=peer)
+            except _RegistrationFailStopError:
+                self._json(503, {"error": "registration_fail_stop"})
             return
         if parsed.path == "/v1/invites/mint":
             self._handle_invite_mint(peer, now)
@@ -3795,7 +4387,10 @@ class Handler(BaseHTTPRequestHandler):
         # this database. Either both land or neither does -- a failed peer
         # INSERT can never leave a consumed use behind.
         name = None
-        with db_lock:
+        # All runtime identity_pubkey writers share registration_lock; the
+        # guard acquires registration_lock -> db_lock in the same order as
+        # register-key.
+        with _EnrollmentIdentityLocks():
             now2 = time.time()  # fresh: request-start `now` may predate expiry
             try:
                 if conn.in_transaction:
@@ -4108,7 +4703,10 @@ class Handler(BaseHTTPRequestHandler):
         # insert). Invite-redeem never requests a name (requested_name is
         # always None there), so no counterpart is needed.
         name = None
-        with db_lock:
+        # All runtime identity_pubkey writers share registration_lock; the
+        # guard acquires registration_lock -> db_lock in the same order as
+        # register-key.
+        with _EnrollmentIdentityLocks():
             now2 = time.time()  # fresh: request-start `now` may predate expiry
             try:
                 if conn.in_transaction:
@@ -4591,7 +5189,10 @@ class Handler(BaseHTTPRequestHandler):
         token = secrets.token_urlsafe(32)
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
         name = None
-        with db_lock:
+        # All runtime identity_pubkey writers share registration_lock; the
+        # guard acquires registration_lock -> db_lock in the same order as
+        # register-key.
+        with _EnrollmentIdentityLocks():
             now2 = time.time()  # fresh: request-start `now` may predate expiry
             try:
                 if conn.in_transaction:

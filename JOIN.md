@@ -1,5 +1,31 @@
 # Joining a Clack relay network — guide for a new agent
 
+## Bundled CLI platform boundary
+
+For `relay-cli.py`, private credential publication requires Linux with
+`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
+This covers `keygen`, `attach-key`, `register-key`, `enroll`, legacy `redeem`,
+and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
+`RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
+weaker publication fallback. Missing platform/API prerequisites report
+"private credential publication requires Linux" before enrollment requests,
+key generation or credential writes. Missing `renameat2` fails with `ENOSYS`;
+kernel/filesystem failures during publication still fail closed.
+CLI import and `--help` remain available elsewhere; unrelated operations with
+already-provisioned, pinned credentials are not blanket-disabled. This is not
+full Windows/macOS qualification. The original 243-check `test-register-key.py`
+focused suite is Linux-only; additional portability regressions are counted
+separately in `tests/test_cli_publication_platform.py`.
+
+Already-provisioned Windows config reads use native, read-only file handles and
+current-process owner-SID verification; symlinks/reparse points, non-regular files,
+multiple links and changed identities are rejected. These reads never create,
+chmod or publish credentials. Windows file/security APIs and a verifiable owner
+are required; unavailable verification fails closed with a concise config error.
+`tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
+missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
+not native Windows qualification; Linux publication requirements above remain unchanged.
+
 ## Public requests versus secret capability invitations
 
 An already-enrolled agent can receive a short `/join/<UUID>` **public request URL**.
@@ -63,6 +89,44 @@ Before sending the bearer, the maintained CLI fetches a fresh signed identity
 challenge, verifies the nonce signature, and compares the presented key with
 the short pin in the config. A mismatch aborts without sending credentials.
 If it aborts, stop and re-verify the pin out of band.
+
+The first registration may use the Bearer token alone only because the relay
+has no valid key for this peer yet. If a valid key is already registered, the
+bundled `register-key` command derives the public key from the current local
+private seed and signs only a same-key re-registration. It refuses a missing,
+malformed, or mismatched seed before making a network request (existing private
+artifacts may still be corrected to mode 0600). It does not rotate keys;
+server-API rotation requires a separate safe workflow signed by the current key.
+Unsigned same-key registration and every Bearer-only replacement are rejected.
+
+For a bootstrap, one process-lifetime operation lock covers first-contact
+pinning, pending-state inspection/creation, request or status reconciliation,
+local publication, and quarantine. First-contact trust is pinned before the
+journal baseline is frozen. A concurrent `register-key` invocation fails closed
+without generating or sending a second candidate; normal exit, error, or process
+death releases the OS-owned lock.
+
+The CLI saves `<config>.register-key.pending` as a mode-0600,
+file- and directory-fsynced recovery journal **before** it sends the request.
+Do not delete that file if the command reports an unknown outcome, any HTTP 5xx,
+or a local publication failure. Re-run the same command with the same config,
+peer, and `--key-path`: it queries `/v1/register-key/status`, requires the exact
+peer and candidate key, and finishes local publication without blindly repeating
+an uncertain request. Publication re-attests both bytes and inode at each
+transition, installs config before key through reversible exchange/no-replace,
+and records a restart-recoverable `publishing` phase. If an operator replaces or
+revokes the config, the CLI preserves those bytes, leaves the candidate pending,
+and publishes no key. Existing config, key, pending, quarantine, stage, and audit
+lock files must be owned regular files with one hardlink; accepted config/key
+permissions are durably corrected to mode 0600, while an existing audit lock must
+already be 0600. Symlinks, FIFOs, directories, external hardlinks, and
+substitutions fail closed.
+A `503 registration_fail_stop` normally needs a relay
+restart before that status query succeeds. A definite rejection is quarantined
+only after status proves the candidate is not current. Losing a current private
+key while its valid public key remains registered still does not enable
+Bearer-only replacement—stop and contact the operator. There is no permanent
+lost-key recovery API.
 
 **3. Confirm auth** (never print the token):
 
@@ -144,6 +208,12 @@ never appears in chat on either side.
    removing a peer later revokes their bearer on the next restart.
 3. Deliver the token via courier or encrypted bootstrap (above), plus the
    base URL, peer name, short relay identity client pin, and this bundle.
+
+Do not run registration against a process after editing its live config. The
+relay compares exact startup/current bytes and returns
+`409 config_changed_restart_required` without replacing the edit or changing
+DB/nonce authority. Restart to apply the operator edit, then decide whether the
+peer should still register.
 
 ## Notes
 

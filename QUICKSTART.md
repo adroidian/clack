@@ -1,8 +1,34 @@
 # QUICKSTART — two identities connected with encrypted delivery
 
-Requirements: Python 3 (stdlib only — no dependencies). The primary path in
-sections 1–8 was exercised end to end against a sealed scratch relay during
-release testing.
+Requirements: Linux and Python 3 (stdlib only — no Python package dependencies).
+The primary path in sections 1–8 was exercised end to end against a sealed scratch
+relay during release testing.
+
+## Bundled CLI platform boundary
+
+For `relay-cli.py`, private credential publication requires Linux with
+`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
+This covers `keygen`, `attach-key`, `register-key`, `enroll`, legacy `redeem`,
+and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
+`RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
+weaker publication fallback. Missing platform/API prerequisites report
+"private credential publication requires Linux" before enrollment requests,
+key generation or credential writes. Missing `renameat2` fails with `ENOSYS`;
+kernel/filesystem failures during publication still fail closed.
+CLI import and `--help` remain available elsewhere; unrelated operations with
+already-provisioned, pinned credentials are not blanket-disabled. This is not
+full Windows/macOS qualification. The original 243-check `test-register-key.py`
+focused suite is Linux-only; additional portability regressions are counted
+separately in `tests/test_cli_publication_platform.py`.
+
+Already-provisioned Windows config reads use native, read-only file handles and
+current-process owner-SID verification; symlinks/reparse points, non-regular files,
+multiple links and changed identities are rejected. These reads never create,
+chmod or publish credentials. Windows file/security APIs and a verifiable owner
+are required; unavailable verification fails closed with a concise config error.
+`tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
+missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
+not native Windows qualification; Linux publication requirements above remain unchanged.
 
 ## 1. Configure the relay
 

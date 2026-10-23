@@ -10,6 +10,32 @@ and separately accepts the pending handshake. Opening the URL never redeems or
 accepts it. New identities use the relay's configured enrollment flow; legacy v3
 and compatible v4 capability invitations remain private bearer secrets.
 
+### Bundled CLI platform boundary
+
+For `relay-cli.py`, private credential publication requires Linux with
+`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
+This covers `keygen`, `attach-key`, `register-key`, `enroll`, legacy `redeem`,
+and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
+`RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
+weaker publication fallback. Missing platform/API prerequisites report
+"private credential publication requires Linux" before enrollment requests,
+key generation or credential writes. Missing `renameat2` fails with `ENOSYS`;
+kernel/filesystem failures during publication still fail closed.
+CLI import and `--help` remain available elsewhere; unrelated operations with
+already-provisioned, pinned credentials are not blanket-disabled. This is not
+full Windows/macOS qualification. The original 243-check `test-register-key.py`
+focused suite is Linux-only; additional portability regressions are counted
+separately in `tests/test_cli_publication_platform.py`.
+
+Already-provisioned Windows config reads use native, read-only file handles and
+current-process owner-SID verification; symlinks/reparse points, non-regular files,
+multiple links and changed identities are rejected. These reads never create,
+chmod or publish credentials. Windows file/security APIs and a verifiable owner
+are required; unavailable verification fails closed with a concise config error.
+`tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
+missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
+not native Windows qualification; Linux publication requirements above remain unchanged.
+
 ### Relay and storage
 
 - Added signed `POST /v1/handshakes/requests` and
@@ -26,6 +52,26 @@ and compatible v4 capability invitations remain private bearer secrets.
   of deleting and recreating surviving rows, preserving row IDs, creation times,
   display metadata and activity timestamps across restart. A config name that
   collides with an independently enrolled peer now fails closed.
+- **Security — register-key replacement authorization:** Bearer-only registration
+  is now limited to peers with no valid stored Ed25519 key. Same-key
+  re-registration and server-API rotation require a canonical request signature
+  by the current stored key; signatures by the proposed/new key fail. A dedicated
+  registration lock serializes compare, verification, nonce reservation, DB
+  update, config publication, and every runtime enrollment identity writer so
+  concurrent requests cannot race the old-key check or identity uniqueness.
+  Config-managed writes are DB-first: under an interprocess registration lock,
+  the relay validates the exact live config bytes against the process startup
+  baseline, fsyncs a candidate before DB commit, rechecks for drift, atomically
+  publishes, and fsyncs the parent directory. A live operator edit is never
+  merged into stale process state: registration returns
+  `409 config_changed_restart_required` without consuming a signed nonce or
+  changing DB authority, and the exact operator bytes take effect on restart.
+  Pre-publication faults restore prior DB/config authority; uncertain
+  post-replace or compensation outcomes latch a process-wide fail-stop. Every
+  POST is refused and every runtime identity writer rechecks the latch under
+  the shared lock until restart reconciliation. Successful responses echo the
+  exact canonical accepted `identity_pubkey`. There is no bearer-only lost-key
+  bypass.
 
 ### Clients
 
@@ -36,6 +82,29 @@ and compatible v4 capability invitations remain private bearer secrets.
 - Maintained CLI send/receive paths now fail closed when encryption state is unknown,
   plaintext arrives on a protected path, or an encrypted payload cannot be decrypted.
   Rejections remain visible instead of silently exposing content.
+- The bundled `register-key` CLI now handles only token-only bootstrap and
+  same-key re-registration. Existing identity public keys are derived from the
+  usable local seed; missing, malformed, or mismatched seed/public-key state is
+  rejected before any request. One process-lifetime operation lock serializes
+  config inspection, first-contact pinning, journal creation, dispatch/status,
+  local publication, and quarantine; a concurrent invocation fails closed before
+  generating a key or making a request, and process death releases the lock.
+  First-contact TOFU is durably pinned before the pending baseline is frozen.
+  Before bootstrap can change server authority, the CLI atomically publishes and
+  fsyncs a mode-0600 pending journal containing the exact recovery seed and bound
+  config/key targets. `register-key` is attempted once: transport uncertainty and
+  every 5xx retain that journal. A later run
+  queries the bearer-authenticated read-only status endpoint and publishes only
+  when the relay reports the same peer and exact candidate key; it never blindly
+  repeats an uncertain mutation. Accepted key/config files use deterministic
+  mode-0600 staged inodes, inode-and-byte CAS, reversible `renameat2` exchange or
+  no-replace transitions, parent fsync, and a journaled `publishing` phase for
+  crash compensation and restart recovery. Config is re-attested before and
+  after key publication; operator replacements are preserved and block the key.
+  Existing credential artifacts must be owned regular files with exactly one
+  hardlink; symlinks, directories, FIFOs, external hardlinks, substitutions, and
+  colliding quarantine/lock artifacts are refused. No CLI key-rotation workflow
+  is claimed or exposed.
 
 ### Verification
 
@@ -46,10 +115,22 @@ and compatible v4 capability invitations remain private bearer secrets.
   request/reply with unchanged identity configuration.
 - Config-peer restart preservation: 2/2 passed, including a takeover-collision
   negative control.
-- Independent follow-up review approved the repaired feature tree with zero open
-  findings. The inherited broad-suite failures remain documented in
-  `docs/short-invitations-verification.md`; they were identical on the untouched base
-  and the repaired feature tree.
+- Register-key security suite: 243/243 passed. It includes the relay authority
+  and concurrency cases above; a deterministic no-lock negative control;
+  pre-request candidate durability; real accepted-then-lost-200 and visible-503
+  reconciliation without retry; invalid-runtime bootstrap; exact response-key
+  binding; every journal/key/config stage, file-fsync, replace, post-replace and
+  directory-fsync fault; mode correction and unsafe destination rejection;
+  real thread/module and process concurrency with stale-owner recovery;
+  first-contact pin ordering; byte/inode publication races and interrupted
+  exchange compensation; external-hardlink artifacts and alias races; concurrent
+  operator-revocation preservation; and fail-stop/positive controls for all three
+  public identity writers.
+- An independent review rejected the 195-check candidate with four Important
+  register-key findings; this source/tests/docs repair addresses those findings.
+  The inherited broad-suite failures remain documented in
+  `docs/short-invitations-verification.md`; they were identical on the untouched
+  base and the earlier feature tree.
 
 ## v1.0.0 — E2EE-only, Fix A, federation (2026-10-12)
 
@@ -74,20 +155,22 @@ Main→Ex→main encrypted duplex verified.
 **Self-service Ed25519 key registration:** The `401 upgrade_required` break
 from v0.2.15 is now self-healing: a token-only peer registers its own
 Ed25519 public key with just its Bearer token — no operator provisioning,
-no re-enrollment.
+no re-enrollment. As tightened in v1.1.0, Bearer-only authority ends once a
+valid key exists; later re-registration or rotation is current-key signed.
 
 ### Server (relay.py)
 
-- **`POST /v1/register-key` (new):** Bearer-token authenticated, intentionally
-  **exempt from request signing** (it is the upgrade path for token-only
-  peers). Body `{"pubkey": <raw 43-char b64u | PEM SPKI>}`. The key is
+- **`POST /v1/register-key` (new):** Bearer-token authenticated and
+  signature-exempt only for the first no-valid-key bootstrap. Body
+  `{"pubkey": <raw 43-char b64u | PEM SPKI>}`. The key is
   validated as a real prime-order Ed25519 key, normalized to canonical raw
   base64url, bound to the authenticated peer immediately, and persisted —
   config-managed peers are written through to `relay-config.json`
   (`identity_pubkeys`), atomic temp-file + `os.replace`. Self-enrolled peers
   persist in the DB row (config re-read preserves non-config rows).
-  Rotation is supported: response
-  `{"registered": true, "peer": "<name>", "rotated": <bool>}`.
+  Rotation is supported when the request is signed by the current stored key:
+  response `{"registered": true, "peer": "<name>", "rotated": <bool>,
+  "identity_pubkey": "<canonical accepted key>"}`.
 - **Handshake redeem accepts optional `pubkey`:** a fresh enrollment can now
   carry `{"pubkey": <raw|PEM>}` alongside `identity_pubkey` — the proof-of-key
   binds whichever key the peer proved, so new peers register their key in the
@@ -95,27 +178,25 @@ no re-enrollment.
   `identity_pubkey` remains the proof-of-possession anchor; the new field is
   strictly additive (redeem without either still 400s).
 - All other auth-path behavior unchanged: wrong/missing pubkey → 400
-  `bad_pubkey` / `pubkey_required`; missing/bad token → 401; register-key is
-  the ONLY authenticated endpoint exempt from signing.
+  `bad_pubkey` / `pubkey_required`; missing/bad token → 401. Register-key's
+  signing exemption is conditional on there being no valid stored key.
 
 ### CLI (relay-cli.py)
 
-- **`register-key` subcommand:** for a token-only peer — generates a keypair
-  when missing (mode-600 private key file, never leaves the machine),
-  upgrades a legacy token config to an identity config in place, and POSTs
-  the public key to `/v1/register-key`. Reports `registered signing key`
-  vs `rotated signing key`.
+- **`register-key` subcommand:** for a token-only peer — generates a keypair,
+  durably journals its mode-600 recovery seed before the POST, and only after
+  exact server acceptance atomically publishes the private key and upgraded
+  config. Unknown/5xx outcomes retain the journal for status reconciliation.
+  Existing identities require a usable seed matching the configured public key
+  and may only submit that same key. The command has no rotation workflow.
 - BUG-007 is now `fixed-in-v1.0.0`: token-only peers self-register;
   operator key provisioning is no longer required for the signing upgrade.
 
 ### Tests
 
-- New `test-register-key.py` (31 checks): token-only register 200
-  signature-exempt; 400s on missing/garbage/wrong-length/malformed-PEM keys;
-  401s on missing/bad token; rotation overwrite + `rotated` flag; old key
-  rejected after rotation; PEM normalization; config persistence +
-  restart survival; signed requests work post-registration; handshake redeem
-  with `pubkey` (PEM) binds at enrollment; CLI `register-key` round trip.
+- The predecessor registration slice retained with the earlier release tree had
+  45 successful checks. The v1.1.0 replacement suite has 243 checks; its current
+  coverage is listed in the v1.1.0 verification section above.
 
 ## v0.2.16 — at-least-once durability (unreleased, in development)
 

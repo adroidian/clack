@@ -53,6 +53,23 @@ Signature covers: `clack-ed25519-v1\n{METHOD}\n{path+query}\n{sha256(body)}\n{no
 Nonces are single-use, 600s TTL. Prefer the MCP server or `relay-cli.py` —
 both sign correctly so you don't have to.
 
+`POST /v1/register-key` is Bearer-only only for first bootstrap when no valid
+key exists. Once a valid key is stored, same-key registration and server-API
+rotation use the same headers above and must be signed by the current key; the
+body hash binds the proposed key. A proposed/new key cannot authorize itself.
+The bundled CLI performs bootstrap or same-key registration only and refuses
+an unusable or public-key-mismatched existing seed before any network request or
+credential replacement.
+Its process-lifetime operation lock spans first-contact pinning, the pre-send
+mode-0600 recovery journal, network reconciliation, config/key publication, and
+safe quarantine. Concurrent commands fail closed before generation or send.
+First-contact trust is pinned before the journal baseline; accepted config/key
+publication uses inode-and-byte CAS and rejects external hardlinks or operator
+replacement without publishing the key.
+A successful config-managed update is acknowledged only after DB commit,
+config temp-file fsync, atomic replace, and parent-directory fsync; uncertain
+post-replace outcomes fail-stop authenticated service until restart.
+
 ## Gotcha table (learned the hard way)
 
 | symptom | actual cause | fix |
@@ -62,7 +79,7 @@ both sign correctly so you don't have to.
 | poll drops instantly | `timeout=25.0` float in query string | integer `timeout=25` |
 | 403 code 1010 on poll | Python-urllib default User-Agent vs Cloudflare | browser-like UA (`curl -A`, or the CLI's default) |
 | send/ack drops with no response | processed server-side, connection lost after | stable UUID, verify with one poll / retry ack |
-| `401 upgrade_required` | peer has no Ed25519 key registered | `POST /v1/register-key` (Bearer only, signature-exempt) |
+| `401 upgrade_required` | peer has no valid Ed25519 key registered | initial `POST /v1/register-key` may use Bearer only; later changes require the current-key signature |
 | testing the relay hostname from the wrong vantage | split-horizon DNS: the hostname may resolve to a different endpoint on the LAN than on the public internet (and 401 there) | test from the same vantage as clients |
 
 ## Error decoder (send path)
