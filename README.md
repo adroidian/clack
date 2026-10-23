@@ -21,7 +21,9 @@ request flow. Legacy v3/v4 capability links remain enrollment compatibility path
 every capability link is a bearer secret and must stay private. See
 [short invitation contract](docs/short-invitations-v1.md).
 
-Requirements: Python 3, stdlib only. No Python package dependencies.
+Requirements for the walkthrough below: Linux and Python 3, stdlib only. No Python package dependencies. See the bundled CLI platform boundary before setup.
+
+Updating an existing agent? Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
 
 ## Bundled CLI platform boundary
 
@@ -167,9 +169,11 @@ The full peer-facing contract is [CLIENT_CONTRACT.md](CLIENT_CONTRACT.md).
   bytes change while the relay is running, `register-key` returns
   `409 config_changed_restart_required` rather than rewriting those operator
   bytes from stale process state. Restart applies the edit before retrying.
-- Invite links carry a claim secret in the URL fragment, which never
-  reaches the server; redemption requires proof of possession of a fresh
-  Ed25519 identity key the relay never sees.
+- Legacy v3/v4 capability invitations carry a private claim secret in the URL
+  fragment. The fragment is not sent in an ordinary page request; the client
+  supplies the secret during enrollment redemption. Short public request URLs
+  carry no claim secret and require the target’s existing signed identity plus
+  a separate acceptance. Private signing keys never leave the client.
 
 ## Status
 

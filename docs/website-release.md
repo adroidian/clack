@@ -21,23 +21,41 @@ Check `/`, `/join`, `/relay`, `/selfhost`, `/privacy`, `/llms.txt`, and `/.well-
 
 Validate JSON files and scan public text for stale release numbers before deployment.
 
+## Documentation publication is a separate acceptance item
+
+The maintained public repository is `adroidian/clack` on GitHub. The website is not a substitute for publishing its matching source and documentation.
+
+Before the website goes live, verify that the `v1.1.0` tag resolves to the accepted release and that its README, QUICKSTART, JOIN, CLIENT_CONTRACT, CHANGELOG, `docs/short-invitations-v1.md`, served CLI and source-bundle links are publicly readable. Do not point new instructions at an absent tag. Preserve the accepted release tag and runtime/image pins; follow-up documentation-only corrections belong in a separate commit on `main`, not a retag or an implicit rebuild. Apply any documentation patch only in the coordinator's clean publication clone, never in an operator or frozen-source checkout.
+
+## Verify the existing publication target
+
+The recorded website project is `tryclack`, scope `aarons-projects-913651c8`, project ID `prj_C8RrOK5m3NVN4DA8U49e8KOvGfie`, organization ID `team_OA07cfx2vHHJCQoksWX1xBhs`. Confirm those IDs and the `tryclack.com` alias through the existing authorized operator's live Vercel readback before deployment. Do not create another project or change accounts, credentials, domains or settings to make a failed lookup pass.
+
+A source folder's presence does not establish current hosting state. Preserve the exact prior production deployment ID and verify its current public bytes before replacing it.
+
 ## Preview deployment
 
+From the approved website source root (or pass its absolute path instead of `website`):
+
 ```bash
-npx --yes vercel@latest --cwd website
+VERCEL_ORG_ID=team_OA07cfx2vHHJCQoksWX1xBhs \
+VERCEL_PROJECT_ID=prj_C8RrOK5m3NVN4DA8U49e8KOvGfie \
+npx --yes vercel@latest --cwd website --scope aarons-projects-913651c8
 ```
 
-Inspect the preview URL and verify every route before promoting it.
+Inspect the preview URL and verify every route before promoting it. The site is static: there is no application build command, dependency install or backend to enable. Keep private reports and release evidence outside the uploaded `website` directory.
 
 ## Production deployment
 
-After the matching relay release is live and verified:
+Only after the matching relay release has passed the coordinator's live acceptance, its existing identities and pins remain continuous, and its public release-source links work:
 
 ```bash
-npx --yes vercel@latest --cwd website --prod
+VERCEL_ORG_ID=team_OA07cfx2vHHJCQoksWX1xBhs \
+VERCEL_PROJECT_ID=prj_C8RrOK5m3NVN4DA8U49e8KOvGfie \
+npx --yes vercel@latest --cwd website --scope aarons-projects-913651c8 --prod
 ```
 
-Record the deployment ID and URL. Read back the custom domain, not only the generated Vercel URL.
+Record the deployment ID and URL. Read back the custom domain, not only the generated Vercel URL. Deployment success does not by itself verify source publication, consent, encrypted messaging or native-platform support.
 
 ## Required public checks
 

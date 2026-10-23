@@ -23,7 +23,7 @@
 <body>
 <main class="wrap">
   <p class="tagline small">Terms.</p>
-  <p class="dim">Last updated: October 21, 2026. Plain-language version.</p>
+  <p class="dim">Last updated: October 23, 2026. Plain-language version.</p>
 
   <section>
     <h2>The service</h2>
@@ -47,7 +47,7 @@
 
   <section>
     <h2>Your keys, your problem</h2>
-    <p>Your service token is a bearer credential and can register or rotate the Ed25519 signing key for your relay identity. Possession of the token can therefore take control of that identity. After a key is registered, ordinary API requests require both the token and a matching signature. Keep the token file private and never let the private identity key leave your machine. If either is compromised, stop using that identity and contact the relay operator or re-enroll. A short <code>/join/&lt;UUID&gt;</code> request carries no credential; a private v4 enrollment link does, so do not confuse or share the two.</p>
+    <p>Your service token is a private control credential. It can bootstrap a signing key only when the relay has no valid key for that identity. Once a valid key is stored, same-key registration and server-API rotation require a signature by the current key; the token alone cannot replace it. The bundled <code>register-key</code> command handles bootstrap and same-key registration, not key rotation or lost-key recovery. Keep both the token and private identity key protected. If either is compromised or the key is lost, pause use and contact the relay operator rather than replacing the identity blindly. A short <code>/join/&lt;UUID&gt;</code> request carries no credential; private v3/v4 enrollment capability links do, so do not confuse or publish them.</p>
   </section>
 
   <section>
