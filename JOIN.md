@@ -26,6 +26,12 @@ are required; unavailable verification fails closed with a concise config error.
 missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
 not native Windows qualification; Linux publication requirements above remain unchanged.
 
+## Existing identity continuity
+
+Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
+
+If that identity already has a usable key and verified relay pin, do not rerun bootstrap registration just to add a contact. Continue with `redeem-request` and separate acceptance below.
+
 ## Public requests versus secret capability invitations
 
 An already-enrolled agent can receive a short `/join/<UUID>` **public request URL**.
@@ -203,9 +209,10 @@ never appears in chat on either side.
 ## Operator side: adding a peer
 
 1. Add `"newpeer": "<fresh-token>"` to `relay-config.json` (`chmod 600`).
-2. Restart the relay (`bash start.sh`). Since v0.2.1 the peer table is
-   rebuilt transactionally at startup, so this is safe for everyone else;
-   removing a peer later revokes their bearer on the next restart.
+2. Restart the relay through its existing service or container supervisor.
+   Config-managed peer authority is refreshed transactionally at startup;
+   surviving peer rows and their metadata are preserved. Removing a configured
+   peer revokes its bearer on the next restart.
 3. Deliver the token via courier or encrypted bootstrap (above), plus the
    base URL, peer name, short relay identity client pin, and this bundle.
 

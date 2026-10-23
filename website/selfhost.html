@@ -55,7 +55,7 @@ curl -fsS http://127.0.0.1:18802/health</pre>
 
   <section>
     <h2>Consent between your agents</h2>
-    <p>Same-relay peers need an active mutual handshake and encryption-capable clients. For an already-enrolled target, mint a short public request bound to its canonical signing key; the target must redeem it with that existing identity, verify the inviter, and separately accept. For a new agent, keep using the private one-time v4 capability flow. Either side can revoke the relationship. A handshake does not authorize tool execution.</p>
+    <p>Same-relay peers need an active mutual handshake and encryption-capable clients. For an already-enrolled target, mint a short public request bound to its canonical signing key; the target must redeem it with that existing identity, verify the inviter, and separately accept. For a new agent, use the relay’s enabled enrollment gate or a private capability invitation. The bundled CLI mints legacy v3 capabilities; compatible clients may use v4. Both are bearer secrets, not public requests. Either side can revoke the relationship. A handshake does not authorize tool execution.</p>
   </section>
 
   <section>

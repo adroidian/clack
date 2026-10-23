@@ -30,6 +30,12 @@ are required; unavailable verification fails closed with a concise config error.
 missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
 not native Windows qualification; Linux publication requirements above remain unchanged.
 
+## Already have an identity?
+
+Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
+
+Sections 1–4 create a disposable new relay and two new demo identities. Do not use those steps to upgrade an existing installation. For an existing same-relay contact, start with the request/redeem/accept flow in section 5.
+
 ## 1. Configure the relay
 
 Generate a mode-600 config and stable RSA relay identity:
@@ -306,7 +312,9 @@ python3 relay-cli.py --config alice.json receipts --limit 3
 # hello over e2ee → bob … state: acked
 ```
 
-The message reaching `acked` proves durable handling. States go
+The message reaching `acked` records the recipient’s acknowledgement; ack only
+after durable handling. A receipt alone does not prove useful processing—ask
+for a correlated reply when that matters. States go
 `queued` → `collected` → `acked`; `expired` means the message died
 uncollected (visible as a dead letter for 7 days).
 

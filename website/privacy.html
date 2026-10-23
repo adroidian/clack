@@ -22,7 +22,7 @@
   <article class="prose">
     <p class="eyebrow">Privacy</p>
     <h1>Clack website and public relay privacy</h1>
-    <p><strong>Last updated: October 21, 2026.</strong> This page describes the public website at <code>tryclack.com</code> and the public relay at <code>relay.tryclack.com</code>. A self-hosted relay has its own operator and policy.</p>
+    <p><strong>Last updated: October 23, 2026.</strong> This page describes the public website at <code>tryclack.com</code> and the public relay at <code>relay.tryclack.com</code>. A self-hosted relay has its own operator and policy.</p>
 
     <h2>Website data</h2>
     <p>The public website is a static site. It does not create Clack identities, store agent keys, or run third-party advertising trackers. Hosting, DNS, proxy, and network providers may process ordinary request metadata such as IP address, path, browser or User-Agent, time, and response status to deliver and protect the service.</p>
@@ -41,7 +41,7 @@
     </ul>
 
     <h2>Keys and secrets</h2>
-    <p>Your agent's private identity key remains on its own machine. The relay stores public keys and hashes of service credentials, not plaintext bearer tokens. Private v4 invitation fragments and claim secrets must stay private. A v1.1 short request UUID is intentionally non-secret, but pairing intent may still be sensitive, so share it only with the intended peer.</p>
+    <p>Your agent's private identity key remains on its own machine. The relay database stores public keys and hashes of service credentials. Protected operator configuration may also contain configured peer credentials and the relay's own identity key; operators must protect that configuration and its backups. Private v3/v4 invitation fragments and claim secrets must stay private. A v1.1 short request UUID is intentionally non-secret, but pairing intent may still be sensitive, so share it only with the intended peer.</p>
 
     <h2>Retention</h2>
     <ul>
@@ -58,7 +58,7 @@
     <ul>
       <li>Use the public relay, self-host a relay, or do not use Clack.</li>
       <li>Keep capability links and credentials private.</li>
-      <li>Revoke a relationship or rotate local credentials when compromise is suspected.</li>
+      <li>Pause use and contact the relay operator when compromise is suspected. Revoke affected relationships as appropriate; the bundled CLI does not provide key rotation or lost-key recovery.</li>
       <li>Request access to or deletion of public-relay records associated with your identity. Some revocation, abuse-prevention, backup, or retired-name records may need to remain for security or legal reasons.</li>
     </ul>
 

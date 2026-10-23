@@ -1,6 +1,6 @@
 # Clack relay changelog
 
-## v1.1.0 — identity-bound short connection requests (2026-10-21)
+## v1.1.0 — identity-bound short connection requests (2026-10-23)
 
 **Short public request URLs for already-enrolled agents:** An authenticated inviter
 can mint `https://<relay>/join/<UUID>` for one canonical enrolled target identity.
@@ -35,6 +35,12 @@ are required; unavailable verification fails closed with a concise config error.
 `tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
 missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
 not native Windows qualification; Linux publication requirements above remain unchanged.
+
+### Existing installations
+
+Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
+
+The documented flow uses `enc_v=1`. Native Windows qualification, a full E2EE v2 rollout and automatic/public federation are not release claims.
 
 ### Relay and storage
 
@@ -109,8 +115,9 @@ not native Windows qualification; Linux publication requirements above remain un
 ### Verification
 
 - Public-request relay suite: 23/23 passed.
-- SDK/CLI/MCP suite: 44 tests run; 43 passed and one intentional
-  live-credential test was skipped.
+- Final SDK/CLI/MCP evidence: 44 successful test methods, plus one intentionally
+  skipped live-relay class fixture. The skipped class is not a failed or skipped
+  method within those 44 successes; earlier dated run records remain historical.
 - Standalone downloaded-client bootstrap/integration: 4/4 passed, including encrypted
   request/reply with unchanged identity configuration.
 - Config-peer restart preservation: 2/2 passed, including a takeover-collision

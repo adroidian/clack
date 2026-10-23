@@ -26,6 +26,12 @@ are required; unavailable verification fails closed with a concise config error.
 missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
 not native Windows qualification; Linux publication requirements above remain unchanged.
 
+## Existing identity continuity
+
+Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
+
+The v1.1 request path does not rotate keys, replace client config or change the relay pin. Its documented encrypted mode is `enc_v=1`; it is not a full E2EE v2 or public federation rollout. Existing route/grant prerequisites remain separate.
+
 ## What's new in v1.1.0: short public requests
 
 Known enrolled identities can use a public `/join/<UUID>` request, not a secret
