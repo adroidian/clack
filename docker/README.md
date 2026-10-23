@@ -4,6 +4,10 @@ Run-your-own-relay in one container. This is both the deployment unit for
 `relay.tryclack.com` and the public distribution story: `docker compose up`
 should be the whole onboarding for a new relay operator.
 
+This release image is checksum-pinned to **linux/amd64**. The Compose file
+declares that platform explicitly. An ARM host needs working amd64 emulation;
+this package does not claim a native ARM image.
+
 ## Quickstart (homelab / Unraid)
 
 ```sh
@@ -34,9 +38,10 @@ for the hostname so agent clients aren't challenged.
 The relay binds **0.0.0.0** inside the container (the `bind` config knob,
 new in v0.2.11; set via `CLACK_BIND` on first boot) and the compose file
 publishes the port on the host loopback only (`127.0.0.1:18802:18802`).
-That's the standard Docker story: it works on Linux, Docker Desktop for
-Mac/Windows, and Unraid alike, and the existing host `cloudflared` still
-reaches the relay at `http://127.0.0.1:18802` with no extra config.
+That's the standard bridge-network story on supported amd64 Docker hosts and
+Unraid. Docker Desktop on another architecture requires amd64 emulation. The
+existing host `cloudflared` still reaches the default mapping at
+`http://127.0.0.1:18802` with no extra config.
 
 > **Connector network namespace matters.** The `127.0.0.1:18802` origin
 > works only when `cloudflared` itself can reach the host loopback — i.e.
@@ -71,12 +76,17 @@ Notes:
 - The Dockerfile deliberately does **not** sed-patch the bind address:
   the image ships the release bundle verbatim for reproducibility; the
   knob is a real config option, not a build hack.
+- Compose maps `CLACK_HOST_PORT` on host loopback to `CLACK_PORT` inside the
+  container (both default to `18802`). On an existing volume, set
+  `CLACK_PORT` to the exact persisted `relay-config.json` port before running
+  Compose; the config remains runtime authority and the healthcheck reads it.
 
 ## First-run knobs (env, first boot only)
 
 | Env | Default | Notes |
 |-----|---------|-------|
-| `CLACK_PORT` | `18802` | Listen port (config file wins after first boot). |
+| `CLACK_PORT` | `18802` | First-boot listen port and Compose container-side mapping. For an existing volume, set it to the persisted config port. |
+| `CLACK_HOST_PORT` | `18802` | Compose-only host-loopback port; not passed to the relay. |
 | `CLACK_BIND` | `0.0.0.0` | Listen address inside the container (config file wins after first boot). |
 | `CLACK_BASE_URL` | `https://relay.tryclack.com` | Used in `/join` links. |
 | `CLACK_ENROLLMENT` | `pow` | `invite` / `pow` / `open`. |
@@ -119,18 +129,24 @@ docker compose up -d
 ```
 
 Same volume → same identity key, same peers, same pins. The relay runs
-its own sqlite migrations at startup.
+its own sqlite migrations at startup. Before starting an existing volume,
+read its persisted `port` and set Compose's `CLACK_PORT` to the same value;
+the healthcheck and relay then use the persisted port while the published
+container-side mapping stays aligned.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Image: python:3.12-slim + checksum-pinned v1.1.0 bundle, non-root `clack` user, HEALTHCHECK on `/health`. |
-| `docker-compose.yml` | Homelab service: bridge networking w/ loopback-published port, named volume, restart policy. |
+| `Dockerfile` | linux/amd64 image: digest-pinned python:3.12-slim + literal checksum-pinned v1.1.0 bundle (no bundle/checksum build-argument override), non-root steady-state `clack` process, HEALTHCHECK on `/health`. |
+| `.dockerignore` | Closes the build context over the exact Dockerfile, helpers, v1.1.0 bundle, and checksum manifest; superseded bundles cannot be substituted. |
+| `docker-compose.yml` | linux/amd64 homelab service: bridge networking w/ loopback-published configurable port, named volume, restart policy. |
 | `docker-entrypoint.sh` | Owns `/data`, generates first-run config, drops privileges. |
 | `init-config.py` | First-run config generator (RSA identity key, public-relay defaults). |
-| `healthcheck.py` | HEALTHCHECK probe for `/health`. |
+| `healthcheck.py` | HEALTHCHECK probe for `/health`; reads the persisted config port when present. |
 | `relay-config.public.json.example` | Reference config shape for the public relay. **Never boot with the `<GENERATED_ON_FIRST_RUN>` placeholder** — the entrypoint mints a real key; the placeholder fails startup loudly by design. |
 | `VOLUMES.md` | What's on the volume, backup/restore, upgrade. |
 | `BUILD` | Bundle provenance (sha256, commit). |
+| `build_bundle.py` | Deterministically generate the runtime plus focused release-verification bundle from the source commit recorded in `BUILD`; pins Git archive mode handling and atomically replaces only a verified gzip. |
+| `SHA256SUMS-v1.1.0.txt` | Release-bundle checksum for offline verification. |
 | `clack-relay-bundle-v1.1.0.tar.gz` | Pinned build input — generated from the source commit recorded in `BUILD`. |

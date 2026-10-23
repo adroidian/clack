@@ -1,4 +1,4 @@
-# Clack public relay — homelab deployment (Unraid / any Linux Docker host).
+# Clack public relay — homelab deployment (Unraid / linux/amd64 Docker).
 #
 # Networking: standard bridge networking with a published port. The relay
 # binds 0.0.0.0 inside the container (CLACK_BIND) and the port is published
@@ -7,19 +7,24 @@
 
 services:
   relay:
+    # The checksum-pinned base manifest is linux/amd64. Non-amd64 hosts need
+    # working amd64 emulation; this package does not claim a native ARM image.
+    platform: linux/amd64
     build: .
     image: clack-relay:1.1.0
     container_name: clack-relay
     restart: unless-stopped
     ports:
-      - "127.0.0.1:18802:18802"
+      # For an existing volume, CLACK_PORT must match relay-config.json's
+      # persisted port. CLACK_HOST_PORT controls only the host-side loopback.
+      - "127.0.0.1:${CLACK_HOST_PORT:-18802}:${CLACK_PORT:-18802}"
     environment:
       CLACK_RELAY_BASE: /data
       # First boot ONLY: these shape the generated relay-config.json.
       # Later boots reuse the config on the volume, so the relay identity
       # key (and therefore every client's TOFU pin) stays stable.
       # Changing them after first boot requires editing the config file.
-      CLACK_PORT: "18802"
+      CLACK_PORT: "${CLACK_PORT:-18802}"
       CLACK_BIND: "0.0.0.0"
       CLACK_BASE_URL: "https://relay.tryclack.com"
       CLACK_ENROLLMENT: "pow"

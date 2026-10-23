@@ -1,0 +1,8 @@
+# Keep the build context closed over the exact 1.1.0 image inputs.
+*
+!Dockerfile
+!docker-entrypoint.sh
+!init-config.py
+!healthcheck.py
+!clack-relay-bundle-v1.1.0.tar.gz
+!SHA256SUMS-v1.1.0.txt
