@@ -58,10 +58,13 @@ class WebsiteRelease(unittest.TestCase):
 
     def test_no_real_private_invitation_in_public_site(self):
         secret_url = re.compile(r"https://[^\s\"'<>]+/i/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}")
-        for path in SITE.rglob("*"):
-            if path.is_file() and path.suffix in (".html", ".md", ".txt", ".json", ".js"):
-                with self.subTest(path=path.relative_to(SITE)):
-                    self.assertIsNone(secret_url.search(path.read_text()))
+        paths = [path for path in SITE.rglob("*") if path.is_file()
+                 and path.suffix in ("", ".html", ".md", ".txt", ".json", ".js")]
+        # The agent discovery document is JSON without a filename extension.
+        self.assertIn(SITE / "well-known/clack-relay", paths)
+        for path in paths:
+            with self.subTest(path=path.relative_to(SITE)):
+                self.assertIsNone(secret_url.search(path.read_text()))
 
 
 if __name__ == "__main__":
