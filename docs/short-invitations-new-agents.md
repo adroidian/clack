@@ -130,8 +130,11 @@ acceptance result to show an active encryption-capable relationship
    `link_id` is the full UUID used for management, not the compact path handle.
 3. A fresh recipient persists its own identity and trusted relay state first,
    then calls `POST /v1/enroll/challenge` with `{invite_id: link_id, k: claim,
-   identity_pubkey: pub}`. The relay must support the invite enrollment gate;
-   the private invitation does not silently fall back to another gate. The
+   identity_pubkey: pub}`. When the configured invite gate is disabled, and ONLY
+   for `invite_not_allowed`, the client requests the relay's enabled PoW/open
+   challenge with `{}`. It solves any required PoW and proves the same local key;
+   the invitation secret and first-key claim checks still apply at redemption.
+   Invalid, revoked or expired claims never trigger a gate switch. The
    subsequent `POST /v1/handshakes/redeem` includes `h`, `k`, `identity_pubkey`
    and the signed challenge `proof` (plus `requested_name` when selected).
    Its proof binds the claim to that key. The first proved key transactionally

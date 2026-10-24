@@ -461,7 +461,7 @@ fresh_key("failpeer")
 KEYS["tokpeer_a"] = KEYS["tokpeer"]
 write_config()
 start_relay()
-check(_rm.VERSION == "1.1.0", "relay reports v1.1.0", _rm.VERSION)
+check(_rm.VERSION == "1.2.0", "relay reports v1.2.0", _rm.VERSION)
 
 # tokpeer starts token-only: signed requests must 401 upgrade_required.
 # (tokpeer's key exists locally but is not registered yet)

@@ -3924,15 +3924,13 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub,
         code, ch = req(cfg, "POST", "/v1/enroll/challenge",
                        ({"invite_id": h, "k": k, "identity_pubkey": b64u_encode(pub)}
                         if private_invitation else {"invite_id": h}), base=relay_url)
-        if not private_invitation and code == 400 and ch.get("error") == "invite_not_allowed":
+        if code == 400 and ch.get("error") == "invite_not_allowed":
             code, ch = req(cfg, "POST", "/v1/enroll/challenge", {},
                            base=relay_url)
         if not (200 <= code < 300):
             print("challenge failed: %s" % json.dumps(ch), file=sys.stderr)
             return 1
         gate = ch.get("gate")
-        if private_invitation and gate != "invite":
-            raise ValueError("private invitation requires the invite enrollment gate")
         if gate == "pow":
             chal_raw = b64u_decode(ch["challenge"])
             difficulty = int(ch.get("difficulty", 20))
@@ -3983,8 +3981,15 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub,
           % (out.get("handshake_id"), out.get("status")))
 
     if private_invitation:
-        print("Pending only. Review, then separately run: accept-handshake %s --enc-v 1"
-              % out["handshake_id"])
+        import shlex
+        summary = {key: out.get(key) for key in (
+            "status", "handshake_id", "minter_identity", "pending_expires_at",
+            "via_link_id", "generation", "enc_capable")}
+        print(json.dumps({"pending_handshake": summary}, indent=2))
+        print("Pending only. Review the actual inviter and pending deadline before accepting.")
+        print("Next command: " + shlex.join([
+            sys.executable, os.path.abspath(__file__), "--config", os.path.abspath(args.config),
+            "accept-handshake", "--enc-v", "1", "--", out["handshake_id"]]))
         print("config saved: %s" % args.config)
         return 0
 

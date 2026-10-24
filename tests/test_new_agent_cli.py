@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -445,8 +446,8 @@ class InvitationHTTP(unittest.TestCase):
 
     def test_fresh_cli_real_http_pending_then_separate_signed_accept(self):
         invitation = self.mint()
-        self.cli_process(["redeem", invitation["link"], "--name", "fresh-agent", "--yes",
-                          "--expect-inviter", self.fixture.pub["alice"]])
+        redemption = self.cli_process(["redeem", invitation["link"], "--name", "fresh-agent", "--yes",
+                                       "--expect-inviter", self.fixture.pub["alice"]])
         saved = cli.load_config(self.path)
         with patch.dict(os.environ, {"CLACK_USE_CURL": "0"}):
             status, listed = cli.req(saved, "GET", "/v1/handshakes", base=self.fixture.base)
@@ -457,7 +458,18 @@ class InvitationHTTP(unittest.TestCase):
         self.assertEqual((hs["status"], hs["enc_capable"]), ("pending", 0))
         self.assertEqual(messages, 0)
         self.assertEqual(saved["peer_name"], "fresh-agent")
-        self.cli_process(["accept-handshake", hs["handshake_id"], "--enc-v", "1"])
+        self.assertIn('"pending_expires_at":', redemption.stdout)
+        self.assertIn('"minter_identity": "' + self.fixture.pub['alice'] + '"', redemption.stdout)
+        self.assertNotIn(saved['service_token'], redemption.stdout)
+        self.assertNotIn(invitation['link'].split('#', 1)[1], redemption.stdout)
+        emitted = next(line.removeprefix('Next command: ') for line in redemption.stdout.splitlines()
+                       if line.startswith('Next command: '))
+        command = shlex.split(emitted)
+        self.assertEqual(command, [sys.executable, str(self.downloaded), '--config', self.path,
+                                   'accept-handshake', '--enc-v', '1', '--', hs['handshake_id']])
+        accepted = subprocess.run(command, cwd=self.isolated, capture_output=True, text=True,
+                                 env={**os.environ, 'CLACK_USE_CURL': '0', 'PYTHONPATH': ''}, timeout=30)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
         with patch.dict(os.environ, {"CLACK_USE_CURL": "0"}):
             _, active = cli.req(saved, "GET", "/v1/handshakes", base=self.fixture.base)
         self.assertEqual((active["handshakes"][0]["status"], active["handshakes"][0]["enc_capable"]),
@@ -497,6 +509,22 @@ class InvitationHTTP(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(enc_v == 1 and question not in text and answer not in text for text, enc_v in rows))
         self.assertTrue(all(path.read_bytes() == data for path, data in before.items()))
+
+    def test_short_url_honors_pow_and_open_policy_without_prior_enrollment(self):
+        for index, gate in enumerate(('pow', 'open'), 1):
+            with self.subTest(gate=gate):
+                self.fixture.cfg['enrollment'] = gate
+                self.fixture.cfg['pow_difficulty'] = 8
+                invitation = self.mint()
+                path = str(Path(self.fixture.temp.name) / ('fresh-' + gate + '.json'))
+                self.cli_process(['redeem', invitation['link'], '--name', 'fresh-' + gate,
+                                  '--yes', '--expect-inviter', self.fixture.pub['alice']], path)
+                saved = cli.load_config(path)
+                self.assertEqual(saved['peer_name'], 'fresh-' + gate)
+                self.assertEqual(self.fixture.state(), (3 + index, index, index))
+                self.assertEqual(self.fixture.r.conn.execute(
+                    'SELECT enroll_gate FROM peers WHERE name=?', (saved['peer_name'],)
+                ).fetchone(), (gate,))
 
     def test_real_name_collision_preserves_seed_and_invite(self):
         invitation = self.mint()
