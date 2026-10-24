@@ -6,7 +6,7 @@ The canonical source for `tryclack.com` lives in `website/`. It is a static Verc
 
 - The website and public relay are separate deployments.
 - Do not publish website claims for a relay version until that version is running and verified at `https://relay.tryclack.com/health`.
-- Never place bearer tokens, private keys, v4 invitation fragments, or claim secrets in source, preview URLs, logs, screenshots, or release notes.
+- Never place bearer tokens, private keys, private invitation fragments, or claim secrets in source, preview URLs, logs, screenshots, or release notes. This includes the v1.2 short private capability URL; use only inert examples in public material.
 - A public `/join/<UUID>` request is non-secret, but pairing intent may still be private.
 
 ## Local validation
@@ -25,7 +25,7 @@ Validate JSON files and scan public text for stale release numbers before deploy
 
 The maintained public repository is `adroidian/clack` on GitHub. The website is not a substitute for publishing its matching source and documentation.
 
-Before the website goes live, verify that the `v1.1.0` tag resolves to the accepted release and that its README, QUICKSTART, JOIN, CLIENT_CONTRACT, CHANGELOG, `docs/short-invitations-v1.md`, served CLI and source-bundle links are publicly readable. Do not point new instructions at an absent tag. Preserve the accepted release tag and runtime/image pins; follow-up documentation-only corrections belong in a separate commit on `main`, not a retag or an implicit rebuild. Apply any documentation patch only in the coordinator's clean publication clone, never in an operator or frozen-source checkout.
+Before the website goes live, verify that the matching `v1.2.0` tag resolves to the accepted successor release and that its README, QUICKSTART, JOIN, CLIENT_CONTRACT, CHANGELOG, `docs/short-invitations-new-agents.md`, served CLI and source-bundle links are publicly readable. Retain `docs/short-invitations-v1.md` for the compatible existing-identity public-request flow. Do not point new instructions at an absent tag. Preserve the immutable `v1.1.0` tag and previous runtime/image pins; follow-up documentation-only corrections belong in a separate commit on `main`, not a retag or an implicit rebuild. Apply any documentation patch only in the coordinator's clean publication worktree, never in an operator or frozen-source checkout.
 
 ## Verify the existing publication target
 
@@ -60,7 +60,7 @@ Record the deployment ID and URL. Read back the custom domain, not only the gene
 ## Required public checks
 
 - `https://tryclack.com/` advertises the intended release.
-- `https://tryclack.com/join` distinguishes new-identity v4 capabilities from existing-identity short requests.
+- `https://tryclack.com/join` explains the v1.2 short private invitation for never-enrolled agents, including actor-local keys, named consent and separate acceptance; it distinguishes that flow from compatible existing-identity public requests and legacy private v4 invitations.
 - `https://tryclack.com/relay` matches live `/health` and the recommended User-Agent.
 - `https://tryclack.com/privacy` describes ciphertext, metadata, request URLs, and logs accurately.
 - `https://tryclack.com/llms.txt` and `https://tryclack.com/.well-known/clack-relay` match the rendered pages.
