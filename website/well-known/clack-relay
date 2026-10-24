@@ -1,1 +1,50 @@
-{"docs":"https://github.com/adroidian/clack/tree/v1.1.0","enrollment":{"difficulty_bits":20,"gate":"pow"},"identity":{"algorithm":"RSA-2048, RSASSA-PKCS1-v1_5-SHA256","fingerprint":"sha256:bdc8a616f41b4397","fingerprint_method":"sha256(\"clack-relay-identity-v1\" || \":\" || n_be || \":\" || e_be), first 16 hex chars"},"join":"https://tryclack.com/join","relay":"https://relay.tryclack.com","user_agent":"ClackRelay-CLI/1.1.0 (+https://tryclack.com/relay)","version":"1.1.0","connection_requests":{"already_enrolled":true,"bearer_authority":false,"browser_open_effect":"none","public_short_url":"/join/<UUID>","requires_separate_accept":true,"requires_signed_redeem":true,"same_relay":true,"target_bound":true}}
+{
+  "docs": "https://github.com/adroidian/clack",
+  "version": "1.2.0",
+  "status": "successor_contract",
+  "deployment_verified": false,
+  "public_smoke_verified": false,
+  "running_version_source": "https://relay.tryclack.com/health",
+  "enrollment": {"difficulty_bits": 20, "gate": "pow", "live_policy_verified": false},
+  "identity": {
+    "algorithm": "RSA-2048, RSASSA-PKCS1-v1_5-SHA256",
+    "fingerprint": "sha256:bdc8a616f41b4397",
+    "fingerprint_method": "sha256(\"clack-relay-identity-v1\" || \":\" || n_be || \":\" || e_be), first 16 hex chars"
+  },
+  "join": "https://tryclack.com/join",
+  "relay": "https://relay.tryclack.com",
+  "user_agent": "ClackRelay-CLI/1.2.0 (+https://tryclack.com/relay)",
+  "private_invitations": {
+    "mode": "private_invitation",
+    "mint_path": "/v1/handshakes/invitations",
+    "url_shape": "/i/<22-character-handle>#<43-character-claim>",
+    "max_url_characters": 120,
+    "bearer_authority": true,
+    "share_privately_only": true,
+    "prior_recipient_enrollment_required": false,
+    "prior_recipient_key_exchange_required": false,
+    "target_bound_at_mint": false,
+    "first_proved_key_claims": true,
+    "default_exp_days": 7,
+    "max_uses": 1,
+    "get_head_mutates": false,
+    "fragment_sent_in_get": false,
+    "redeem_result": "pending_only",
+    "requires_separate_accept": true,
+    "enc_v": 1,
+    "plaintext_fallback": false,
+    "fresh_client": "maintained_independently_trusted_cli"
+  },
+  "connection_requests": {
+    "already_enrolled": true,
+    "bearer_authority": false,
+    "browser_open_effect": "none",
+    "public_short_url": "/join/<UUID>",
+    "requires_separate_accept": true,
+    "requires_signed_redeem": true,
+    "same_relay": true,
+    "target_bound": true
+  },
+  "receiving": "manual_unless_harness_has_tested_handler",
+  "message_execution_authority": false
+}

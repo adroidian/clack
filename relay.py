@@ -40,7 +40,7 @@ import federation_cns  # signed-static CNS route authority (candidate-679-py-fed
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "clack-client"))  # noqa: E402
 from clack_client.envelope import native_payload  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 # BASE may be overridden for testing via CLACK_RELAY_BASE; production
 # always uses ~/workspace/clack-relay.
 BASE = os.environ.get("CLACK_RELAY_BASE", os.path.expanduser("~/workspace/clack-relay"))
@@ -905,6 +905,9 @@ _SCHEMA_MIGRATION_COLUMNS = {
         ("minter_enc_v", "INTEGER NOT NULL DEFAULT 0"),
         # NULL: legacy bearer. Non-NULL: public request, existing key only.
         ("target_identity", "TEXT"),
+        # Compact private invitation; NULL/0 leaves v4 and v1.1 unchanged.
+        ("short_invitation", "INTEGER NOT NULL DEFAULT 0"),
+        ("claimed_identity", "TEXT"),
     ),
 }
 # Table-level constraint openers: definitions starting with one of these
@@ -3193,6 +3196,13 @@ class Handler(BaseHTTPRequestHandler):
             "link_version": HANDSHAKE_LINK_VERSION,
             "link_format": "https://<relay>/join#v=4&r=<base64url relay url>&h=<handshake link id>&k=<claim secret>&by=<minter>&exp=<expiry epoch>&max=<max uses>",
             "fragment_params": ["r", "h", "k", "v", "by", "exp", "max"],
+            "private_invitation": {
+                "format": "https://<relay>/i/<22-character handle>#<43-character secret>",
+                "authority": "Short PRIVATE single-use enrollment capability. No prior recipient enrollment or key exchange. Keep the entire URL private; the fragment never reaches GET/access logs.",
+                "mint": "Signed POST /v1/handshakes/invitations with enc_v:1; no target key. Inviter mint is consent.",
+                "complete": "Use maintained client redeem with the entire URL; verify relay trust and exact inviter, preserve own keys, enroll if needed, then explicitly accept-handshake --enc-v 1. Redemption alone is pending; GET/HEAD never changes state.",
+                "retry": "Keep your original local identity. After response loss obtain a fresh challenge with invite_id, k and identity_pubkey, then retry proof with the SAME key. A different key cannot claim a consumed invite.",
+            },
             "public_request": {
                 "format": "https://<relay>/join/<public UUID>",
                 "authority": "Public request URL, not a secret capability. Existing target signing identity required; no enrollment.",
@@ -3340,7 +3350,8 @@ class Handler(BaseHTTPRequestHandler):
             "(Signed POST /v1/handshakes/accept.) Only then is messaging active.\n"
             "Inviter denial or expiry before acceptance prevents completion.\n"
             "New external agents cannot enroll using a public request URL.\n"
-            "Ask for a separate v4 one-time secret capability URL; keep it private.\n"
+            "Ask for a short PRIVATE /i/handle#secret invitation (mint-invitation)\n"
+            "for a never-enrolled agent; no prior key exchange. Keep it private.\n"
             "A downloaded client is executable code, not independent relay verification.\n"
         )
         if "application/json" in self.headers.get("Accept", ""):
@@ -3360,7 +3371,60 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _serve_short_invitation(self):
+        """Read-only instructions. Fragments/claims never reach this endpoint."""
+        handle = urlparse(self.path).path.removeprefix("/i/")
+        try:
+            raw = b64u_decode(handle)
+            if len(raw) != 16 or b64u_encode(raw) != handle:
+                raise ValueError("noncanonical handle")
+            link_id = str(uuid.UUID(bytes=raw))
+        except (ValueError, TypeError):
+            self._json(404, {"error": "not_found"})
+            return
+        with db_lock:
+            row = conn.execute(
+                "SELECT inviter_identity,exp FROM invites WHERE invite_id=? AND short_invitation=1",
+                (link_id,),
+            ).fetchone()
+        text = (
+            "Clack short PRIVATE invitation. Keep the entire URL private.\n"
+            "Its compact #fragment is a 256-bit enrollment capability, not a public request.\n"
+            "Opening this page never enrolls, consumes, accepts or sends messages.\n"
+            "Give the ENTIRE original URL (including #fragment) to your own agent.\n"
+            "Use the maintained independently trusted Clack client from https://github.com/adroidian/clack.\n"
+            "No prior enrollment or recipient public-key exchange is needed.\n"
+            "Run: python3 clack.py --config <your-private-config> redeem '<entire-private-URL>'\n"
+            "Review relay trust and the named inviter; create or preserve YOUR OWN local key.\n"
+            "Redemption returns PENDING only. Review then explicitly accept-handshake --enc-v 1.\n"
+            "Inviter mint is inviter consent; recipient acceptance is separate consent.\n"
+            "Messages confer no execution permission. Receiving/reply is manual unless your harness wires it.\n"
+        )
+        doc = {"mode": "private_invitation", "instructions": text,
+               "client_url": relay_base_url(relay_cfg).rstrip("/") + "/join/client"}
+        if row:
+            doc.update(inviter_identity=row[0], inviter_name_hint=peer_name_for_identity(row[0]), exp=row[1])
+        if "application/json" in self.headers.get("Accept", ""):
+            self._json(200, doc)
+            return
+        plain = "text/plain" in self.headers.get("Accept", "")
+        text += ("Inviter: %s (%s)\n" % (doc["inviter_name_hint"], row[0])) if row else ""
+        html = "<!doctype html><meta charset=utf-8><title>Clack private invitation</title><pre>" + text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "</pre>"
+        body = (text if plain else html).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8" if plain else "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def do_HEAD(self):
+        if re.fullmatch(r"/i/[A-Za-z0-9_-]{22}", urlparse(self.path).path):
+            self._serve_short_invitation()
+            return
         if re.fullmatch(r"/join/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", urlparse(self.path).path):
             self._serve_public_request_join()
         else:
@@ -3383,6 +3447,8 @@ class Handler(BaseHTTPRequestHandler):
             "<p>This relay speaks the Clack agent-to-agent protocol. "
             "Public request URLs (/join/UUID) require an existing target signing identity, "
             "signed redemption and separate recipient acceptance; opening them does nothing. "
+            "For a never-enrolled agent, ask the inviter to run mint-invitation: a short PRIVATE "
+            "/i/handle#secret URL needs no prior recipient key exchange and returns pending until explicit accept. "
             "The v4 links below are one-time secret capability URLs, not public requests.</p>\n"
             "<ol>\n"
             "<li>Download the client: "
@@ -3509,6 +3575,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Public bootstrap endpoints for self-contained onboarding (v0.2.8).
         # These come before auth on purpose: an invitee has no credentials yet.
+        if re.fullmatch(r"/i/[A-Za-z0-9_-]{22}", parsed.path):
+            self._serve_short_invitation()
+            return
         if parsed.path in ("/join", "/join/"):
             self._serve_join()
             return
@@ -3864,9 +3933,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         peer = self._require_auth(require_signature=True) if parsed.path in (
             "/v1/handshakes/requests", "/v1/handshakes/requests/redeem",
-            "/v1/handshakes/accept",
+            "/v1/handshakes/accept", "/v1/handshakes/invitations",
         ) else self._require_auth()
         if peer is None:
+            return
+        if parsed.path == "/v1/handshakes/invitations":
+            self._handle_handshake_mint(peer, now, short_invitation=True)
             return
         if parsed.path == "/v1/handshakes/requests":
             self._handle_handshake_mint(peer, now, public_request=True)
@@ -4468,17 +4540,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with db_lock:
                 row = conn.execute(
-                    "SELECT exp, max_uses, uses, revoked, target_identity"
+                    "SELECT exp, max_uses, uses, revoked, target_identity,"
+                    " short_invitation,claimed_identity,secret_hash"
                     " FROM invites WHERE invite_id=?",
                     (invite_id,),
                 ).fetchone()
-            if row is None or row[4] is not None:
+            if row is None or (row[4] is not None and not row[5]):
                 # Public requests never authorize enrollment. Match unknown
                 # IDs before looking at lifecycle state or creating a nonce.
                 self._json(404, {"error": "invite_not_found"})
                 return
-            exp, max_uses, uses, revoked, _target = row
-            if revoked or exp <= now or uses >= max_uses:
+            exp, max_uses, uses, revoked, _target, short, claimed, secret_hash = row
+            retry = False
+            if short:
+                try:
+                    claim_hash = "s1:" + hashlib.sha256(b64u_decode(body.get("k"))).hexdigest()
+                except ValueError:
+                    claim_hash = ""
+                if not hmac.compare_digest(claim_hash, secret_hash):
+                    self._json(403, {"error": "invite_unusable"})
+                    return
+                retry = claimed is not None and claimed == body.get("identity_pubkey")
+            if revoked or exp <= now or (uses >= max_uses and not retry):
                 # One error on purpose: don't leak which condition failed.
                 self._json(410, {"error": "invite_unusable"})
                 return
@@ -4824,7 +4907,7 @@ class Handler(BaseHTTPRequestHandler):
                 return value, row[0]
         return None, None
 
-    def _handle_handshake_mint(self, peer, now, public_request=False):
+    def _handle_handshake_mint(self, peer, now, public_request=False, short_invitation=False):
         body = self._read_json()
         if not isinstance(body, dict):
             self._json(400, {"error": "invalid_json"})
@@ -4833,6 +4916,12 @@ class Handler(BaseHTTPRequestHandler):
         exp_days = body.get("exp_days", 7)
         note = body.get("note")
         target = None
+        if short_invitation and (max_uses != 1 or "target_identity" in body or "k" in body):
+            self._json(400, {"error": "private_invitation_single_use_only"})
+            return
+        if short_invitation and len(relay_base_url(relay_cfg).rstrip("/")) + len("/i/") + 22 + 1 + 43 > 120:
+            self._json(400, {"error": "private_invitation_origin_too_long"})
+            return
         if public_request:
             target = body.get("target_identity")
             try:
@@ -4854,7 +4943,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
         # E2EE: stored on the invite row, copied at redeem, ANDed with
         # the redeemer's advertisement at accept.
-        minter_enc_v = body.get("enc_v", 0)
+        minter_enc_v = body.get("enc_v", 1 if short_invitation else 0)
         if not _is_strict_enc_v(minter_enc_v):
             self._json(400, {"error": "bad_enc_v"})
             return
@@ -4920,11 +5009,11 @@ class Handler(BaseHTTPRequestHandler):
                     """INSERT INTO invites(invite_id, secret_hash, inviter_identity,
                                            exp, max_uses, uses, revoked, created_at,
                                            grant_handshake, note, minter_enc_v,
-                                           target_identity)
-                       VALUES(?,?,?,?,?,0,0,?,1,?,?,?)""",
+                                           target_identity, short_invitation)
+                       VALUES(?,?,?,?,?,0,0,?,1,?,?,?,?)""",
                     (
                         link_id,
-                        "" if public_request else hashlib.sha256(secret).hexdigest(),
+                        "" if public_request else ("s1:" if short_invitation else "") + hashlib.sha256(secret).hexdigest(),
                         ident,
                         exp,
                         max_uses,
@@ -4932,6 +5021,7 @@ class Handler(BaseHTTPRequestHandler):
                         note,
                         minter_enc_v,
                         target,
+                        int(short_invitation),
                     ),
                 )
                 conn.execute("COMMIT")
@@ -4941,6 +5031,16 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
                 raise
+        if short_invitation:
+            # 128-bit record handle + 256-bit claim. Only the non-secret
+            # handle reaches GET, previews or access logs. No URL resolver.
+            handle = b64u_encode(uuid.UUID(link_id).bytes)
+            self._json(200, {
+                "link": relay_base_url(relay_cfg).rstrip("/") + "/i/" + handle + "#" + b64u_encode(secret),
+                "link_id": link_id, "exp": exp, "max_uses": 1,
+                "mode": "private_invitation", "inviter_identity": ident,
+            })
+            return
         if public_request:
             self._json(200, {
                 "link": relay_base_url(relay_cfg).rstrip("/") + "/join/" + link_id,
@@ -4988,13 +5088,23 @@ class Handler(BaseHTTPRequestHandler):
         if request_peer is None:
             with db_lock:
                 public = conn.execute(
-                    "SELECT target_identity FROM invites WHERE invite_id=?", (h,)
+                    "SELECT target_identity,short_invitation,secret_hash FROM invites WHERE invite_id=?", (h,)
                 ).fetchone()
-            if public is not None and public[0] is not None:
+            if public is not None and public[0] is not None and not public[1]:
                 # Public UUIDs aren't secrets: unauthenticated legacy
                 # probes must not poison the intended target's link budget.
                 self._json(403, {"error": "link_unusable"})
                 return
+            if public is not None and public[1]:
+                # The GET handle is non-secret. Probes without the private
+                # fragment must not poison the real claimant's link budget.
+                try:
+                    probe_hash = "s1:" + hashlib.sha256(b64u_decode(k)).hexdigest()
+                except ValueError:
+                    probe_hash = ""
+                if not hmac.compare_digest(probe_hash, public[2]):
+                    self._json(403, {"error": "link_unusable"})
+                    return
         # Untrusted legacy IDs are strings; authenticated-public budgets are
         # tuples. No chosen string on either legacy redeem route can collide.
         budget = h if request_peer is None else ("public", request_peer, h)
@@ -5020,7 +5130,9 @@ class Handler(BaseHTTPRequestHandler):
         # fresh enrollment inline below.
         peer = request_peer
         if request_peer is None and self.headers.get("Authorization"):
-            peer = self._require_auth()
+            # New private invitations require real key proof even on a
+            # trusted-proxy network; legacy v4 auth policy stays compatible.
+            peer = self._require_auth(require_signature=bool(public and public[1]))
             if peer is None:
                 return
         # Fast-path link validation. The single-UPDATE use-count inside
@@ -5028,14 +5140,15 @@ class Handler(BaseHTTPRequestHandler):
         with db_lock:
             inv = conn.execute(
                 """SELECT secret_hash, inviter_identity, exp, max_uses, uses,
-                          revoked, grant_handshake, minter_enc_v, target_identity
+                          revoked, grant_handshake, minter_enc_v, target_identity,
+                          short_invitation, claimed_identity
                    FROM invites WHERE invite_id=?""",
                 (h,),
             ).fetchone()
         if inv is None:
             link_fail()
             return
-        secret_hash, minter, exp, max_uses, uses, revoked, gh, minter_enc_v, target = inv
+        secret_hash, minter, exp, max_uses, uses, revoked, gh, minter_enc_v, target, short, claimed = inv
         minter_enc_v = minter_enc_v or 0
         # NOTE: the use-count is deliberately NOT checked here. A retry
         # of a live pending whose link is at max_uses (the final-use
@@ -5047,11 +5160,11 @@ class Handler(BaseHTTPRequestHandler):
             link_fail()
             return
         if request_peer is not None:
-            if target is None or caller_identity(request_peer) != target:
+            if short or target is None or caller_identity(request_peer) != target:
                 link_fail()
                 return
         else:
-            if target is not None:
+            if target is not None and not short:
                 link_fail()
                 return
             try:
@@ -5059,7 +5172,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 link_fail()
                 return
-            if not hmac.compare_digest(hashlib.sha256(secret).hexdigest(), secret_hash):
+            if not hmac.compare_digest(("s1:" if short else "") + hashlib.sha256(secret).hexdigest(), secret_hash):
                 link_fail()
                 return
         # N's identity comes from the mint record. The `by` fragment field
@@ -5206,6 +5319,37 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute("ROLLBACK")
                     link_fail()
                     return
+                if short:
+                    # Bind one capability to its FIRST proved identity inside
+                    # the enrollment/pair transaction, before idempotency.
+                    current = conn.execute(
+                        "SELECT revoked,exp,claimed_identity,uses,max_uses,secret_hash"
+                        " FROM invites WHERE invite_id=? AND short_invitation=1",
+                        (h,),
+                    ).fetchone()
+                    if (current is None or current[0] or current[1] <= now2
+                            or current[2] not in (None, redeemer)
+                            or current[5] != secret_hash
+                            or (current[2] is None and current[3] >= current[4])):
+                        conn.execute("ROLLBACK")
+                        link_fail()
+                        return
+                    if current[2] is None:
+                        if enroll is not None and requested_name is not None:
+                            taken = conn.execute(
+                                "SELECT identity_pubkey FROM peers WHERE name=?", (requested_name,),
+                            ).fetchone()
+                            retired = conn.execute(
+                                "SELECT 1 FROM retired_names WHERE name=?", (requested_name,),
+                            ).fetchone()
+                            if retired or (taken and taken[0] != redeemer):
+                                conn.execute("ROLLBACK")
+                                self._json(409, {"error": "requested_name_unavailable"})
+                                return
+                        conn.execute(
+                            "UPDATE invites SET claimed_identity=?,target_identity=?,uses=uses+1 WHERE invite_id=?",
+                            (redeemer, redeemer, h),
+                        )
                 if conn.execute(
                     "SELECT 1 FROM link_revocations WHERE link_id=?"
                     " AND a_identity=? AND b_identity=?",
@@ -5226,7 +5370,7 @@ class Handler(BaseHTTPRequestHandler):
                     (a, b),
                 ).fetchone()
                 replace_pending = (
-                    request_peer is not None and hs2 is not None
+                    (request_peer is not None or short) and hs2 is not None
                     and hs2[0] == "pending" and hs2[5] != h
                 )
                 if hs2 is not None and (
@@ -5239,7 +5383,7 @@ class Handler(BaseHTTPRequestHandler):
                         # The public backing request h was validated above
                         # under this same write lock. A different request is
                         # a new ceremony, never an idempotent retry of it.
-                        and (request_peer is None or hs2[5] == h)
+                        and ((request_peer is None and not short) or hs2[5] == h)
                     )
                 ):
                     # Idempotent no-op: active, or a live pending owned by
@@ -5377,13 +5521,20 @@ class Handler(BaseHTTPRequestHandler):
                     # consume one use in one statement. Proceed only if
                     # exactly one row was updated -- concurrent redeems
                     # against max_uses=N yield exactly N successes.
-                    cur = conn.execute(
-                        """UPDATE invites SET uses = uses + 1
-                           WHERE invite_id=? AND revoked=0 AND exp > ?
-                             AND uses < max_uses AND grant_handshake=1""",
-                        (h, now2),
-                    )
-                    if cur.rowcount != 1:
+                    if not short:
+                        cur = conn.execute(
+                            """UPDATE invites SET uses = uses + 1
+                               WHERE invite_id=? AND revoked=0 AND exp > ?
+                                 AND uses < max_uses AND grant_handshake=1""",
+                            (h, now2),
+                        )
+                        if cur.rowcount != 1:
+                            conn.execute("ROLLBACK")
+                            link_fail()
+                            return
+                    elif current[2] is not None:
+                        # A consumed claim can recover its live ceremony, not
+                        # recreate a lapsed or superseded one.
                         conn.execute("ROLLBACK")
                         link_fail()
                         return
@@ -5400,7 +5551,7 @@ class Handler(BaseHTTPRequestHandler):
                             enroll_ip=ip,
                         )
                     pending_exp = now2 + HANDSHAKE_PENDING_WINDOW
-                    if target is not None:
+                    if target is not None or short:
                         pending_exp = min(exp, pending_exp)
                     expires_at = (
                         now2 + HS_EXPIRY_DAYS * 86400.0
@@ -5532,11 +5683,13 @@ class Handler(BaseHTTPRequestHandler):
                          AND pending_expires_at > ? AND generation=?
                          AND NOT EXISTS (
                              SELECT 1 FROM invites i WHERE i.invite_id=via_link_id
-                             AND i.target_identity IS NOT NULL
-                             AND (i.revoked!=0 OR i.exp<=? OR i.target_identity!=?)
+                             AND (i.target_identity IS NOT NULL OR i.short_invitation=1)
+                             AND (i.revoked!=0 OR i.exp<=?
+                                  OR (i.target_identity IS NOT NULL AND i.target_identity!=?)
+                                  OR (i.short_invitation=1 AND i.claimed_identity!=?))
                          )""",
                     (now2, new_redeemer_enc_v, new_enc_capable,
-                     a, b, me, now2, gen, now2, me),
+                     a, b, me, now2, gen, now2, me, me),
                 )
                 if cur.rowcount == 1:
                     accepted = True

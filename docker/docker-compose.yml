@@ -11,7 +11,7 @@ services:
     # working amd64 emulation; this package does not claim a native ARM image.
     platform: linux/amd64
     build: .
-    image: clack-relay:1.1.0
+    image: clack-relay:1.2.0
     container_name: clack-relay
     restart: unless-stopped
     ports:

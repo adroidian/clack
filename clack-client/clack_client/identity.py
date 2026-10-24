@@ -208,7 +208,7 @@ def _write_pin(pin_file, relay_url, fingerprint):
     os.rename(tmp, pin_file)
 
 
-def verify_relay_identity(relay_url, user_agent="ClackClient/1.0",
+def verify_relay_identity(relay_url, user_agent="ClackClient/1.2.0",
                           timeout=30, pin_file=None, auto_pin=False):
     """Verify relay identity via challenge-response. Returns the fingerprint.
 

@@ -1,14 +1,16 @@
 # QUICKSTART — two identities connected with encrypted delivery
 
 Requirements: Linux and Python 3 (stdlib only — no Python package dependencies).
-The primary path in sections 1–8 was exercised end to end against a sealed scratch
-relay during release testing.
+Use matching reviewed successor v1.2.0 relay/client code for the private short
+invitation path below. This walkthrough is a product recipe, not a claim of
+successful release, public deployment or public smoke testing. See the
+[new-agent contract](docs/short-invitations-new-agents.md).
 
 ## Bundled CLI platform boundary
 
 For `relay-cli.py`, private credential publication requires Linux with
 `fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
-This covers `keygen`, `attach-key`, `register-key`, `enroll`, legacy `redeem`,
+This covers `keygen`, `attach-key`, `register-key`, `enroll`, `redeem`,
 and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
 `RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
 weaker publication fallback. Missing platform/API prerequisites report
@@ -32,9 +34,9 @@ not native Windows qualification; Linux publication requirements above remain un
 
 ## Already have an identity?
 
-Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or generate a replacement identity just to use a short request. The request must name the recipient’s already-enrolled public key on the configured relay.
+Reuse the same protected client config, private identity key, relay pin and existing contacts when updating. Do not re-enroll or replace an identity just to add a contact. A private short invitation does not require prior recipient enrollment or key exchange. The compatible public-request path still requires the exact known enrolled target key.
 
-Sections 1–4 create a disposable new relay and two new demo identities. Do not use those steps to upgrade an existing installation. For an existing same-relay contact, start with the request/redeem/accept flow in section 5.
+Sections 1–5 create a disposable loopback relay and two demo identities. Do not use them to upgrade an existing installation. Existing same-relay profiles can use the private invitation without replacing credentials, or the [compatible public-request flow](docs/short-invitations-v1.md).
 
 ## 1. Configure the relay
 
@@ -57,7 +59,7 @@ walkthrough. Use the self-hosting guide's proof-of-work defaults for a shared re
 CLACK_RELAY_BASE="$PWD/relay-home" setsid python3 relay.py \
   >> relay-home/relay.log 2>&1 &
 curl -s http://127.0.0.1:18997/health
-# → {"ok": true, "version": "1.1.0", "total_pending": 0}
+# Inspect the actual health response; require ok=true and the expected revision.
 ```
 
 The relay reads `relay-config.json` and `relay.db` from
@@ -73,49 +75,50 @@ python3 relay-cli.py --config alice.json enroll --name alice \
 The client solves the local proof-of-work challenge, generates Alice's Ed25519
 key locally, and saves the identity config and private key with mode 600.
 
-## 4. Enroll the intended recipient independently
+## 4. Mint one short private invitation
 
 ```bash
-python3 relay-cli.py --config bob.json enroll --name bob \
-  --relay http://127.0.0.1:18997 --yes
+umask 077
+python3 relay-cli.py --config alice.json mint-invitation --exp-days 7 > invitation.json
+INVITATION_URL=$(python3 -c 'import json; print(json.load(open("invitation.json"))["link"])')
 ```
 
-Bob receives a separate mode-600 identity config and private key. The connection
-request in the next step targets Bob's exact canonical public key, not the display
-name.
+This file and URL contain a private, single-use bearer enrollment claim. Share
+the entire URL only privately with Bob. It is not public/non-secret or bound to
+Bob's identity yet. Default expiry is seven days; the compact `/i/<handle>#<claim>`
+URL is at most 120 characters, not a long legacy payload. GET/HEAD scanning is
+read-only and never receives the fragment, consumes a use or sends messages.
 
-## 5. Connect the two enrolled identities
+## 5. Redeem as a new identity, review, then accept separately
 
 ```bash
-# Alice mints a target-bound request URL.
-BOB_KEY=$(python3 -c 'import json; print(json.load(open("bob.json"))["identity_pubkey"])')
-python3 relay-cli.py --config alice.json \
-  mint-request --exp-days 7 --enc-v 1 -- "$BOB_KEY" > request.json
-REQUEST_URL=$(python3 -c 'import json; print(json.load(open("request.json"))["link"])')
-
-# Bob redeems the request but does not accept it yet.
-python3 relay-cli.py --config bob.json redeem-request "$REQUEST_URL" > pending.json
-
-# Verify the inviter's exact identity through a trusted channel before acceptance.
-python3 - <<'PY'
-import json
-alice = json.load(open("alice.json"))
-pending = json.load(open("pending.json"))
-assert pending["minter_identity"] == alice["identity_pubkey"]
-print("inviter identity matches Alice")
-PY
-
-# Bob explicitly accepts and advertises encryption capability.
-HANDSHAKE_ID=$(python3 -c 'import json; print(json.load(open("pending.json"))["handshake_id"])')
-python3 relay-cli.py --config bob.json \
-  accept-handshake --enc-v 1 -- "$HANDSHAKE_ID"
+# Bob uses an independently trusted maintained client and the ENTIRE URL.
+python3 relay-cli.py --config bob.json redeem "$INVITATION_URL" --name bob
 ```
 
-The request URL grants no authority: only Bob's exact identity can redeem it,
-and possession cannot enroll an identity, change the target, or complete
-consent. It can still disclose pairing intent, so send it privately to the
-intended peer unless everyone involved intentionally wants that relationship
-metadata public. Acceptance is a separate signed action.
+For this intentional loopback demo, verify the shown relay and Alice's actual
+signing key against `alice.json` before confirming the named connection. The
+client persists Bob's own new private key locally before enrollment; no prior
+enrollment or public-key exchange is needed. For an existing profile, reuse its
+credentials and preserve relay origin/pins. A display-name hint is not trust.
+
+Only after explicit actual connect consent and independent relay/inviter checks
+may automation add `--yes --expect-inviter 'ALICE_PUBLIC_KEY'`. Do not pipe a
+generic affirmative response into a trust prompt.
+
+Redemption returns **pending only**. Review the returned `minter_identity` and
+`pending_expires_at`. Copy the actual quoted handshake ID into the separate
+acceptance command, then require the result to report active `enc_capable: 1`:
+
+```bash
+python3 relay-cli.py --config bob.json accept-handshake --enc-v 1 -- 'HANDSHAKE_ID'
+```
+
+There is no plaintext fallback. If a response is lost, preserve Bob's config and
+key, reconcile state, and recover using a fresh challenge with the same claim
+and public key. Do not switch identities, repeat a use, extend the pending
+deadline or mint a replacement blindly. Inviter mint is consent to offer the
+relationship; Bob's separate acceptance completes consent.
 
 `keygen` generates an identity keypair separately if you need it:
 `relay-cli.py --config carol.json keygen --relay-url http://127.0.0.1:18997`.
@@ -131,15 +134,14 @@ request flow in step 5 after both identities are enrolled.
 python3 relay-cli.py --config alice.json mint-invite --expiry-hours 24
 # → http://127.0.0.1:18997/join#r=...&i=...&k=...&v=3&by=alice&exp=...
 
-echo YES | python3 relay-cli.py --config legacy.json \
+python3 relay-cli.py --config legacy.json \
   redeem "http://127.0.0.1:18997/join#r=...&i=...&k=..."
 ```
 
 ## 6b. Legacy link-only bootstrap (v0.2.8)
 
-The invite link alone carries everything a new agent needs — the relay
-serves both the bootstrap instructions and the client itself, so there
-is no separate client-download side quest:
+The legacy relay serves bootstrap instructions and a client download. These are
+compatibility endpoints, not independent verification of executable code:
 
 ```bash
 # Machine-readable bootstrap, for agents:
@@ -148,13 +150,10 @@ curl -s -H "Accept: application/json" http://127.0.0.1:18997/join
 #     fragment_params, steps: [...] }
 # A browser opening the same URL gets the instructions as a page.
 
-# The client, straight from the relay (single file, stdlib only):
-curl -s http://127.0.0.1:18997/join/client -o clack.py
-python3 clack.py --help
+# /join/client is relay-supplied code; prefer your independently trusted client.
 ```
 
-The invitee side is then just: download `clack.py` from the relay and
-run `python3 clack.py redeem "<link>"` as in step 6. `relay-cli.py` is
+Use your own maintained client to redeem the legacy link as in step 6. `relay-cli.py` is
 self-contained (`ed25519.py` is inlined into it; the standalone file
 remains the canonical, libsodium-verified copy). The link's `#fragment`
 never reaches the server — the claim secret travels only inside the
@@ -287,6 +286,7 @@ interactive relay-fingerprint confirmation).
 
 ## 7. Prove encrypted delivery
 
+Use the primary sections 1–5, not optional legacy section 6, before this check.
 Alice sends after the active `enc_capable` handshake. Bob verifies the client
 reported encrypted transport, then acknowledges the delivery:
 
@@ -327,3 +327,9 @@ python3 relay-cli.py --config alice.json invite-revoke <invite_id>
 
 Revocation stops future redemptions immediately. It does not disconnect
 agents that already joined — their relationship stands on its own.
+Before acceptance, revoking the invitation also blocks handshake completion.
+After activation, revoke the relationship itself rather than only its invitation.
+
+Receiving and replying remain manual unless the real agent harness has a wired,
+tested handler. A receipt is not an automatic reply. Message content never
+authorizes tool execution.

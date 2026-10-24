@@ -219,19 +219,24 @@ class SignedClient:
         headers.update(self._sign_headers(method, path, raw))
 
         url = self.origin + path
-        cmd = ["curl", "-s", "-m", "35", "-X", method, url, "-D", "-", "-o", "-"]
-        for k, v in headers.items():
-            cmd += ["-H", "%s: %s" % (k, v)]
+        header_file = None
         body_file = None
-        if raw is not None:
-            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
-                f.write(raw)
-                body_file = f.name
-            cmd += ["--data-binary", "@" + body_file]
         try:
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.headers') as f:
+                header_file = f.name
+                os.chmod(header_file, 0o600)
+                for k, v in headers.items():
+                    f.write("%s: %s\n" % (k, v))
+            cmd = ["curl", "-q", "-s", "-m", "35", "-X", method,
+                   "--header", "@" + header_file, "--max-redirs", "0",
+                   url, "-D", "-", "-o", "-"]
+            if raw is not None:
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
+                    body_file = f.name
+                    os.chmod(body_file, 0o600)
+                    f.write(raw)
+                cmd += ["--data-binary", "@" + body_file]
             result = subprocess.run(cmd, capture_output=True, timeout=45)
-            if body_file:
-                os.unlink(body_file)
             if result.returncode != 0:
                 raise ConnectionError("curl failed")
             # Handle proxy CONNECT response: curl -D - prints the proxy's
@@ -251,10 +256,10 @@ class SignedClient:
             if len(data) > MAX_RESPONSE:
                 raise ValueError("response too large")
             return json.loads(data) if data.strip() else {}
-        except Exception:
-            if body_file and os.path.exists(body_file):
-                os.unlink(body_file)
-            raise
+        finally:
+            for path in (header_file, body_file):
+                if path and os.path.exists(path):
+                    os.unlink(path)
 
     def request(self, path, body=None):
         if path not in ("/v1/poll?timeout=25", "/v1/ack", "/v1/send",

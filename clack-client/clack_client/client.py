@@ -53,7 +53,7 @@ def _is_transient(exc) -> bool:
 
 class ClackClient:
     def __init__(self, relay_url, token, privkey_path, peer_name,
-                 user_agent="ClackClient/1.0", timeout=30,
+                 user_agent="ClackClient/1.2.0", timeout=30,
                  pin_file=None, auto_pin=False):
         self.relay_url = relay_url.rstrip("/")
         self.token = token
@@ -384,6 +384,78 @@ class ClackClient:
         if not hid:
             raise ClackError(f"redeem did not return handshake_id: {result}")
         return hid
+
+    def mint_invitation(self, exp_days=7):
+        """Mint a private single-use short URL (enc_v=1), never blind-retry.
+
+        Returns full metadata, including the secret-bearing URL. Keep it
+        private. Unknown outcomes require list/readback reconciliation.
+        """
+        from .invitations import parse_invitation_url, validate_invitation_expiry, canonical_key
+        try:
+            validate_invitation_expiry(exp_days)
+        except ValueError as exc:
+            raise ClackError(str(exc)) from exc
+        self._require_invitation_identity()
+        result = self._request("POST", "/v1/handshakes/invitations",
+                               {"exp_days": exp_days, "enc_v": 1})
+        try:
+            parsed = parse_invitation_url(result["link"], self.relay_url)
+            canonical_key(result.get("inviter_identity"))
+            if (result.get("mode") != "private_invitation"
+                    or result.get("max_uses") != 1 or result.get("link_id") != parsed["h"]
+                    or len(result["link"]) > 120):
+                raise ValueError("unexpected invitation metadata")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ClackError("Invalid mint response; outcome UNKNOWN, reconcile before retrying") from exc
+        return result
+
+    def list_invitations(self):
+        """Read-only mint reconciliation; secrets cannot be recovered by list."""
+        self._require_invitation_identity()
+        return self._request("GET", "/v1/invites/list", idempotent=True)
+
+    def redeem_invitation(self, url, *, confirm=False, expect_inviter=None):
+        """Existing enrolled identity only; explicit named connect consent.
+
+        Fresh agents use relay-cli.py redeem URL --name NAME --yes
+        --expect-inviter KEY, which owns durable private key storage. This
+        method never enrolls, rotates keys, changes tokens, accepts or greets.
+        Call accept_handshake separately after reviewing the pending result.
+        """
+        from .invitations import parse_invitation_url, canonical_key
+        try:
+            parsed = parse_invitation_url(url, self.relay_url)
+            canonical_key(expect_inviter)
+            if confirm is not True:
+                raise ValueError("explicit connect consent (confirm=True) is required")
+        except ValueError as exc:
+            raise ClackError(str(exc)) from exc
+        self._require_invitation_identity()
+        # Constructor already verified/pinned this configured relay. This
+        # public metadata GET never releases auth, signature or claim secret.
+        status, raw = transport.request("GET", self.relay_url + parsed["path"],
+            {"Accept": "application/json", "User-Agent": self.user_agent},
+            None, self.timeout)
+        try:
+            metadata = json.loads(raw.decode())
+            if (status != 200 or metadata.get("mode") != "private_invitation"
+                    or canonical_key(metadata.get("inviter_identity")) != expect_inviter):
+                raise ValueError("invitation unavailable or inviter identity mismatch")
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ClackError("Invitation unavailable or inviter identity mismatch") from exc
+        result = self._request("POST", "/v1/handshakes/redeem",
+                               {"h": parsed["h"], "k": parsed["k"]})
+        if (not isinstance(result, dict) or result.get("status") != "pending"
+                or not result.get("handshake_id") or result.get("minter_identity") != expect_inviter):
+            raise ClackError("Redeem outcome UNKNOWN: expected pending handshake; reconcile before retrying")
+        return result
+
+    def _require_invitation_identity(self):
+        if not self._seed or not self.token or not self.peer_name:
+            raise ClackError("SDK private invitations require an enrolled signing identity; "
+                             "fresh recipients use relay-cli.py redeem URL --name NAME "
+                             "--yes --expect-inviter KEY for durable private key storage")
 
     def mint_handshake_request(self, target_identity, exp_days=7, enc_v=0):
         """Mint a public, single-use request for an already-enrolled identity.
