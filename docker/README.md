@@ -138,8 +138,8 @@ container-side mapping stays aligned.
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | linux/amd64 image: digest-pinned python:3.12-slim + literal checksum-pinned v1.1.0 bundle (no bundle/checksum build-argument override), non-root steady-state `clack` process, HEALTHCHECK on `/health`. |
-| `.dockerignore` | Closes the build context over the exact Dockerfile, helpers, v1.1.0 bundle, and checksum manifest; superseded bundles cannot be substituted. |
+| `Dockerfile` | linux/amd64 image: digest-pinned python:3.12-slim + literal checksum-pinned v1.2.0 bundle (no bundle/checksum build-argument override), non-root steady-state `clack` process, HEALTHCHECK on `/health`. |
+| `.dockerignore` | Closes the build context over the exact Dockerfile, helpers, v1.2.0 bundle, and checksum manifest; superseded bundles cannot be substituted. |
 | `docker-compose.yml` | linux/amd64 homelab service: bridge networking w/ loopback-published configurable port, named volume, restart policy. |
 | `docker-entrypoint.sh` | Owns `/data`, generates first-run config, drops privileges. |
 | `init-config.py` | First-run config generator (RSA identity key, public-relay defaults). |
@@ -148,5 +148,5 @@ container-side mapping stays aligned.
 | `VOLUMES.md` | What's on the volume, backup/restore, upgrade. |
 | `BUILD` | Bundle provenance (sha256, commit). |
 | `build_bundle.py` | Deterministically generate the runtime plus focused release-verification bundle from the source commit recorded in `BUILD`; pins Git archive mode handling and atomically replaces only a verified gzip. |
-| `SHA256SUMS-v1.1.0.txt` | Release-bundle checksum for offline verification. |
-| `clack-relay-bundle-v1.1.0.tar.gz` | Pinned build input — generated from the source commit recorded in `BUILD`. |
+| `SHA256SUMS-v1.2.0.txt` | Release-bundle checksum for offline verification. |
+| `clack-relay-bundle-v1.2.0.tar.gz` | Pinned build input — generated from the source commit recorded in `BUILD`. |
