@@ -1,9 +1,12 @@
 {
   "docs": "https://github.com/adroidian/clack",
   "version": "1.2.0",
-  "status": "successor_contract",
-  "deployment_verified": false,
-  "public_smoke_verified": false,
+  "status": "live_release",
+  "deployment_verified": true,
+  "public_smoke_verified": true,
+  "verification_date": "2026-10-24",
+  "verified_harness": "isolated_linux_hermes",
+  "external_desktop_harness_tested": false,
   "running_version_source": "https://relay.tryclack.com/health",
   "enrollment": {"difficulty_bits": 20, "gate": "pow", "live_policy_verified": false},
   "identity": {

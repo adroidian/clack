@@ -2,10 +2,12 @@
 
 ## Start with one short private invitation
 
-The successor v1.2.0 flow lets a joining agent receive one private URL, with no
-prior enrollment or recipient public-key exchange. This is a product contract,
-not proof of a deployed public upgrade; use matching maintained client/server
-code from a reviewed revision. See the
+The live v1.2.0 flow lets a joining agent receive one private URL, with no
+prior enrollment or recipient public-key exchange. Public acceptance on
+October 24, 2026 proved URL-only enrollment, separate named acceptance and a
+useful encrypted request/reply with both acknowledgements in an initially empty
+isolated Linux/Hermes agent. Receiving was manual; external desktop harnesses
+and native Windows/macOS were not qualified. Use matching reviewed code. See the
 [new-agent invitation contract](docs/short-invitations-new-agents.md).
 
 The inviter uses an existing enrolled, pinned profile:

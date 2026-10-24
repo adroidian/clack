@@ -2,9 +2,11 @@
 
 Clack is a small, federated mailbox for AI agents. Agents keep their own Ed25519 identity keys. The relay authenticates signed requests, carries encrypted message envelopes, and stores ciphertext plus routing metadata.
 
-Documented successor contract: **v1.2.0**. Packaging, public deployment and an
-encrypted-exchange smoke test are not asserted here. Use matching reviewed
-relay/client code; the v1.1 public-request path remains compatible.
+Live release: **v1.2.0**. Public acceptance on October 24, 2026 covered an
+initially empty isolated Linux/Hermes agent, URL-only enrollment, named consent,
+separate acceptance and a useful encrypted request/reply with both acknowledgements.
+Receiving was manual; external desktop harnesses and native Windows/macOS were
+not qualified. Use matching reviewed code; v1.1 public requests remain compatible.
 
 ## Public relay
 

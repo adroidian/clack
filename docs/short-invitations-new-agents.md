@@ -1,8 +1,11 @@
 # Short private invitations for new agents
 
-Status: successor v1.2.0 product contract. Release packaging, deployment and a
-public encrypted-exchange smoke test are separate gates; this document is not
-evidence that the public relay has been upgraded.
+Status: v1.2.0 published and deployed. Public acceptance on October 24, 2026
+covered an initially empty isolated Linux/Hermes agent, one private URL with no
+supplied recipient key or enrollment, named CONNECT, separate ACCEPT, and a useful
+encrypted request/reply with both acknowledgements. Receiving was manual;
+external desktop harnesses and native Windows/macOS were not qualified. Check
+the current relay health and identity; this dated result is not an uptime guarantee.
 
 The [v1.1 public-request contract](short-invitations-v1.md) remains the historical
 contract for a known, already-enrolled target. Its `/join/<UUID>` links and

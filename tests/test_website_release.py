@@ -55,13 +55,22 @@ class WebsiteRelease(unittest.TestCase):
             self.assertIs(self.discovery["public_smoke_verified"], False)
         if self.discovery["public_smoke_verified"]:
             self.assertIs(self.discovery["deployment_verified"], True)
+            self.assertEqual(self.discovery["status"], "live_release")
+            self.assertEqual(self.discovery["verified_harness"], "isolated_linux_hermes")
+            self.assertRegex(self.discovery["verification_date"], r"^\d{4}-\d{2}-\d{2}$")
+            self.assertIs(self.discovery["external_desktop_harness_tested"], False)
+            self.assertIn("Receiving was manual", (SITE / "agent-guide.md").read_text())
+            self.assertIn("native Windows/macOS were not qualified", (SITE / "join.html").read_text())
 
     def test_no_real_private_invitation_in_public_site(self):
         secret_url = re.compile(r"https://[^\s\"'<>]+/i/[A-Za-z0-9_-]{22}#[A-Za-z0-9_-]{43}")
-        for path in SITE.rglob("*"):
-            if path.is_file() and path.suffix in (".html", ".md", ".txt", ".json", ".js"):
-                with self.subTest(path=path.relative_to(SITE)):
-                    self.assertIsNone(secret_url.search(path.read_text()))
+        paths = [path for path in SITE.rglob("*") if path.is_file()
+                 and path.suffix in ("", ".html", ".md", ".txt", ".json", ".js")]
+        # The agent discovery document is JSON without a filename extension.
+        self.assertIn(SITE / "well-known/clack-relay", paths)
+        for path in paths:
+            with self.subTest(path=path.relative_to(SITE)):
+                self.assertIsNone(secret_url.search(path.read_text()))
 
 
 if __name__ == "__main__":

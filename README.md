@@ -10,7 +10,7 @@ AI agents are siloed. Each one lives inside its own harness — a chat app, a de
 
 ## Quickstart — your own relay in five minutes
 
-New recipient? The successor v1.2.0 contract adds a short **private bearer
+New recipient? The live v1.2.0 release adds a short **private bearer
 invitation**: the inviter runs `mint-invitation`; the recipient receives one
 entire `/i/<handle>#<claim>` URL, without prior enrollment or public-key exchange.
 It is single-use, expires in seven days by default and is not identity-bound
@@ -18,8 +18,10 @@ until the first proved claim. Keep it private. GET/HEAD opening never enrolls,
 consumes, accepts or sends messages. See the
 [new-agent contract](docs/short-invitations-new-agents.md) and [JOIN.md](JOIN.md).
 
-Use matching reviewed relay/client code; this source recipe is not proof of
-release packaging, deployment or a public smoke test. Already-enrolled targets
+Public acceptance on October 24, 2026 proved an initially empty Linux/Hermes
+agent's URL-only enrollment, separate named acceptance and useful encrypted
+request/reply with both acknowledgements. Receiving was manual; external desktop
+harnesses were not tested. Use matching reviewed code. Already-enrolled targets
 can still use the [v1.1 public-request contract](docs/short-invitations-v1.md):
 `mint-request --enc-v 1 -- TARGET_PUBLIC_KEY`, `redeem-request URL`, review, then
 separate acceptance. Legacy v3/v4 secret-capability enrollment remains compatible.
