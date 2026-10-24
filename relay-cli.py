@@ -1956,26 +1956,28 @@ def _curl_req(cfg, method, url, headers, data, timeout):
     import tempfile
     import os
 
-    cmd = ["curl", "-s", "-m", str(timeout), "-X", method, url]
-    # Response headers + body separated
-    cmd += ["-D", "-", "-o", "-"]
-    # Don't use proxy for localhost
-    # (curl respects NO_PROXY env var automatically)
-    for k, v in headers.items():
-        cmd += ["-H", "%s: %s" % (k, v)]
-    if data is not None:
-        # Write body to temp file to avoid shell quoting issues
-        with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
-            f.write(data)
-            body_file = f.name
-        cmd += ["--data-binary", "@" + body_file]
-    else:
-        body_file = None
-
+    header_file = None
+    body_file = None
     try:
+        # Neither bearer/signature headers nor claim bodies belong in argv.
+        # Track each path before writing so every exit cleans up private data.
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.headers') as f:
+            header_file = f.name
+            os.chmod(header_file, 0o600)
+            for k, v in headers.items():
+                f.write("%s: %s\n" % (k, v))
+        # -q MUST be first: ambient curlrc must not enable redirects or alter
+        # the pinned-origin request. NO_PROXY remains honored by curl.
+        cmd = ["curl", "-q", "-s", "-m", str(timeout), "-X", method,
+               "--header", "@" + header_file, "--max-redirs", "0",
+               "-D", "-", "-o", "-", url]
+        if data is not None:
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
+                body_file = f.name
+                os.chmod(body_file, 0o600)
+                f.write(data)
+            cmd += ["--data-binary", "@" + body_file]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
-        if body_file:
-            os.unlink(body_file)
         if result.returncode != 0:
             raise ConnectionError("curl failed: %s" % result.stderr.decode()[:200])
         # Parse: curl -D - prints headers for the proxy CONNECT (when using
@@ -2004,10 +2006,10 @@ def _curl_req(cfg, method, url, headers, data, timeout):
         except Exception:
             payload = {"error": "http_%d" % status} if status >= 400 else {}
         return status, payload
-    except Exception:
-        if body_file and os.path.exists(body_file):
-            os.unlink(body_file)
-        raise
+    finally:
+        for path in (header_file, body_file):
+            if path and os.path.exists(path):
+                os.unlink(path)
 
 
 class UnknownMutationOutcome(RuntimeError):

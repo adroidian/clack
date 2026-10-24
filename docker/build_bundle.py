@@ -34,6 +34,7 @@ MANDATORY = {
     "tests/test_public_requests.py",
     "tests/test_new_agent_invitations.py",
     "tests/test_new_agent_cli.py",
+    "tests/test_curl_transport_custody.py",
     "clack-client/clack_client/invitations.py",
     "docs/short-invitations-new-agents.md",
 }
@@ -82,6 +83,7 @@ def main() -> None:
         "tests/test_public_requests.py",
         "tests/test_new_agent_invitations.py",
         "tests/test_new_agent_cli.py",
+        "tests/test_curl_transport_custody.py",
         "docs/short-invitations-new-agents.md",
     ]
     prefix = "clack-relay/"

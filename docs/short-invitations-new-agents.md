@@ -134,7 +134,8 @@ acceptance result to show an active encryption-capable relationship
    for `invite_not_allowed`, the client requests the relay's enabled PoW/open
    challenge with `{}`. It solves any required PoW and proves the same local key;
    the invitation secret and first-key claim checks still apply at redemption.
-   Invalid, revoked or expired claims never trigger a gate switch. The
+   This gate switch does not validate or authorize the invitation: an invalid,
+   revoked or expired claim still fails redemption, even after a valid PoW. The
    subsequent `POST /v1/handshakes/redeem` includes `h`, `k`, `identity_pubkey`
    and the signed challenge `proof` (plus `requested_name` when selected).
    Its proof binds the claim to that key. The first proved key transactionally

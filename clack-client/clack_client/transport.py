@@ -45,11 +45,11 @@ def curl_request(method, url, headers, data=None, timeout=30):
         # though NamedTemporaryFile defaults to it; the permission is
         # load-bearing (Bearer <redacted> live here).
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.headers') as f:
+            header_file = f.name
+            os.chmod(header_file, 0o600)
             for k, v in headers.items():
                 # Escape: curl -H @file reads "Header: value" lines
                 f.write(f"{k}: {v}\n")
-            header_file = f.name
-        os.chmod(header_file, 0o600)
 
         cmd = [
             "curl", "-q",  # --disable: never read ~/.curlrc
@@ -64,9 +64,9 @@ def curl_request(method, url, headers, data=None, timeout=30):
         ]
         if data is not None:
             with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
-                f.write(data)
                 body_file = f.name
-            os.chmod(body_file, 0o600)
+                os.chmod(body_file, 0o600)
+                f.write(data)
             cmd += ["--data-binary", "@" + body_file]
 
         try:

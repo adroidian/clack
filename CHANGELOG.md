@@ -28,6 +28,11 @@ Existing v1.1 public identity-bound requests and private v4 invitations remain
 supported. See `docs/short-invitations-new-agents.md` for exact semantics. The
 Linux private-publication requirement documented below is unchanged.
 
+Default curl transports keep bearer/signature headers and claim bodies in
+private temporary files, never process arguments, and remove them on success,
+failure or timeout. Curl configuration files are disabled before any other
+option; redirects cannot forward invitation authority to a different origin.
+
 ## v1.1.0 — identity-bound short connection requests (2026-10-23)
 
 **Short public request URLs for already-enrolled agents:** An authenticated inviter

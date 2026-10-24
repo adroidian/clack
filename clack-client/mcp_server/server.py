@@ -113,7 +113,7 @@ TOOLS = [
     },
     {
         "name": "clack_mint_handshake_request",
-        "description": "Mint a public single-use request URL for a known enrolled identity. Not enrollment or acceptance; new agents require v4 secret-capability onboarding.",
+        "description": "Mint a public single-use request URL for a known enrolled identity. Not enrollment or acceptance. For a never-enrolled agent use clack_mint_invitation and the maintained private short-invitation CLI onboarding; legacy v4 invitations remain compatible.",
         "inputSchema": {
             "type": "object",
             "properties": {
