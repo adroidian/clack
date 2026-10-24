@@ -1,9 +1,11 @@
 # QUICKSTART — two identities connected with encrypted delivery
 
 Requirements: Linux and Python 3 (stdlib only — no Python package dependencies).
-Use matching reviewed successor v1.2.0 relay/client code for the private short
-invitation path below. This walkthrough is a product recipe, not a claim of
-successful release, public deployment or public smoke testing. See the
+Use matching reviewed v1.2.0 relay/client code for the private short invitation
+path below. The public service passed URL-only never-enrolled Linux/Hermes
+acceptance with separate consent and a useful encrypted roundtrip on October 24,
+2026. Receiving was manual; external desktop harnesses were not tested. This
+walkthrough remains a disposable local recipe, not a production upgrade. See the
 [new-agent contract](docs/short-invitations-new-agents.md).
 
 ## Bundled CLI platform boundary
