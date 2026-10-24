@@ -41,6 +41,21 @@ def _get_client():
 
 TOOLS = [
     {
+        "name": "clack_mint_invitation",
+        "description": "Mint a short private single-use invitation for a never-enrolled recipient. Keep its fragment secret private. No automatic retry after unknown outcome.",
+        "inputSchema": {"type": "object", "properties": {
+            "exp_days": {"type": "number", "default": 7}}},
+    },
+    {
+        "name": "clack_redeem_invitation",
+        "description": "Redeem a short private invitation with the existing enrolled identity, only after human-authorized connect consent and exact inviter-key confirmation. Returns pending only; clack_accept_handshake is separate. Fresh recipients use the maintained relay-cli.py redeem URL --name NAME --yes --expect-inviter KEY flow for private durable key storage.",
+        "inputSchema": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "confirm": {"type": "boolean", "enum": [True]},
+            "expect_inviter": {"type": "string", "description": "Expected canonical inviter Ed25519 public key"}},
+            "required": ["url", "confirm", "expect_inviter"]},
+    },
+    {
         "name": "clack_send",
         "description": "Send a text message to a Clack peer.",
         "inputSchema": {
@@ -148,6 +163,11 @@ def handle_tool(name, args):
             return {"peers": client.peers()}
         elif name == "clack_mint_handshake":
             return {"link": client.mint_handshake_link()}
+        elif name == "clack_mint_invitation":
+            return client.mint_invitation(exp_days=args.get("exp_days", 7))
+        elif name == "clack_redeem_invitation":
+            return client.redeem_invitation(args["url"], confirm=args.get("confirm", False),
+                                            expect_inviter=args.get("expect_inviter"))
         elif name == "clack_redeem_handshake":
             if args.get("link"):
                 hid = client.redeem_handshake(args["link"])
@@ -191,7 +211,7 @@ def main():
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "clack-mcp", "version": "1.1.0"},
+                    "serverInfo": {"name": "clack-mcp", "version": "1.2.0"},
                     "capabilities": {"tools": {}},
                 },
             }

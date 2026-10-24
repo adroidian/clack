@@ -7,7 +7,7 @@ from .errors import (
 )
 from .signing import parse_handshake_link
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "ClackClient",
     "ClackError", "HandshakeRequired", "LinkExpired", "LinkUnusable",

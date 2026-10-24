@@ -32,6 +32,10 @@ MANDATORY = {
     "clack-client/mcp_server/server.py",
     "tests/test_config_peer_restart.py",
     "tests/test_public_requests.py",
+    "tests/test_new_agent_invitations.py",
+    "tests/test_new_agent_cli.py",
+    "clack-client/clack_client/invitations.py",
+    "docs/short-invitations-new-agents.md",
 }
 
 ROOT_SOURCE = (
@@ -76,6 +80,9 @@ def main() -> None:
         "QUICKSTART.md",
         "tests/test_config_peer_restart.py",
         "tests/test_public_requests.py",
+        "tests/test_new_agent_invitations.py",
+        "tests/test_new_agent_cli.py",
+        "docs/short-invitations-new-agents.md",
     ]
     prefix = "clack-relay/"
     # Pin Git's archive mode mask so ambient repository/global configuration

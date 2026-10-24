@@ -880,7 +880,7 @@ def base_url(cfg):
 
 
 def user_agent(cfg):
-    return cfg.get("user_agent") or "ClackRelay-CLI/1.1.0"
+    return cfg.get("user_agent") or "ClackRelay-CLI/1.2.0"
 
 
 # --- Ed25519 request signing (v0.2.12) ----------------------------------------
@@ -2021,7 +2021,9 @@ def req(cfg, method, path, body=None, base=None):
     public_request = path in ("/v1/handshakes/requests", "/v1/handshakes/requests/redeem",
                               "/v1/handshakes/accept")
     register_mutation = method.upper() == "POST" and path == "/v1/register-key"
-    unknown_sensitive = public_request or register_mutation
+    invitation_mutation = method.upper() == "POST" and path in (
+        "/v1/handshakes/invitations", "/v1/handshakes/redeem", "/v1/enroll/challenge")
+    unknown_sensitive = public_request or register_mutation or invitation_mutation
     origin = (base or base_url(cfg)).rstrip("/")
     token = auth_token(cfg)
     level = _ensure_origin_verified(origin, cfg)
@@ -2039,6 +2041,8 @@ def req(cfg, method, path, body=None, base=None):
     if token:
         headers["Authorization"] = "Bearer " + token
     headers["User-Agent"] = user_agent(cfg)
+    if path.startswith("/i/"):
+        headers["Accept"] = "application/json"
     headers.update(sign_headers(cfg, method, path, data))
     if data is not None:
         headers["Content-Type"] = "application/json"
@@ -2098,6 +2102,13 @@ def req(cfg, method, path, body=None, base=None):
                 for k, v in headers.items():
                     r.add_header(k, v)
                 continue
+            raise
+        except (ValueError, urllib.error.URLError, OSError) as exc:
+            # A malformed success body or wrapped socket failure can arrive
+            # AFTER the server committed. Do not downgrade or replay it.
+            if unknown_sensitive:
+                raise UnknownMutationOutcome(
+                    "mutation outcome UNKNOWN; reconcile before retrying") from exc
             raise
 
 
@@ -2171,7 +2182,7 @@ def fetch_relay_identity(relay_url, cfg=None):
     valid proof for a different challenge is rejected even though its
     signature is genuine.
 
-    The configured user_agent is sent (default ClackRelay-CLI/1.1.0):
+    The configured user_agent is sent (default ClackRelay-CLI/1.2.0):
     Cloudflare-fronted relays 403 Python-urllib's default signature, so a
     bare _open() fails closed before any normal operation can run.
 
@@ -3418,6 +3429,57 @@ def parse_request_url(link, relay_url):
     return handle
 
 
+def _canonical_inviter(value):
+    import re
+    if (type(value) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value)
+            or b64u_encode(b64u_decode(value)) != value):
+        raise ValueError("inviter identity must be a canonical Ed25519 public key")
+    return value
+
+
+def parse_invitation_url(link, relay_url=None):
+    """Standalone equivalent of SDK invitations.parse_invitation_url."""
+    import re
+    import ipaddress
+    def split(value):
+        if (type(value) is not str or not value
+                or any(ord(c) <= 32 or ord(c) == 127 for c in value)
+                or any(c in value for c in ("?", "\\", "%"))):
+            raise ValueError("invitation requires a clean absolute URL")
+        p = urllib.parse.urlsplit(value)
+        if (not p.hostname or p.username is not None or p.password is not None
+                or p.scheme not in ("http", "https")):
+            raise ValueError("invitation requires HTTPS without credentials")
+        p.port
+        if p.netloc.endswith(":"):
+            raise ValueError("invalid origin port")
+        if p.scheme == "http":
+            try:
+                local = ipaddress.ip_address(p.hostname).is_loopback
+            except ValueError:
+                local = p.hostname == "localhost"
+            if not local:
+                raise ValueError("HTTP invitations are allowed only on loopback")
+        return p
+    p = split(link)
+    origin = p.scheme + "://" + p.netloc
+    if relay_url is not None:
+        configured = split(relay_url)
+        if (configured.path not in ("", "/") or "#" in relay_url
+                or (p.scheme, p.netloc.lower()) != (configured.scheme, configured.netloc.lower())):
+            raise ValueError("invitation origin differs from configured relay")
+    match = re.fullmatch(r"/i/([A-Za-z0-9_-]{22})", p.path)
+    if not match or link.count("#") != 1:
+        raise ValueError("invitation must be /i/<22-character handle>#<secret>")
+    handle = match.group(1)
+    raw = b64u_decode(handle)
+    if b64u_encode(raw) != handle:
+        raise ValueError("noncanonical invitation handle")
+    _canonical_inviter(p.fragment)
+    return {"origin": origin, "h": str(uuid.UUID(bytes=raw)), "k": p.fragment,
+            "path": p.path}
+
+
 def cmd_public_request(args, cfg):
     """Use only an existing enrolled identity; never enroll or auto-accept."""
     try:
@@ -3428,6 +3490,12 @@ def cmd_public_request(args, cfg):
         if args.cmd == "redeem-request":
             handle = parse_request_url(args.link, origin)
             path, body = "/v1/handshakes/requests/redeem", {"h": handle}
+        elif args.cmd == "mint-invitation":
+            import math
+            if not math.isfinite(args.exp_days) or args.exp_days <= 0:
+                raise ValueError("exp_days must be a positive finite number")
+            path = "/v1/handshakes/invitations"
+            body = {"exp_days": args.exp_days, "enc_v": 1}
         elif args.cmd == "mint-request":
             import re
             import math
@@ -3460,7 +3528,26 @@ def cmd_public_request(args, cfg):
         code, out = req(cfg, "POST", path, body, base=origin)
     except RuntimeError as exc:
         print("error: %s" % exc, file=sys.stderr)
+        if args.cmd == "mint-invitation":
+            print("Mint outcome UNKNOWN; do not mint again blindly. Read-only invite-list reconciliation:",
+                  file=sys.stderr)
+            try:
+                _, listed = req(cfg, "GET", "/v1/invites/list", base=origin)
+                print(json.dumps(listed, indent=2), file=sys.stderr)
+            except Exception:
+                print("Readback unavailable; run invite-list later before deciding on a new mint.", file=sys.stderr)
         return 1
+    if 200 <= code < 300 and args.cmd == "mint-invitation":
+        try:
+            parsed = parse_invitation_url(out["link"], origin)
+            _canonical_inviter(out.get("inviter_identity"))
+            if (out.get("mode") != "private_invitation" or out.get("max_uses") != 1
+                    or out.get("link_id") != parsed["h"] or len(out["link"]) > 120):
+                raise ValueError("unexpected invitation metadata")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            print("Invalid mint response; outcome UNKNOWN. Reconcile with invite-list before minting again.",
+                  file=sys.stderr)
+            return 1
     print(json.dumps(out, indent=2))
     if 200 <= code < 300 and args.cmd == "redeem-request":
         print("Pending only: review the handshake, then explicitly run accept-handshake HANDSHAKE_ID.",
@@ -3532,8 +3619,94 @@ def _apply_enrollment_response(cfg, out, what, requested_name=None):
     return True
 
 
+def _redeem_private_invitation(args):
+    """Serialize short-invitation setup against other identity setup work."""
+    try:
+        _ensure_private_parent(_private_abs(args.config))
+        with _RegisterKeyOperationLock(args.config):
+            if os.path.lexists(_register_key_pending_path(args.config)):
+                raise ValueError("finish pending register-key recovery before redeeming")
+            return _redeem_private_invitation_locked(args)
+    except (ValueError, OSError) as exc:
+        print("private invitation local state unsafe: %s" % exc, file=sys.stderr)
+        return 1
+
+
+def _redeem_private_invitation_locked(args):
+    """Read-only discovery, named consent, durable identity, pending only."""
+    try:
+        existing = load_config(args.config) if os.path.exists(args.config) else None
+        if existing is not None and not is_identity_cfg(existing):
+            raise ValueError("existing config is not an identity; use an isolated config")
+        if existing is not None and not existing.get("relay_url"):
+            raise ValueError("existing identity has no configured relay origin")
+        f = parse_invitation_url(args.link, existing.get("relay_url") if existing else None)
+        origin = f["origin"]
+        if args.base_url and args.base_url.rstrip("/") != origin:
+            raise ValueError("--base-url differs from invitation origin")
+        if existing and auth_token(existing) and not (
+                existing.get("relay_identity_fingerprint") or existing.get("relay_identity_fingerprint_full")):
+            raise ValueError("existing enrolled identity requires an established relay pin")
+        expected = getattr(args, "expect_inviter", None)
+        if expected is not None:
+            _canonical_inviter(expected)
+        if getattr(args, "yes", False) and expected is None:
+            raise ValueError("--yes requires --expect-inviter CANONICAL_PUBLIC_KEY")
+        name = getattr(args, "name", None)
+        import re
+        if name is not None and (not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", name)
+                                 or name.startswith("guest-")):
+            raise ValueError("invalid --name")
+        if (getattr(args, "yes", False) and not (existing or {}).get("service_token")
+                and name is None):
+            raise ValueError("fresh automated redemption requires --name")
+        relay_fp = check_relay_identity(origin, existing or {})
+        # Discovery is deliberately unauthenticated, and contains NO fragment.
+        discovery = {"relay_url": origin, "relay_identity_fingerprint": relay_fp}
+        if existing and existing.get("relay_identity_fingerprint_full"):
+            discovery["relay_identity_fingerprint_full"] = existing["relay_identity_fingerprint_full"]
+        code, metadata = req(discovery, "GET", f["path"], base=origin)
+        if not 200 <= code < 300 or metadata.get("mode") != "private_invitation":
+            raise ValueError("private invitation unavailable")
+        inviter = _canonical_inviter(metadata.get("inviter_identity"))
+        f["inviter_identity"] = inviter
+        print("Relay: %s (key %s)" % (origin, relay_fp))
+        print("Inviter identity: %s" % inviter)
+        print("Inviter name hint (not identity): %s" % json.dumps(metadata.get("inviter_name_hint")))
+        print("Expires: %s" % metadata.get("exp"))
+        if expected is not None and expected != inviter:
+            raise ValueError("inviter identity does not match --expect-inviter")
+        if not getattr(args, "yes", False):
+            if input("Type CONNECT %s to enroll/redeem (acceptance remains separate): " % inviter) != "CONNECT " + inviter:
+                raise ValueError("aborted: connect consent not given")
+        cfg = dict(existing) if existing else {
+            "kind": IDENTITY_KIND, "relay_url": origin,
+            "user_agent": "ClackRelay-CLI/1.2.0"}
+        if existing:
+            seed = signing_seed(cfg)
+            if seed is None or b64u_encode(_publickey(seed)) != cfg.get("identity_pubkey"):
+                raise ValueError("existing identity key is missing or inconsistent")
+            pub = _publickey(seed)
+        else:
+            if os.path.lexists(args.config + ".key"):
+                raise ValueError("orphan key exists; recover it explicitly instead of overwriting")
+            seed, pub = keygen()
+            cfg["identity_pubkey"] = b64u_encode(pub)
+        cfg["relay_identity_fingerprint"] = relay_fp
+        # Key, identity and pin are durable BEFORE challenge or claim mutation.
+        _save_identity_config(args.config, cfg, seed)
+        return _redeem_v4_handshake(args, cfg, f, origin, relay_fp, seed, pub,
+                                    private_invitation=True)
+    except (ValueError, OSError, RuntimeError, EOFError, KeyError, TypeError, AttributeError) as exc:
+        print("private invitation failed: %s; keep this config for same-identity recovery; "
+              "do not mint/redeem blindly" % exc, file=sys.stderr)
+        return 1
+
+
 def cmd_redeem(args):
     _require_private_publication_platform()
+    if "/i/" in args.link:
+        return _redeem_private_invitation(args)
     try:
         f = parse_link(args.link)
     except ValueError as e:
@@ -3595,7 +3768,7 @@ def cmd_redeem(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/1.1.0",
+            "user_agent": "ClackRelay-CLI/1.2.0",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -3684,7 +3857,8 @@ def cmd_redeem(args):
     return 0
 
 
-def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
+def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub,
+                         private_invitation=False):
     """Redeem a v4 handshake link: inline enrollment (invite/PoW/open gate)
     via POST /v1/handshakes/redeem, then accept the pending handshake via
     POST /v1/handshakes/accept. The minter already consented at mint time;
@@ -3706,17 +3880,24 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
     requested_name = None
     already_enrolled = bool(cfg.get("service_token") and cfg.get("peer_name"))
     if already_enrolled:
+        if private_invitation and getattr(args, "name", None) not in (None, cfg["peer_name"]):
+            raise ValueError("--name cannot rename an existing identity")
         print("note: redeeming on already-enrolled identity %r; keeping "
               "existing peer name (no rename)" % cfg["peer_name"])
     else:
         while True:
-            ans = input("Choose your peer name (lowercase, or Enter for guest): ").strip()
+            chosen = getattr(args, "name", None) if private_invitation else None
+            if private_invitation and getattr(args, "yes", False) and chosen is None:
+                raise ValueError("fresh automated redemption requires --name")
+            ans = chosen if chosen is not None else input("Choose your peer name (lowercase, or Enter for guest): ").strip()
             if not ans:
                 break
             if _name_re.match(ans) and not ans.startswith("guest-"):
                 requested_name = ans
                 break
             print("  invalid name: use lowercase letters, digits, _ or -, 1-31 chars", file=sys.stderr)
+            if chosen is not None:
+                raise ValueError("invalid --name")
 
     body = {"h": h, "k": k, "identity_pubkey": b64u_encode(pub)}
     if requested_name:
@@ -3741,14 +3922,17 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
         # back past {"invite_id": h} when the invite gate itself is disabled --
         # a bad link must fail here, not silently switch gates.
         code, ch = req(cfg, "POST", "/v1/enroll/challenge",
-                       {"invite_id": h}, base=relay_url)
-        if code == 400 and ch.get("error") == "invite_not_allowed":
+                       ({"invite_id": h, "k": k, "identity_pubkey": b64u_encode(pub)}
+                        if private_invitation else {"invite_id": h}), base=relay_url)
+        if not private_invitation and code == 400 and ch.get("error") == "invite_not_allowed":
             code, ch = req(cfg, "POST", "/v1/enroll/challenge", {},
                            base=relay_url)
         if not (200 <= code < 300):
             print("challenge failed: %s" % json.dumps(ch), file=sys.stderr)
             return 1
         gate = ch.get("gate")
+        if private_invitation and gate != "invite":
+            raise ValueError("private invitation requires the invite enrollment gate")
         if gate == "pow":
             chal_raw = b64u_decode(ch["challenge"])
             difficulty = int(ch.get("difficulty", 20))
@@ -3777,6 +3961,15 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
         print("redeem failed: %s" % json.dumps(out), file=sys.stderr)
         return 1
 
+    if private_invitation and (out.get("status") != "pending" or not out.get("handshake_id")):
+        raise ValueError("private invitation did not return a pending handshake; reconcile before retrying")
+    if private_invitation and out.get("minter_identity") != f["inviter_identity"]:
+        raise ValueError("redeem inviter identity mismatch; reconcile before retrying")
+    if private_invitation and already_enrolled:
+        # Existing credentials remain authoritative even if an unexpected
+        # server response includes enrollment fields.
+        out = dict(out)
+        out.pop("service_token", None)
     if not _apply_enrollment_response(cfg, out, "redeem", requested_name):
         return 1
     if relay_fp:
@@ -3788,6 +3981,12 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub):
              out.get("enrollment")))
     print("handshake: %s (status %s)"
           % (out.get("handshake_id"), out.get("status")))
+
+    if private_invitation:
+        print("Pending only. Review, then separately run: accept-handshake %s --enc-v 1"
+              % out["handshake_id"])
+        print("config saved: %s" % args.config)
+        return 0
 
     # The redeemer consents by accepting. Authenticated: the fresh token
     # and signing key prove key possession. E2EE: advertise enc_v=1 so the
@@ -3924,7 +4123,7 @@ def cmd_enroll(args):
             "kind": IDENTITY_KIND,
             "relay_url": relay_url,
             "identity_pubkey": b64u_encode(pub),
-            "user_agent": "ClackRelay-CLI/1.1.0",
+            "user_agent": "ClackRelay-CLI/1.2.0",
         }
         # Persist the private key immediately (mode 600 key file): the relay
         # never sees it, and nothing below may proceed without it on disk.
@@ -4104,6 +4303,8 @@ def main():
     mr.add_argument("target_identity", help="canonical Ed25519 public key (base64url)")
     mr.add_argument("--exp-days", type=float, default=7)
     mr.add_argument("--enc-v", type=int, choices=(0, 1), default=0)
+    mi = sub.add_parser("mint-invitation", help="mint a short private single-use invitation for a new agent")
+    mi.add_argument("--exp-days", type=float, default=7)
     rr = sub.add_parser("redeem-request", help="redeem a public URL into a pending handshake (no acceptance)")
     rr.add_argument("link", help="same-configured-relay /join/UUID URL")
     ah = sub.add_parser("accept-handshake", help="explicitly consent to a pending handshake")
@@ -4113,6 +4314,9 @@ def main():
 
     rd = sub.add_parser("redeem", help="redeem an invite link (full join flow)")
     rd.add_argument("link", help="the invite link (or its #fragment payload)")
+    rd.add_argument("--name", default=None, help="peer name for short private invitation enrollment")
+    rd.add_argument("--yes", action="store_true", help="explicit connect consent; requires --expect-inviter")
+    rd.add_argument("--expect-inviter", default=None, help="expected canonical inviter Ed25519 public key")
 
     e = sub.add_parser("enroll", help="self-enroll a new agent identity (v0.2.9)")
     e.add_argument("--name", default=None, help="desired peer name (optional)")
@@ -4157,7 +4361,7 @@ def main():
     except (OSError, ValueError) as exc:
         print("cannot read client config: %s" % exc, file=sys.stderr)
         return 1
-    if args.cmd in ("mint-request", "redeem-request", "accept-handshake"):
+    if args.cmd in ("mint-request", "mint-invitation", "redeem-request", "accept-handshake"):
         return cmd_public_request(args, cfg)
     token = auth_token(cfg)
     if not token and args.cmd in ("mint-invite", "invite-list", "invite-revoke",
