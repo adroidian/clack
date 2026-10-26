@@ -69,7 +69,10 @@ class CurlTransportCustody(unittest.TestCase):
     def private_files(self, argv):
         paths = [Path(arg[1:]) for arg in argv if arg.startswith("@")]
         self.assertEqual(len(paths), 2, "body and headers must use private files")
-        self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in paths))
+        # Windows st_mode does not encode its discretionary ACL; custody and
+        # cleanup still apply on every platform.
+        self.assertTrue(os.name == "nt" or all(
+            path.stat().st_mode & 0o777 == 0o600 for path in paths))
         self.assertFalse(any(self.f.tokens["bob"] in arg for arg in argv),
                          "bearer authority appeared in child argv")
         self.assertFalse(any("X-Clack-Sig:" in arg for arg in argv),

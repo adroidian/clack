@@ -58,6 +58,10 @@ except ImportError:
 
 import http.client
 import json
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 import os
 import socket
 import stat
@@ -727,6 +731,7 @@ def _windows_config_api():
             (kernel, "GetFileInformationByHandle", [HANDLE, pointer(FILE_INFO)], BOOL),
             (kernel, "ReadFile", [HANDLE, HANDLE, DWORD, pointer(DWORD), HANDLE], BOOL),
             (kernel, "CloseHandle", [HANDLE], BOOL),
+            (kernel, "FlushFileBuffers", [HANDLE], BOOL),
             (kernel, "GetCurrentProcess", [], HANDLE),
             (kernel, "LocalFree", [HANDLE], HANDLE),
             (security, "GetSecurityInfo", [HANDLE, DWORD, DWORD, pointer(HANDLE), HANDLE, HANDLE, HANDLE, pointer(HANDLE)], DWORD),
@@ -750,13 +755,12 @@ def _windows_config_components(path):
             raise ValueError("config path contains a symlink or Windows reparse point: %s" % current)
 
 
-def _read_windows_private_config(path):
-    """Read an existing caller-owned regular file; no publication or chmod.
+def _read_windows_private_config(path, with_snapshot=False):
+    """Read a caller-owned regular file through stable native handles.
 
-    Native handles avoid relying on Windows' meaningless Unix UID fields or
-    version-dependent CRT inode values. Denying write/delete sharing keeps the
-    opened object stable. Owner SID, link count, reparse state and identity are
-    re-attested before any JSON or credentials are used.
+    Denying write/delete sharing keeps the opened object stable. Owner SID,
+    link count, reparse state and identity are re-attested before use. The
+    optional snapshot is the native equivalent of the POSIX inode snapshot.
     """
     kernel, security, DWORD, FILE_INFO, TOKEN_USER = _windows_config_api()
     absolute = _private_abs(path)
@@ -806,6 +810,9 @@ def _read_windows_private_config(path):
             user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
             if not user.sid or not security.EqualSid(owner, user.sid):
                 raise ValueError("config file is not owned by the current Windows user")
+            # Snapshots need a stable SID value, not the address of the freed
+            # owner buffer. Ordinary secret reads only need the equality check.
+            return _windows_current_sid(kernel, security) if with_snapshot else None
         finally:
             if token.value:
                 kernel.CloseHandle(token)
@@ -816,7 +823,7 @@ def _read_windows_private_config(path):
     handle = open_existing()
     try:
         before = information(handle)
-        owned_by_caller(handle)
+        owner = owned_by_caller(handle)
         chunks = []
         while True:
             buffer, count = ctypes.create_string_buffer(65536), DWORD()
@@ -838,7 +845,174 @@ def _read_windows_private_config(path):
                 raise ValueError("config path changed while it was read")
         finally:
             kernel.CloseHandle(visible)
+        if with_snapshot:
+            snapshot = {
+                "dev": before[0], "ino": (before[1] << 32) | before[2],
+                "mode": before[9], "uid": owner, "nlink": before[10],
+                "size": (before[3] << 32) | before[4], "data": data,
+            }
+            return data, snapshot
         return data
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _windows_current_sid(kernel=None, security=None):
+    """Return the current token user's SID without POSIX uid emulation."""
+    _kernel, _security, DWORD, _FILE_INFO, TOKEN_USER = _windows_config_api()
+    if kernel is None or security is None:
+        kernel, security = _kernel, _security
+    for library, name, arguments, result in (
+            (security, "ConvertSidToStringSidW", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)], ctypes.c_int32),):
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, result
+    token = ctypes.c_void_p()
+    text = ctypes.c_wchar_p()
+    try:
+        if not security.OpenProcessToken(kernel.GetCurrentProcess(), 8, ctypes.byref(token)):
+            raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+        needed = DWORD()
+        security.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+        if not ctypes.sizeof(TOKEN_USER) <= needed.value <= 65536:
+            raise ValueError("Windows token user information is unavailable or invalid")
+        buffer = ctypes.create_string_buffer(needed.value)
+        if not security.GetTokenInformation(token, 1, buffer, needed.value, ctypes.byref(needed)):
+            raise OSError(ctypes.get_last_error(), "GetTokenInformation(TokenUser) failed")
+        user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+        if not user.sid or not security.ConvertSidToStringSidW(user.sid, ctypes.byref(text)):
+            raise OSError(ctypes.get_last_error(), "ConvertSidToStringSidW failed")
+        return text.value
+    finally:
+        if text.value:
+            kernel.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        if token.value:
+            kernel.CloseHandle(token)
+
+
+def _windows_restrict_handle_acl(handle):
+    """Apply a protected DACL granting full control only to the caller."""
+    kernel, security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    DWORD, BOOL, HANDLE = ctypes.c_uint32, ctypes.c_int32, ctypes.c_void_p
+    for name, arguments, result in (
+            ("ConvertStringSecurityDescriptorToSecurityDescriptorW",
+             [ctypes.c_wchar_p, DWORD, ctypes.POINTER(HANDLE), ctypes.POINTER(DWORD)], BOOL),
+            ("GetSecurityDescriptorDacl",
+             [HANDLE, ctypes.POINTER(BOOL), ctypes.POINTER(HANDLE), ctypes.POINTER(BOOL)], BOOL),
+            ("SetSecurityInfo",
+             [HANDLE, DWORD, DWORD, HANDLE, HANDLE, HANDLE, HANDLE], DWORD)):
+        function = getattr(security, name)
+        function.argtypes, function.restype = arguments, result
+    sid = _windows_current_sid(kernel, security)
+    descriptor = ctypes.c_void_p()
+    try:
+        sddl = "D:P(A;;FA;;;%s)" % sid
+        if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(descriptor), None):
+            raise OSError(ctypes.get_last_error(), "cannot construct Windows private DACL")
+        present, defaulted, dacl = BOOL(), BOOL(), ctypes.c_void_p()
+        if not security.GetSecurityDescriptorDacl(
+                descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
+            raise OSError(ctypes.get_last_error(), "cannot read Windows private DACL")
+        if not present.value or not dacl.value:
+            raise ValueError("Windows private DACL is absent")
+        # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION.
+        code = security.SetSecurityInfo(
+            ctypes.c_void_p(handle), 1, 0x80000004, None, None, dacl, None)
+        if code:
+            raise OSError(code, "cannot protect Windows private artifact")
+    finally:
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+
+
+def _windows_restrict_path_acl(path):
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    absolute = _private_abs(path)
+    _windows_config_components(absolute)
+    # GENERIC_WRITE (for flush) | READ_CONTROL | WRITE_DAC | WRITE_OWNER.
+    handle = kernel.CreateFileW(absolute, 0x400E0000, 1, None, 3, 0x00200000, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "cannot open Windows private artifact for ACL protection", absolute)
+    try:
+        _windows_restrict_handle_acl(handle)
+        if not kernel.FlushFileBuffers(handle):
+            raise OSError(ctypes.get_last_error(), "cannot flush Windows private ACL", absolute)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _windows_open_private_stage(path):
+    """Create a non-shared stage with WRITE_DAC before secret bytes arrive."""
+    if msvcrt is None:
+        raise OSError(errno.ENOSYS, "native Windows file handles are unavailable")
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    # GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER; no sharing.
+    handle = kernel.CreateFileW(path, 0x400E0000, 0, None, 1, 0x00200000, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "cannot create Windows private stage", path)
+    try:
+        _windows_restrict_handle_acl(handle)
+        return msvcrt.open_osfhandle(handle, os.O_WRONLY)
+    except Exception:
+        kernel.CloseHandle(handle)
+        raise
+
+
+def _windows_flush_fd(fd):
+    if msvcrt is None:
+        raise OSError(errno.ENOSYS, "native Windows file handles are unavailable")
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    if not kernel.FlushFileBuffers(ctypes.c_void_p(msvcrt.get_osfhandle(fd))):
+        raise OSError(ctypes.get_last_error(), "FlushFileBuffers failed")
+
+
+def _windows_move(source, destination, replace=False):
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    function = kernel.MoveFileExW
+    function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    function.restype = ctypes.c_int32
+    # MOVEFILE_WRITE_THROUGH, optionally MOVEFILE_REPLACE_EXISTING.
+    if not function(source, destination, 8 | (1 if replace else 0)):
+        raise OSError(ctypes.get_last_error(), "MoveFileExW failed", destination)
+
+
+def _windows_replace(destination, source, backup):
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    function = kernel.ReplaceFileW
+    function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                         ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
+    function.restype = ctypes.c_int32
+    if not function(destination, source, backup, 0, None, None):
+        raise OSError(ctypes.get_last_error(), "ReplaceFileW failed", destination)
+
+
+def _windows_mutex_acquire(name):
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    for function_name, arguments, result in (
+            ("CreateMutexW", [ctypes.c_void_p, ctypes.c_int32, ctypes.c_wchar_p], ctypes.c_void_p),
+            ("WaitForSingleObject", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_uint32)):
+        function = getattr(kernel, function_name)
+        function.argtypes, function.restype = arguments, result
+    handle = kernel.CreateMutexW(None, False, "Local\\" + name)
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
+    result = kernel.WaitForSingleObject(handle, 0)
+    if result not in (0, 0x80):  # owned, or abandoned by a dead process
+        kernel.CloseHandle(handle)
+        raise ValueError("another register-key operation is already active")
+    return handle
+
+
+def _windows_mutex_release(handle):
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    kernel.ReleaseMutex.argtypes = [ctypes.c_void_p]
+    kernel.ReleaseMutex.restype = ctypes.c_int32
+    try:
+        if not kernel.ReleaseMutex(handle):
+            raise OSError(ctypes.get_last_error(), "ReleaseMutex failed")
     finally:
         kernel.CloseHandle(handle)
 
@@ -913,9 +1087,12 @@ def signing_seed(cfg):
     path = cfg.get("identity_privkey_path")
     if path:
         try:
-            with open(path, "rb") as f:
-                raw = f.read().strip()
-        except OSError:
+            if sys.platform == "win32":
+                raw = _read_windows_private_config(path).strip()
+            else:
+                with open(path, "rb") as f:
+                    raw = f.read().strip()
+        except (OSError, ValueError):
             return None
         if len(raw) == 32:
             return raw
@@ -1243,14 +1420,18 @@ if _RENAMEAT2 is not None:
 
 
 PRIVATE_PUBLICATION_REQUIREMENT = (
-    "private credential publication requires Linux with fcntl.flock, os.geteuid, "
-    "abstract AF_UNIX sockets and renameat2; run enrollment/key setup in a "
-    "supported Linux environment"
+    "private credential publication requires supported native Linux or Windows "
+    "file, security and locking APIs"
 )
 
 
 def _require_private_publication_platform():
     """Reject unsupported enrollment/publication before local or remote effects."""
+    if sys.platform == "win32":
+        if msvcrt is None or not hasattr(ctypes, "WinDLL"):
+            raise OSError(errno.ENOSYS, PRIVATE_PUBLICATION_REQUIREMENT)
+        _windows_config_api()  # Fail before key generation or network mutation.
+        return
     if (sys.platform != "linux" or fcntl is None
             or not hasattr(fcntl, "flock") or not hasattr(os, "geteuid")
             or not hasattr(socket, "AF_UNIX") or _RENAMEAT2 is None):
@@ -1305,8 +1486,10 @@ def _reject_symlink_components(path):
             st = os.lstat(current)
         except FileNotFoundError:
             continue
-        if stat.S_ISLNK(st.st_mode):
-            raise ValueError("private artifact path contains a symlink: %s" % current)
+        if (stat.S_ISLNK(st.st_mode)
+                or (sys.platform == "win32"
+                    and getattr(st, "st_file_attributes", 0) & 0x400)):
+            raise ValueError("private artifact path contains a symlink or reparse point: %s" % current)
     return absolute
 
 
@@ -1329,17 +1512,23 @@ def _validate_private_destination(path, must_exist=False):
         if must_exist:
             raise ValueError("private artifact does not exist: %s" % absolute)
         return absolute, parent, None
-    if stat.S_ISLNK(st.st_mode):
-        raise ValueError("private artifact destination is a symlink: %s" % absolute)
+    if (stat.S_ISLNK(st.st_mode)
+            or (sys.platform == "win32"
+                and getattr(st, "st_file_attributes", 0) & 0x400)):
+        raise ValueError("private artifact destination is a symlink or reparse point: %s" % absolute)
     if not stat.S_ISREG(st.st_mode):
         raise ValueError("private artifact destination is not a regular file: %s"
                          % absolute)
-    if st.st_nlink != 1:
-        raise ValueError("private artifact destination has %d hardlinks: %s"
-                         % (st.st_nlink, absolute))
-    if st.st_uid != os.geteuid():
-        raise ValueError("private artifact destination is not owned by this user: %s"
-                         % absolute)
+    if sys.platform == "win32":
+        # Native handles verify the owner SID, real link count and stable file ID.
+        _read_windows_private_config(absolute)
+    else:
+        if st.st_nlink != 1:
+            raise ValueError("private artifact destination has %d hardlinks: %s"
+                             % (st.st_nlink, absolute))
+        if st.st_uid != os.geteuid():
+            raise ValueError("private artifact destination is not owned by this user: %s"
+                             % absolute)
     return absolute, parent, st
 
 
@@ -1382,6 +1571,11 @@ def _same_file_snapshot(first, second):
 
 
 def _fsync_parent(path, label):
+    if sys.platform == "win32":
+        # MoveFileExW(MOVEFILE_WRITE_THROUGH) persists namespace transitions;
+        # Windows does not provide POSIX directory fsync semantics.
+        _local_publication_event(label + ":before_dir_fsync")
+        return
     parent = os.path.dirname(_private_abs(path)) or "."
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -1394,6 +1588,9 @@ def _fsync_parent(path, label):
 
 
 def _read_private_regular_snapshot(path, correct_mode=False):
+    if sys.platform == "win32":
+        # Readback never mutates ACLs; explicit repair uses _correct_private_mode.
+        return _read_windows_private_config(path, with_snapshot=True)
     absolute, _parent, opening_path_st = _validate_private_destination(
         path, must_exist=True)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -1460,6 +1657,8 @@ def _require_snapshot(path, expected, label):
 
 def _correct_private_mode(path):
     if os.path.lexists(_private_abs(path)):
+        if sys.platform == "win32":
+            _windows_restrict_path_acl(path)
         _read_private_regular(path, correct_mode=True)
 
 
@@ -1469,14 +1668,90 @@ def _safe_unlink_snapshot(path, expected):
     _LOCAL_UNLINK(path)
 
 
-def _atomic_publish_private(path, data, label, expected_snapshot=None):
-    """Durably publish bytes with reversible CAS semantics.
+_LOCAL_WINDOWS_MOVE = _windows_move
+_LOCAL_WINDOWS_REPLACE = _windows_replace
 
-    Existing destinations are exchanged with the staged inode. The displaced
-    inode is then compared with the snapshot captured before staging; drift is
-    exchanged back before failure. Absent destinations use RENAME_NOREPLACE.
+
+def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
+    """Publish with native flush, no-replace moves and replace backups.
+
+    ReplaceFileW preserves the displaced destination until its exact native
+    snapshot is verified. Operator drift is never overwritten deliberately.
     """
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError("private artifact data must be bytes")
+    absolute, parent, current_st = _validate_private_destination(path)
+    if expected_snapshot is None and current_st is not None:
+        _old_data, expected_snapshot = _read_private_regular_snapshot(
+            absolute, correct_mode=True)
+    elif expected_snapshot is not None:
+        _require_snapshot(absolute, expected_snapshot, label + " destination")
+    expected_absent = expected_snapshot is None
+    token = _secrets.token_hex(8)
+    tmp = os.path.join(parent, ".%s.%s-%s.tmp" % (os.path.basename(absolute), label, token))
+    backup = os.path.join(parent, ".%s.%s-%s.prior" % (os.path.basename(absolute), label, token))
+    fd = None
+    stage_snapshot = displaced_snapshot = None
+    transitioned = False
+    try:
+        _local_publication_event(label + ":before_stage_open")
+        fd = _windows_open_private_stage(tmp)
+        view = memoryview(bytes(data))
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while staging %s" % label)
+            view = view[written:]
+        _local_publication_event(label + ":before_file_fsync")
+        _windows_flush_fd(fd)
+        os.close(fd)
+        fd = None
+        stage_snapshot = _snapshot_at_path(tmp)
+        _local_publication_event(label + ":before_replace")
+        if _ACTIVE_REGISTER_KEY_OPERATION is not None:
+            _assert_register_key_operation()
+        if expected_absent:
+            _absolute, _parent, late_st = _validate_private_destination(absolute)
+            if late_st is not None:
+                raise ValueError("%s destination appeared before publication" % label)
+            _LOCAL_WINDOWS_MOVE(tmp, absolute, replace=False)
+            transitioned = True
+        else:
+            _require_snapshot(absolute, expected_snapshot, label + " destination")
+            _LOCAL_WINDOWS_REPLACE(absolute, tmp, backup)
+            transitioned = True
+            candidate_now = _snapshot_at_path(absolute)
+            displaced_snapshot = _snapshot_at_path(backup)
+            if (not _same_file_snapshot(candidate_now, stage_snapshot)
+                    or not _same_file_snapshot(displaced_snapshot, expected_snapshot)):
+                _LOCAL_WINDOWS_MOVE(backup, absolute, replace=True)
+                raise ValueError("%s destination changed during publication" % label)
+        _local_publication_event(label + ":after_replace")
+        actual = _snapshot_at_path(absolute, correct_mode=True)
+        if not _same_file_snapshot(actual, stage_snapshot):
+            raise OSError("published %s file ID/bytes do not match staged bytes" % label)
+        if displaced_snapshot is not None:
+            _safe_unlink_snapshot(backup, displaced_snapshot)
+        return absolute
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        try:
+            if not transitioned and os.path.lexists(tmp) and stage_snapshot is not None:
+                _safe_unlink_snapshot(tmp, stage_snapshot)
+            elif not transitioned and os.path.lexists(tmp):
+                os.unlink(tmp)
+        except (OSError, ValueError):
+            pass
+        # A retained backup is recovery evidence, never blindly deleted.
+        raise
+
+
+def _atomic_publish_private(path, data, label, expected_snapshot=None):
+    """Durably publish bytes with native compare-and-recover semantics."""
     _require_private_publication_platform()
+    if sys.platform == "win32":
+        return _windows_atomic_publish_private(path, data, label, expected_snapshot)
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("private artifact data must be bytes")
     absolute, parent, current_st = _validate_private_destination(path)
@@ -1583,40 +1858,49 @@ _REGISTER_KEY_PENDING_ACTIVE = False
 
 
 class _RegisterKeyOperationLock:
-    """Process-lifetime exclusion for one logical register-key config.
+    """Process-lifetime exclusion using a native kernel-owned lock.
 
-    The abstract Unix socket is authoritative, so replacing an inode-backed
-    lock pathname cannot admit a second process. An optional existing mode-0600
-    lock file is treated only as an audit artifact and is never created or
-    repaired by this command. Kernel socket/flock lifetime defines staleness:
-    normal return, exception, or process death releases ownership.
+    Linux uses its abstract socket/flock pair. Windows uses a named mutex,
+    which cannot be replaced through the filesystem and is released on process
+    death. An existing lock file remains a validated audit artifact only.
     """
 
     def __init__(self, config_path):
         _require_private_publication_platform()
         self.config_path = _private_abs(config_path)
         self.lock_path = self.config_path + ".register-key.lock"
+        owner = (_windows_current_sid() if sys.platform == "win32"
+                 else str(os.geteuid()))
         digest = hashlib.sha256(
-            (str(os.geteuid()) + "\0" + self.config_path).encode("utf-8")
-        ).hexdigest()
+            (owner + "\0" + self.config_path).encode("utf-8")).hexdigest()
         self.socket_name = "\0clack-register-key-v1-" + digest
+        self.mutex_name = "clack-register-key-v1-" + digest
         self._socket = None
+        self._mutex = None
         self._lock_fd = None
         self._lock_snapshot = None
 
     def __enter__(self):
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.set_inheritable(False)
-        try:
-            sock.bind(self.socket_name)
-        except OSError as exc:
-            sock.close()
-            if exc.errno == errno.EADDRINUSE:
+        if sys.platform == "win32":
+            try:
+                self._mutex = _windows_mutex_acquire(self.mutex_name)
+            except ValueError as exc:
                 raise ValueError(
                     "another register-key operation is already active for %s"
                     % self.config_path) from exc
-            raise
-        self._socket = sock
+        else:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.set_inheritable(False)
+            try:
+                sock.bind(self.socket_name)
+            except OSError as exc:
+                sock.close()
+                if exc.errno == errno.EADDRINUSE:
+                    raise ValueError(
+                        "another register-key operation is already active for %s"
+                        % self.config_path) from exc
+                raise
+            self._socket = sock
         try:
             lock_parent = os.path.dirname(self.lock_path) or "."
             _reject_symlink_components(lock_parent)
@@ -1626,7 +1910,9 @@ class _RegisterKeyOperationLock:
                     % lock_parent)
             _absolute, _parent, st = _validate_private_destination(
                 self.lock_path)
-            if st is not None:
+            if st is not None and sys.platform == "win32":
+                self._lock_snapshot = _snapshot_at_path(self.lock_path)
+            elif st is not None:
                 if stat.S_IMODE(st.st_mode) != 0o600:
                     raise ValueError(
                         "register-key audit lock must already be mode 0600: %s"
@@ -1671,7 +1957,10 @@ class _RegisterKeyOperationLock:
             raise
 
     def assert_held(self):
-        if self._socket is None or self._socket.fileno() < 0:
+        if sys.platform == "win32":
+            if self._mutex is None:
+                raise ValueError("register-key operation lock is not held")
+        elif self._socket is None or self._socket.fileno() < 0:
             raise ValueError("register-key operation lock is not held")
         if self._lock_snapshot is None:
             if os.path.lexists(self.lock_path):
@@ -1694,6 +1983,9 @@ class _RegisterKeyOperationLock:
         if self._socket is not None:
             self._socket.close()
             self._socket = None
+        if self._mutex is not None:
+            mutex, self._mutex = self._mutex, None
+            _windows_mutex_release(mutex)
         return False
 
 
@@ -2303,7 +2595,9 @@ def cmd_keygen(args):
     os.makedirs(os.path.dirname(os.path.abspath(args.config)) or ".", exist_ok=True)
     _save_identity_config(args.config, cfg, seed, key_path=args.key_path)
     print("identity created: %s" % args.config)
-    print("private key:      %s (mode 600; never leaves this machine)" % cfg["identity_privkey_path"])
+    protection = "owner-only ACL" if sys.platform == "win32" else "mode 600"
+    print("private key:      %s (%s; never leaves this machine)"
+          % (cfg["identity_privkey_path"], protection))
     print("pubkey: %s" % cfg["identity_pubkey"])
     return 0
 
@@ -2373,8 +2667,9 @@ def cmd_attach_key(args, cfg):
     _save_identity_config(args.config, new_cfg, seed,
                           key_path=getattr(args, "key_path", None))
     print("signing key attached: %s (peer %s)" % (args.config, peer_name))
-    print("private key: %s (mode 600; never leaves this machine)"
-          % new_cfg["identity_privkey_path"])
+    protection = "owner-only ACL" if sys.platform == "win32" else "mode 600"
+    print("private key: %s (%s; never leaves this machine)"
+          % (new_cfg["identity_privkey_path"], protection))
     print("pubkey for the relay operator's identity_pubkeys map:")
     print(b64u_encode(pub))
     return 0
@@ -3044,8 +3339,9 @@ def _finish_accepted_register_key(path, journal):
               % exc, file=sys.stderr)
         return 1
     if journal.get("generated"):
-        print("generated signing keypair; private key: %s (mode 600; never leaves this machine)"
-              % journal["key_path"])
+        protection = "owner-only ACL" if sys.platform == "win32" else "mode 600"
+        print("generated signing keypair; private key: %s (%s; never leaves this machine)"
+              % (journal["key_path"], protection))
     print("registered signing key for peer %r" % journal["peer"])
     print("pubkey: %s" % journal["identity_pubkey"])
     return 0
@@ -4284,7 +4580,8 @@ def main():
     k.add_argument("--relay-url", required=True, help="relay base URL, e.g. http://127.0.0.1:18998")
     k.add_argument("--force", action="store_true", help="overwrite existing config")
     k.add_argument("--key-path", default=None,
-                   help="private key file path (mode 600; default: <config>.key)")
+                   help="private key file path (mode 600 on POSIX, owner-only ACL "
+                        "on Windows; default: <config>.key)")
     k.add_argument("--user-agent", default=None)
 
     ak = sub.add_parser("attach-key",

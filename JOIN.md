@@ -64,29 +64,24 @@ Separate acceptance and consent still apply.
 
 ## Bundled CLI platform boundary
 
-For `relay-cli.py`, private credential publication requires Linux with
-`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`.
-This covers `keygen`, `attach-key`, `register-key`, `enroll`, `redeem`,
-and first-contact TOFU pin writes. Use a Linux kernel/filesystem supporting
-`RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`; there is no
-weaker publication fallback. Missing platform/API prerequisites report
-"private credential publication requires Linux" before enrollment requests,
-key generation or credential writes. Missing `renameat2` fails with `ENOSYS`;
-kernel/filesystem failures during publication still fail closed.
-CLI import and `--help` remain available elsewhere; unrelated operations with
-already-provisioned, pinned credentials are not blanket-disabled. This is not
-full Windows/macOS qualification. The original 243-check `test-register-key.py`
-focused suite is Linux-only; additional portability regressions are counted
-separately in `tests/test_cli_publication_platform.py`.
+On Linux, `relay-cli.py` private credential publication continues to require
+`fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`,
+with `RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`. There is
+no weaker publication fallback. Native Windows onboarding needs no WSL or
+Linux bridge: `CreateFileW` handles protect non-inherited owner-only DACLs,
+`FlushFileBuffers` durably flushes them, `MoveFileExW` performs no-replace
+publication, `ReplaceFileW` preserves replacement backups, and a named mutex
+excludes concurrent key registration. Config and private-key reads verify the
+current owner SID, stable file identity, single-link regular-file state and
+absence of reparse points. `tests/test_cli_windows_native.py` exercises these
+operations on actual Windows; it is not a production deployment qualification.
 
-Already-provisioned Windows config reads use native, read-only file handles and
-current-process owner-SID verification; symlinks/reparse points, non-regular files,
-multiple links and changed identities are rejected. These reads never create,
-chmod or publish credentials. Windows file/security APIs and a verifiable owner
-are required; unavailable verification fails closed with a concise config error.
-`tests/test_cli_provisioned_reader.py` covers the actual config-reader path with
-missing POSIX APIs and a Windows API-contract fixture. This is simulated coverage,
-not native Windows qualification; Linux publication requirements above remain unchanged.
+macOS remains fail closed with `ENOSYS`. CLI import and `--help` remain
+available elsewhere; unrelated operations with already-provisioned, pinned
+credentials are not blanket-disabled. The original 243-check
+`test-register-key.py` focused suite is Linux-only; portability and native
+Windows regressions are counted separately. `tests/test_cli_provisioned_reader.py`
+is a Windows API-contract simulation, not a substitute for native testing.
 
 ## Existing identity continuity
 

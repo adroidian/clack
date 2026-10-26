@@ -137,8 +137,11 @@ class InvitationCLI(unittest.TestCase):
         durable = cli.load_config(self.path)
         self.assertEqual(durable["identity_pubkey"], cfg["identity_pubkey"])
         self.assertEqual(cli.signing_seed(durable), self.seed)
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
-        self.assertEqual(os.stat(durable["identity_privkey_path"]).st_mode & 0o777, 0o600)
+        if sys.platform != "win32":
+            # Windows owner-only ACLs are covered by real native handle/ACL tests;
+            # st_mode does not represent Windows discretionary access control.
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(durable["identity_privkey_path"]).st_mode & 0o777, 0o600)
         if path == "/v1/enroll/challenge":
             self.assertEqual(body, {"invite_id": str(HANDLE), "k": SECRET,
                                     "identity_pubkey": cli.b64u_encode(self.pub)})

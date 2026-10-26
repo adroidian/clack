@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import types
@@ -43,7 +44,9 @@ class Function:
 class Win32Fixture:
     """Contract fake; records every native call, tracks resources and file data."""
     def __init__(self):
-        self.current_uid = os.geteuid()
+        # The fake translates Windows ownership checks to fixture-file uids.
+        # Native Windows exposes a stable zero here; POSIX uses the real owner.
+        self.current_uid = os.geteuid() if hasattr(os, "geteuid") else 0
         self.calls, self.files, self.tokens, self.descriptors = [], {}, set(), set()
         self.fail = None
         self.owner_matches = True
@@ -56,7 +59,7 @@ class Win32Fixture:
         self.kernel = types.SimpleNamespace()
         self.security = types.SimpleNamespace()
         for name in ('CreateFileW', 'GetFileType', 'GetFileInformationByHandle',
-                     'ReadFile', 'CloseHandle', 'GetCurrentProcess', 'LocalFree'):
+                     'ReadFile', 'CloseHandle', 'FlushFileBuffers', 'GetCurrentProcess', 'LocalFree'):
             setattr(self.kernel, name, Function(self.dispatch(name)))
         for name in ('GetSecurityInfo', 'OpenProcessToken', 'GetTokenInformation', 'EqualSid'):
             setattr(self.security, name, Function(self.dispatch(name)))
@@ -77,7 +80,8 @@ class Win32Fixture:
     def CreateFileW(self, path, access, share, security, disposition, flags, template):
         assert access == 0x80020000 and share == 1 and disposition == 3 and flags == 0x00200000
         assert security is None and template is None
-        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+                     | getattr(os, 'O_BINARY', 0))
         self.files[fd] = path
         return fd
 
@@ -139,6 +143,8 @@ class Win32Fixture:
             del self.files[handle]
         return 1
 
+    def FlushFileBuffers(self, handle): return 1
+
     def LocalFree(self, pointer):
         self.descriptors.remove(value(pointer))
         return None
@@ -155,8 +161,9 @@ def windows_without_posix(fixture):
         stack.enter_context(mock.patch.object(sys, 'platform', 'win32'))
         stack.enter_context(mock.patch.object(ctypes, 'WinDLL', fixture.loader, create=True))
         stack.enter_context(mock.patch.object(ctypes, 'get_last_error', return_value=5, create=True))
-        stack.enter_context(mock.patch.object(os, 'geteuid'))
-        del os.geteuid
+        if hasattr(os, 'geteuid'):
+            stack.enter_context(mock.patch.object(os, 'geteuid'))
+            del os.geteuid
         if hasattr(os, 'getuid'):
             stack.enter_context(mock.patch.object(os, 'getuid'))
             del os.getuid
@@ -212,7 +219,7 @@ class ProvisionedReaderTests(unittest.TestCase):
                 with self.subTest(command=argv[0]), mock.patch.object(sys, 'argv', ['cli','--config',str(self.config),*argv]), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(self.cli.main(), 0)
             self.assertEqual(req.call_count, 5)
-        self.assertEqual(self.fixture.calls.count('EqualSid'), 10)
+        self.assertEqual(self.fixture.calls.count('EqualSid'), 16)
         self.assertEqual(snapshot(self.root), before)
         self.fixture.assert_closed(self)
 
@@ -245,14 +252,22 @@ class ProvisionedReaderTests(unittest.TestCase):
         self.fixture.assert_closed(self)
 
     def test_symlink_ancestor_rejected_without_opening_handle(self):
-        (self.root/'link').symlink_to(self.root, target_is_directory=True)
+        if sys.platform == 'win32':
+            # Directory junctions need no developer mode and exercise the same
+            # native reparse-point rejection as a symlink ancestor.
+            subprocess.run(['cmd', '/c', 'mklink', '/J', str(self.root/'link'), str(self.root)],
+                           check=True, capture_output=True, text=True)
+        else:
+            (self.root/'link').symlink_to(self.root, target_is_directory=True)
         with windows_without_posix(self.fixture), self.assertRaisesRegex(ValueError, 'symlink'):
             self.cli.load_config(str(self.root/'link/client.json'))
         self.assertNotIn('CreateFileW', self.fixture.calls)
         self.fixture.assert_closed(self)
 
     def test_directory_rejected_without_data_read(self):
-        with windows_without_posix(self.fixture), self.assertRaisesRegex(ValueError, 'regular file'):
+        # POSIX reaches the regular-file check; native Windows may reject the
+        # directory at CreateFileW before a handle exists. Both fail closed.
+        with windows_without_posix(self.fixture), self.assertRaises((ValueError, OSError)):
             self.cli.load_config(str(self.root))
         self.assertNotIn('ReadFile', self.fixture.calls)
         self.fixture.assert_closed(self)
@@ -300,16 +315,18 @@ class ProvisionedReaderTests(unittest.TestCase):
         self.assertNotIn('Traceback',err.getvalue())
 
     def test_linux_reader_keeps_original_single_link_owner_validation(self):
-        with mock.patch.object(self.cli,'_read_windows_private_config',side_effect=AssertionError('Windows path on Linux')):
+        with mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.object(os, 'geteuid', return_value=0, create=True), \
+                mock.patch.object(self.cli,'_read_windows_private_config',side_effect=AssertionError('Windows path on Linux')):
             self.assertEqual(self.cli.load_config(str(self.config)),self.cfg)
             os.link(self.config,self.root/'alias')
             with self.assertRaisesRegex(ValueError,'hardlinks'): self.cli.load_config(str(self.config))
 
-    def test_publication_stays_blocked_before_native_reader_or_effects(self):
+    def test_macos_publication_stays_blocked_before_reader_or_effects(self):
         commands = [['keygen','--relay-url',self.cfg['relay_url']],['attach-key'],['register-key'],
                     ['redeem','invalid-link-not-to-be-read'],['enroll','--relay',self.cfg['relay_url'],'--yes']]
         before = snapshot(self.root)
-        with windows_without_posix(self.fixture):
+        with mock.patch.object(sys, 'platform', 'darwin'):
             for argv in commands:
                 with self.subTest(command=argv[0]), mock.patch.object(sys,'argv',['cli','--config',str(self.config),*argv]), contextlib.redirect_stderr(io.StringIO()):
                     self.assertEqual(self.cli.main(),1)

@@ -286,10 +286,18 @@ class NewAgentInvitationTests(unittest.TestCase):
         unclaimed = self.mint_new()
         h2, k2 = self.parts(unclaimed)
         old_path = Path(self.temp.name) / 'predecessor.py'
+        # Local object reads need no credential-helper overrides. In particular,
+        # Windows cannot round-trip an empty GIT_CONFIG_VALUE_n through putenv.
+        git_env = {key: value for key, value in os.environ.items()
+                   if not key.startswith('GIT_CONFIG_')}
         old_path.write_bytes(subprocess.check_output([
-            'git', '-C', str(root), 'show', '0c02b037b7c4002a398d3a1de0d2ec5965043842:relay.py']))
+            'git', '-C', str(root), 'show', '0c02b037b7c4002a398d3a1de0d2ec5965043842:relay.py'],
+            env=git_env))
         self.r.conn.close()
-        with mock.patch.dict(os.environ, {'CLACK_RELAY_BASE': self.temp.name}):
+        # The predecessor imports fcntl unconditionally. This test exercises
+        # successor-era database rejection, not predecessor Windows lock support.
+        with mock.patch.dict(os.environ, {'CLACK_RELAY_BASE': self.temp.name}), \
+                mock.patch.dict('sys.modules', {'fcntl': mock.Mock()}):
             spec = importlib.util.spec_from_file_location('short_predecessor_relay', old_path)
             old = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(old)

@@ -40,6 +40,9 @@ class ConfigPeerRestartPreservationTests(unittest.TestCase):
             "enroll_ip, invited_by FROM peers WHERE name='alice'"
         ).fetchone()
 
+        # init_db opens a new connection; close the previous one as a real
+        # restart would, especially before Windows temporary-directory cleanup.
+        self.r.conn.close()
         self.r.init_db({"peers": {"alice": "token-two", "bob": "token-bob"}})
 
         after = self.r.conn.execute(
@@ -67,6 +70,7 @@ class ConfigPeerRestartPreservationTests(unittest.TestCase):
             "FROM peers WHERE name='dynamic'"
         ).fetchone()
 
+        self.r.conn.close()
         with self.assertRaisesRegex(
             SystemExit, "config-managed peer name collides with an enrolled peer"
         ):

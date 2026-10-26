@@ -8,7 +8,11 @@ server never executes, interprets, or acts on message text.
 """
 import base64
 import faulthandler
-import fcntl
+import sys
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -21,7 +25,6 @@ import signal
 import socket
 import sqlite3
 import stat
-import sys
 import threading
 import time
 import urllib.parse
@@ -251,7 +254,11 @@ class _RegistrationConfigFileLock:
                 raise OSError("registration lock is not a regular file")
             os.fchmod(fd, 0o600)
             os.fsync(fd)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if sys.platform == "win32":
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX)
         except Exception:
             os.close(fd)
             raise
@@ -260,7 +267,11 @@ class _RegistrationConfigFileLock:
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            if sys.platform == "win32":
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
         finally:
             os.close(self.fd)
             self.fd = None

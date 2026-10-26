@@ -36,9 +36,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "relay-cli.py"
 ERROR = (
-    "private credential publication requires Linux with fcntl.flock, os.geteuid, "
-    "abstract AF_UNIX sockets and renameat2; run enrollment/key setup in a "
-    "supported Linux environment"
+    "private credential publication requires supported native Linux or Windows "
+    "file, security and locking APIs"
 )
 DOCS = ("README.md", "QUICKSTART.md", "JOIN.md", "CLIENT_CONTRACT.md", "CHANGELOG.md")
 SEED = bytes(range(32))  # disposable test material, never a real identity
@@ -179,12 +178,6 @@ class PublicationPlatformTests(unittest.TestCase):
             self.assertIsNone(module._RENAMEAT2)
             self.assert_requirement(module._require_private_publication_platform)
 
-    def test_windows_commands_reject_before_effects(self):
-        with mock.patch.object(sys, "platform", "win32"), \
-                mock.patch.object(self.cli, "fcntl", None), \
-                absent_attr(os, "geteuid"), absent_attr(socket, "AF_UNIX"):
-            self.check_command_rejections()
-
     def test_macos_commands_reject_even_with_unix_primitives(self):
         with mock.patch.object(sys, "platform", "darwin"):
             self.check_command_rejections()
@@ -201,7 +194,7 @@ class PublicationPlatformTests(unittest.TestCase):
                 with self.subTest(missing_api=index), context:
                     self.check_command_rejections()
 
-    def test_direct_command_entrypoints_reject_before_effects(self):
+    def test_direct_linux_entrypoints_reject_before_effects(self):
         calls = (
             lambda: self.cli.cmd_keygen(self.args),
             lambda: self.cli.cmd_attach_key(self.args, self.cfg),
@@ -209,12 +202,13 @@ class PublicationPlatformTests(unittest.TestCase):
             lambda: self.cli.cmd_redeem(self.args),
             lambda: self.cli.cmd_enroll(self.args),
         )
-        with mock.patch.object(self.cli, "_RENAMEAT2", None), self.no_enrollment_effects():
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(self.cli, "_RENAMEAT2", None), self.no_enrollment_effects():
             for index, call in enumerate(calls):
                 with self.subTest(entrypoint=index):
                     self.assert_requirement(call)
 
-    def test_publication_helpers_reject_without_chmod_or_parent_creation(self):
+    def test_unsupported_publication_helpers_reject_without_effects(self):
         calls = (
             lambda: self.cli._atomic_publish_private(str(self.config), b"replacement", "config"),
             lambda: self.cli._atomic_publish_private(str(self.root / "absent" / "key"), SEED, "key"),
@@ -224,7 +218,7 @@ class PublicationPlatformTests(unittest.TestCase):
             lambda: self.cli._RegisterKeyOperationLock(str(self.config)),
         )
         cfg_before = copy.deepcopy(self.cfg)
-        for platform in ("win32", "darwin", "linux"):
+        for platform in ("darwin", "linux"):
             with self.subTest(platform=platform), mock.patch.object(sys, "platform", platform), \
                     mock.patch.object(self.cli, "_RENAMEAT2", None), self.no_enrollment_effects():
                 for call in calls:
@@ -268,6 +262,7 @@ class PublicationPlatformTests(unittest.TestCase):
                     mock.patch.object(self.cli, "_persist_tofu_pin", side_effect=AssertionError("pin write")):
                 self.assertEqual(self.cli._ensure_origin_verified(self.cfg["relay_url"], self.cfg), "pinned")
 
+    @unittest.skipUnless(sys.platform == "linux", "requires actual Linux")
     def test_linux_positive_control_publication_and_lock_are_real(self):
         # A supported Linux run must still mutate these same valid fixtures;
         # the negative snapshots above cannot pass merely because writes are no-ops.
@@ -281,14 +276,13 @@ class PublicationPlatformTests(unittest.TestCase):
         self.assertEqual(json.loads(self.config.read_text()), self.cfg)
         self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
 
-    def test_all_five_docs_state_boundary_and_linux_suite_scope(self):
+    def test_all_five_docs_state_native_boundary_and_linux_suite_scope(self):
         for name in DOCS:
             with self.subTest(document=name):
                 text = " ".join((ROOT / name).read_text().split())
-                for required in (ERROR.split(" with ")[0], "`fcntl.flock`", "`os.geteuid`",
-                                 "`AF_UNIX`", "`renameat2`", "`ENOSYS`", "`RENAME_EXCHANGE`",
-                                 "`RENAME_NOREPLACE`", "`fsync`", "243-check", "Linux-only",
-                                 "already-provisioned, pinned", "`--help`"):
+                for required in ("native Windows", "owner-only", "`CreateFileW`",
+                                 "`ReplaceFileW`", "macOS", "`ENOSYS`", "243-check",
+                                 "Linux-only", "already-provisioned, pinned", "`--help`"):
                     self.assertIn(required, text)
 
     def test_fresh_isolated_child_import_and_help_without_fcntl(self):
@@ -312,7 +306,7 @@ spec.loader.exec_module(module)
 sys.argv = [sys.argv[1], "--help"]
 module.main()
 '''
-        env = {"PATH": os.defpath, "HOME": str(self.root), "TMPDIR": str(self.root)}
+        env = dict(os.environ, HOME=str(self.root), TMPDIR=str(self.root))
         before = snapshot(self.root)
         child = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(CLI)],
                                cwd=self.root, env=env, capture_output=True, text=True, timeout=15)
