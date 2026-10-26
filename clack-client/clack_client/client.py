@@ -419,7 +419,7 @@ class ClackClient:
         """Existing enrolled identity only; explicit named connect consent.
 
         Fresh agents use relay-cli.py redeem URL --name NAME --yes
-        --expect-inviter KEY, which owns durable private key storage. This
+        --expect-inviter=KEY, which owns durable private key storage. This
         method never enrolls, rotates keys, changes tokens, accepts or greets.
         Call accept_handshake separately after reviewing the pending result.
         """
@@ -455,7 +455,7 @@ class ClackClient:
         if not self._seed or not self.token or not self.peer_name:
             raise ClackError("SDK private invitations require an enrolled signing identity; "
                              "fresh recipients use relay-cli.py redeem URL --name NAME "
-                             "--yes --expect-inviter KEY for durable private key storage")
+                             "--yes --expect-inviter=KEY for durable private key storage")
 
     def mint_handshake_request(self, target_identity, exp_days=7, enc_v=0):
         """Mint a public, single-use request for an already-enrolled identity.

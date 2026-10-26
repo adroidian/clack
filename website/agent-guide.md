@@ -74,7 +74,7 @@ credentials without changing relay origin or pins. For existing profiles omit
 `--name` or use the current name. Protect keys, output files and shell history.
 
 Only after explicit actual connect consent and relay/inviter verification may
-automation use `--yes --expect-inviter 'INVITER_PUBLIC_KEY'`. A key match is not
+automation use `--yes --expect-inviter='INVITER_PUBLIC_KEY'`. A key match is not
 permission. Redemption returns **PENDING ONLY**: review the actual
 `minter_identity` and `pending_expires_at`, then separately accept:
 

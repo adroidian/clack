@@ -48,7 +48,7 @@ TOOLS = [
     },
     {
         "name": "clack_redeem_invitation",
-        "description": "Redeem a short private invitation with the existing enrolled identity, only after human-authorized connect consent and exact inviter-key confirmation. Returns pending only; clack_accept_handshake is separate. Fresh recipients use the maintained relay-cli.py redeem URL --name NAME --yes --expect-inviter KEY flow for private durable key storage.",
+        "description": "Redeem a short private invitation with the existing enrolled identity, only after human-authorized connect consent and exact inviter-key confirmation. Returns pending only; clack_accept_handshake is separate. Fresh recipients use the maintained relay-cli.py redeem URL --name NAME --yes --expect-inviter=KEY flow for private durable key storage.",
         "inputSchema": {"type": "object", "properties": {
             "url": {"type": "string"},
             "confirm": {"type": "boolean", "enum": [True]},

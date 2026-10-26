@@ -284,14 +284,33 @@ class PublicationPlatformTests(unittest.TestCase):
         self.assertEqual(json.loads(self.config.read_text()), self.cfg)
         self.assertEqual(stat.S_IMODE(self.key.stat().st_mode), 0o600)
 
+    def test_linux_register_key_guard_preserves_main_dispatch(self):
+        # Dispatch fixture on any host; actual Linux transaction evidence remains separate.
+        before = snapshot(self.root)
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(self.cli, "_require_private_publication_platform") as require, \
+                mock.patch.object(self.cli, "cmd_register_key", return_value=0) as command, \
+                mock.patch.object(sys, "argv", [
+                    str(CLI), "--config", str(self.config), "register-key"]):
+            self.assertIsNone(self.cli._require_register_key_platform())
+            self.assertEqual(self.cli.main(), 0)
+        require.assert_called_once_with()
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0].cmd, "register-key")
+        self.assertEqual(snapshot(self.root), before)
+
     def test_all_five_docs_state_native_boundary_and_linux_suite_scope(self):
         for name in DOCS:
             with self.subTest(document=name):
                 text = " ".join((ROOT / name).read_text().split())
                 for required in ("native Windows", "owner-only", "`CreateFileW`",
                                  "`ReplaceFileW`", "macOS", "`ENOSYS`", "243-check",
-                                 "Linux-only", "already-provisioned, pinned", "`--help`"):
+                                 "Linux-only", "already-provisioned, pinned", "`--help`",
+                                 "PowerShell", "no automatic ACL repair", "`.prior`",
+                                 "flags zero", "error-1177", "desktop-versus-SSH"):
                     self.assertIn(required, text)
+                self.assertNotIn("Replacement tightens the retained destination DACL", text)
+                self.assertNotIn("native write-through flags", text)
 
     def test_fresh_isolated_child_import_and_help_without_fcntl(self):
         # -I avoids ambient module paths; -B (not just PYTHONDONTWRITEBYTECODE)

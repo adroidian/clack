@@ -1030,8 +1030,9 @@ def _windows_replace(destination, source, backup):
     function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
                          ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
     function.restype = ctypes.c_int32
-    # REPLACEFILE_WRITE_THROUGH requests durable replacement semantics.
-    if not function(destination, source, backup, 1, None, None):
+    # Flag 1 (REPLACEFILE_WRITE_THROUGH) is documented as unsupported.
+    # Stage data is flushed separately; no power-loss guarantee is inferred.
+    if not function(destination, source, backup, 0, None, None):
         raise OSError(ctypes.get_last_error(), "ReplaceFileW failed", destination)
 
 
@@ -1487,6 +1488,19 @@ def _require_private_publication_platform():
         raise OSError(errno.ENOSYS, PRIVATE_PUBLICATION_REQUIREMENT)
 
 
+REGISTER_KEY_WINDOWS_REQUIREMENT = (
+    "register-key is Linux-only on this client; Windows refuses before local "
+    "or remote effects. Preserve the existing config, key and pending journal; "
+    "no recovery action was attempted"
+)
+
+
+def _require_register_key_platform():
+    """Keep the unported Windows transaction closed at every public entry."""
+    if sys.platform == "win32":
+        raise OSError(errno.ENOSYS, REGISTER_KEY_WINDOWS_REQUIREMENT)
+
+
 def _local_publication_event(name):
     hook = _LOCAL_PUBLICATION_HOOK
     if hook is not None:
@@ -1669,8 +1683,9 @@ def _same_file_snapshot(first, second):
 
 def _fsync_parent(path, label):
     if sys.platform == "win32":
-        # Native MoveFileExW/ReplaceFileW use their WRITE_THROUGH flags;
-        # Windows does not provide POSIX directory fsync semantics.
+        # MoveFileExW uses MOVEFILE_WRITE_THROUGH and stage data is flushed
+        # before either namespace operation. ReplaceFileW has no supported
+        # write-through flag; Windows has no POSIX directory-fsync equivalent.
         _local_publication_event(label + ":before_dir_fsync")
         return
     parent = os.path.dirname(_private_abs(path)) or "."
@@ -1769,33 +1784,48 @@ _LOCAL_WINDOWS_MOVE = _windows_move
 _LOCAL_WINDOWS_REPLACE = _windows_replace
 
 
+def _windows_require_private_snapshot(snapshot, label):
+    """Refuse unsuitable existing protection before any publication mutation."""
+    sid = snapshot.get("uid") if snapshot else None
+    security = snapshot.get("security") if snapshot else None
+    suitable = isinstance(sid, str) and security in (
+        "O:%sD:P(A;;FA;;;%s)" % (sid, sid),
+        "O:%sD:PAI(A;;FA;;;%s)" % (sid, sid),
+    )
+    if not suitable:
+        raise ValueError(
+            "%s must already have a protected owner-only Windows DACL; "
+            "refusing before changing its bytes or security. Reconcile the "
+            "existing file's owner and ACL explicitly; no automatic ACL repair "
+            "was attempted" % label)
+
+
 def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
     """Publish with native flush, no-replace moves and replace backups.
 
-    ReplaceFileW preserves the displaced destination until its exact native
-    snapshot is verified. Operator drift is never overwritten deliberately.
+    Existing destinations must already be private. ReplaceFileW retains their
+    security and preserves the displaced file until exact readback attestation.
+    Operator drift is never overwritten deliberately or repaired implicitly.
     """
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("private artifact data must be bytes")
     absolute, parent, current_st = _validate_private_destination(path)
     if current_st is not None:
-        if expected_snapshot is not None:
-            # Detect caller-visible ACL drift before repairing the destination.
-            _require_snapshot(absolute, expected_snapshot, label + " destination")
-        # ReplaceFileW retains destination security metadata. Make the target
-        # exactly caller-only before any new secret bytes can become visible.
-        _windows_restrict_path_acl(absolute)
-        if expected_snapshot is None:
-            _old_data, expected_snapshot = _read_private_regular_snapshot(
-                absolute, correct_mode=True)
-        else:
-            _require_snapshot(absolute, expected_snapshot, label + " destination")
+        _old_data, current_snapshot = _read_private_regular_snapshot(
+            absolute, correct_mode=False)
+        if (expected_snapshot is not None
+                and not _same_file_snapshot(current_snapshot, expected_snapshot)):
+            raise ValueError(
+                "%s destination changed before publication; reconcile its "
+                "content, identity, owner, links and security before retrying" % label)
+        _windows_require_private_snapshot(current_snapshot, label + " destination")
+        expected_snapshot = current_snapshot
     expected_absent = expected_snapshot is None
     token = _secrets.token_hex(8)
     tmp = os.path.join(parent, ".%s.%s-%s.tmp" % (os.path.basename(absolute), label, token))
     backup = os.path.join(parent, ".%s.%s-%s.prior" % (os.path.basename(absolute), label, token))
     fd = None
-    stage_snapshot = displaced_snapshot = None
+    stage_snapshot = displaced_snapshot = published_snapshot = None
     transitioned = False
     try:
         _local_publication_event(label + ":before_stage_open")
@@ -1811,6 +1841,7 @@ def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
         os.close(fd)
         fd = None
         stage_snapshot = _snapshot_at_path(tmp)
+        published_snapshot = stage_snapshot
         _local_publication_event(label + ":before_replace")
         if _ACTIVE_REGISTER_KEY_OPERATION is not None:
             _assert_register_key_operation()
@@ -1822,21 +1853,24 @@ def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
             transitioned = True
         else:
             _require_snapshot(absolute, expected_snapshot, label + " destination")
+            # ReplaceFileW retains the destination DACL, not the stage DACL.
+            published_snapshot = dict(stage_snapshot)
+            published_snapshot["security"] = expected_snapshot.get("security")
             _LOCAL_WINDOWS_REPLACE(absolute, tmp, backup)
             transitioned = True
             candidate_now = _snapshot_at_path(absolute)
             displaced_snapshot = _snapshot_at_path(backup)
-            if (not _same_file_snapshot(candidate_now, stage_snapshot)
+            if (not _same_file_snapshot(candidate_now, published_snapshot)
                     or not _same_file_snapshot(displaced_snapshot, expected_snapshot)):
                 # Never overwrite a changed destination or delete uncertain
                 # recovery evidence. Both names are retained for the operator.
                 raise ValueError("%s destination changed during publication" % label)
         _local_publication_event(label + ":after_replace")
-        # Re-attest without mutating a possibly newer operator file. The exact
-        # snapshot already proves the retained/replacement DACL is private.
-        actual = _snapshot_at_path(absolute, correct_mode=True)
-        if not _same_file_snapshot(actual, stage_snapshot):
-            raise OSError("published %s file ID/bytes do not match staged bytes" % label)
+        # Re-attest without mutating a possibly newer operator file. For a
+        # replacement, exact retained destination security is part of readback.
+        actual = _snapshot_at_path(absolute, correct_mode=False)
+        if not _same_file_snapshot(actual, published_snapshot):
+            raise OSError("published %s file ID/bytes/security do not match the expected snapshot" % label)
         if displaced_snapshot is not None:
             _safe_unlink_snapshot(backup, displaced_snapshot)
         return absolute
@@ -2128,8 +2162,16 @@ def _save_identity_config(path, cfg, seed, key_path=None):
         raise ValueError("config and private key paths must name different files")
     _validate_private_destination(cp)
     _validate_private_destination(kp)
-    _correct_private_mode(cp)
-    _correct_private_mode(kp)
+    if sys.platform == "win32":
+        # Preflight both destinations before publishing either one. Existing
+        # Windows files are never silently ACL-repaired as a side effect.
+        for artifact, label in ((cp, "config"), (kp, "key")):
+            if os.path.lexists(artifact):
+                _windows_require_private_snapshot(
+                    _snapshot_at_path(artifact), label + " destination")
+    else:
+        _correct_private_mode(cp)
+        _correct_private_mode(kp)
     cfg.pop("identity_privkey", None)
     cfg["identity_privkey_path"] = kp
     _write_key_file(kp, seed)
@@ -3591,7 +3633,8 @@ def _load_register_key_config(config_path):
 
 
 def cmd_register_key(args, cfg=None):
-    """Serialize the complete durable register-key state machine."""
+    """Serialize the complete durable register-key state machine on Linux."""
+    _require_register_key_platform()
     _require_private_publication_platform()
     del cfg  # Caller snapshots are advisory; authority is re-read under lock.
     global _ACTIVE_REGISTER_KEY_OPERATION, _REGISTER_KEY_PENDING_ACTIVE
@@ -4082,7 +4125,7 @@ def _redeem_private_invitation_locked(args):
         if expected is not None:
             _canonical_inviter(expected)
         if getattr(args, "yes", False) and expected is None:
-            raise ValueError("--yes requires --expect-inviter CANONICAL_PUBLIC_KEY")
+            raise ValueError("--yes requires --expect-inviter=CANONICAL_PUBLIC_KEY")
         name = getattr(args, "name", None)
         import re
         if name is not None and (not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,30}", name)
@@ -4288,6 +4331,20 @@ def cmd_redeem(args):
     return 0
 
 
+def _accept_handshake_command(executable, script, config, handshake_id):
+    """Return one honestly labeled, copy/pasteable acceptance instruction."""
+    argv = [executable, script, "--config", config, "accept-handshake",
+            "--enc-v", "1", "--", handshake_id]
+    if sys.platform == "win32":
+        # PowerShell single-quoted literals double embedded apostrophes. The
+        # invocation operator is required for quoted executable paths.
+        literals = ["'" + str(argument).replace("'", "''") + "'"
+                    for argument in argv]
+        return "PowerShell", "& " + " ".join(literals)
+    import shlex
+    return "POSIX shell", shlex.join(argv)
+
+
 def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub,
                          private_invitation=False):
     """Redeem a v4 handshake link: inline enrollment (invite/PoW/open gate)
@@ -4412,15 +4469,15 @@ def _redeem_v4_handshake(args, cfg, f, relay_url, relay_fp, seed, pub,
           % (out.get("handshake_id"), out.get("status")))
 
     if private_invitation:
-        import shlex
         summary = {key: out.get(key) for key in (
             "status", "handshake_id", "minter_identity", "pending_expires_at",
             "via_link_id", "generation", "enc_capable")}
         print(json.dumps({"pending_handshake": summary}, indent=2))
         print("Pending only. Review the actual inviter and pending deadline before accepting.")
-        print("Next command: " + shlex.join([
-            sys.executable, os.path.abspath(__file__), "--config", os.path.abspath(args.config),
-            "accept-handshake", "--enc-v", "1", "--", out["handshake_id"]]))
+        shell, command = _accept_handshake_command(
+            sys.executable, os.path.abspath(__file__),
+            os.path.abspath(args.config), out["handshake_id"])
+        print("Next command (%s): %s" % (shell, command))
         print("config saved: %s" % args.config)
         return 0
 
@@ -4725,12 +4782,12 @@ def main():
                     help="private key file path (mode 600; default: <config>.key)")
 
     rk = sub.add_parser("register-key",
-                        help="self-service Ed25519 key registration: bootstrap "
-                             "a legacy token config, or re-register exactly "
+                        help="Linux-only self-service Ed25519 key registration: "
+                             "bootstrap a legacy token config, or re-register exactly "
                              "the key derived from an existing identity seed "
-                             "(no key rotation)")
+                             "(no key rotation); Windows refuses before any effects")
     rk.add_argument("--key-path", default=None,
-                    help="private key file path (mode 600; default: <config>.key)")
+                    help="private key file path (Linux mode 600; default: <config>.key)")
 
     m = sub.add_parser("mint-invite", help="mint a shareable join link")
     m.add_argument("--max-uses", type=int, default=1)
@@ -4752,8 +4809,9 @@ def main():
     rd = sub.add_parser("redeem", help="redeem an invite link (full join flow)")
     rd.add_argument("link", help="the invite link (or its #fragment payload)")
     rd.add_argument("--name", default=None, help="peer name for short private invitation enrollment")
-    rd.add_argument("--yes", action="store_true", help="explicit connect consent; requires --expect-inviter")
-    rd.add_argument("--expect-inviter", default=None, help="expected canonical inviter Ed25519 public key")
+    rd.add_argument("--yes", action="store_true", help="explicit connect consent; requires --expect-inviter=KEY")
+    rd.add_argument("--expect-inviter", default=None,
+                    help="expected canonical inviter Ed25519 public key; use --expect-inviter=KEY so leading-hyphen keys are preserved")
 
     e = sub.add_parser("enroll", help="self-enroll a new agent identity (v0.2.9)")
     e.add_argument("--name", default=None, help="desired peer name (optional)")
@@ -4769,7 +4827,14 @@ def main():
     rv.add_argument("invite_id")
 
     args = ap.parse_args()
-    if args.cmd in ("keygen", "attach-key", "register-key", "redeem", "enroll"):
+    if args.cmd == "register-key":
+        try:
+            _require_register_key_platform()
+            _require_private_publication_platform()
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    elif args.cmd in ("keygen", "attach-key", "redeem", "enroll"):
         try:
             _require_private_publication_platform()
         except OSError as exc:

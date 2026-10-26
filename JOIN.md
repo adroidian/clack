@@ -39,7 +39,7 @@ and persists a new private key locally **before enrollment**. Existing profiles
 reuse their key/token; their configured relay origin and pins must not change.
 Omit `--name` for an existing identity or use its current name.
 
-Automation may use `--yes --expect-inviter 'INVITER_PUBLIC_KEY'` only after
+Automation may use `--yes --expect-inviter='INVITER_PUBLIC_KEY'` only after
 explicit actual connect consent and independent relay/inviter verification.
 That flag does not grant consent on behalf of a human.
 
@@ -67,22 +67,41 @@ Separate acceptance and consent still apply.
 On Linux, `relay-cli.py` private credential publication continues to require
 `fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`,
 with `RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`. There is
-no weaker publication fallback. Native Windows onboarding needs no WSL or
-Linux bridge: `CreateFileW` handles give new stages explicit current-token
-ownership and non-inherited owner-only DACLs before secret bytes arrive.
-`FlushFileBuffers` flushes file data; `MoveFileExW` and `ReplaceFileW` use their
-native write-through flags. Replacement tightens the retained destination DACL
-before exposing new bytes, includes exact owner/DACL state in drift checks, and
-preserves uncertain backups rather than blindly restoring over operator edits.
-A `Global\` named mutex binds the current SID and canonical logical path across
-Windows sessions, including case aliases for existing files and absent files
-with existing parents; distinct hardlink names are not equivalent. Curl header
-and body files use the same owner-only staging and are removed after the request.
-Config and private-key reads verify the current owner SID, stable file identity,
-single-link regular-file state and absence of reparse points.
-`tests/test_cli_windows_native.py` exercises these operations on actual Windows;
-independent second-session evidence is reported separately, and this is not a
-production deployment qualification.
+no weaker publication fallback. `register-key` is Linux-only: native Windows
+refuses it before locking, key generation, ACL/config/journal/TOFU writes or
+network requests, preserving existing config, key and pending artifacts without
+attempting recovery.
+
+Native Windows onboarding needs no WSL or Linux bridge: `CreateFileW` handles
+give new stages explicit current-token ownership and non-inherited owner-only
+DACLs before secret bytes arrive. Existing destinations must already have an
+exact protected current-user-only DACL. Publication refuses broader or otherwise
+unsuitable security before changing bytes or security; no automatic ACL repair
+occurs. Replacement includes exact owner/DACL state in drift checks and preserves
+uncertain backups rather than blindly restoring over operator edits.
+`FlushFileBuffers` flushes stage data. `MoveFileExW` uses
+`MOVEFILE_WRITE_THROUGH`; `ReplaceFileW` is called with flags zero because its
+write-through flag is unsupported. Namespace replacement and retained recovery
+files are separate from stage-data flushing; no power-loss guarantee is claimed.
+Preserve uncertain `.prior`, stage and current artifacts, stop blind retries, and
+reconcile exact owner/security/content before approved recovery or deletion. The
+documented `ReplaceFileW` error-1177 model can leave old bytes in `.prior` with
+the canonical name absent; this API-contract note is not a native fault
+reproduction.
+
+A `Global\` named mutex uses the current SID and canonical logical path, including
+case aliases for existing files and absent files with existing parents; distinct
+hardlink names are not equivalent. Actual desktop-versus-SSH second-session
+exclusion remains unproven. Curl header and body files use the same owner-only
+staging; cleanup is attempted after the request, but a denied final unlink can
+leave protected residuals and prevent the second final cleanup attempt. Config
+and private-key reads verify the current owner SID, stable file identity,
+single-link regular-file state and absence of reparse points. Private-invitation
+redemption prints a native PowerShell acceptance command using `&` and literal
+argument escaping on Windows, and POSIX-shell rendering on Linux. Redemption
+remains pending only; acceptance is always separate.
+`tests/test_cli_windows_native.py` exercises the supported operations on actual
+Windows; this is not a production deployment qualification.
 
 macOS remains fail closed with `ENOSYS`. CLI import and `--help` remain
 available elsewhere; unrelated operations with already-provisioned, pinned

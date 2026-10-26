@@ -114,6 +114,23 @@ class InvitationParsing(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class ExpectInviterArgv(unittest.TestCase):
+    def test_equals_form_preserves_leading_hyphen_and_normal_keys(self):
+        leading = cli.b64u_encode(bytes([0xF8]) + bytes(range(1, 32)))
+        self.assertTrue(leading.startswith("-"))
+        self.assertEqual(cli._canonical_inviter(leading), leading)
+        for key in (leading, INVITER):
+            with self.subTest(key=key), \
+                    patch.object(cli, "_require_private_publication_platform"), \
+                    patch.object(cli, "cmd_redeem", return_value=0) as redeem, \
+                    patch.object(sys, "argv", [
+                        str(ROOT / "relay-cli.py"), "--config", "disposable.json",
+                        "redeem", URL, "--name", "fresh-agent", "--yes",
+                        "--expect-inviter=" + key]):
+                self.assertEqual(cli.main(), 0)
+                self.assertEqual(redeem.call_args.args[0].expect_inviter, key)
+
+
 class InvitationCLI(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -450,7 +467,7 @@ class InvitationHTTP(unittest.TestCase):
     def test_fresh_cli_real_http_pending_then_separate_signed_accept(self):
         invitation = self.mint()
         redemption = self.cli_process(["redeem", invitation["link"], "--name", "fresh-agent", "--yes",
-                                       "--expect-inviter", self.fixture.pub["alice"]])
+                                       "--expect-inviter=" + self.fixture.pub["alice"]])
         saved = cli.load_config(self.path)
         with patch.dict(os.environ, {"CLACK_USE_CURL": "0"}):
             status, listed = cli.req(saved, "GET", "/v1/handshakes", base=self.fixture.base)
@@ -465,13 +482,23 @@ class InvitationHTTP(unittest.TestCase):
         self.assertIn('"minter_identity": "' + self.fixture.pub['alice'] + '"', redemption.stdout)
         self.assertNotIn(saved['service_token'], redemption.stdout)
         self.assertNotIn(invitation['link'].split('#', 1)[1], redemption.stdout)
-        emitted = next(line.removeprefix('Next command: ') for line in redemption.stdout.splitlines()
-                       if line.startswith('Next command: '))
-        command = shlex.split(emitted)
-        self.assertEqual(command, [sys.executable, str(self.downloaded), '--config', self.path,
-                                   'accept-handshake', '--enc-v', '1', '--', hs['handshake_id']])
-        accepted = subprocess.run(command, cwd=self.isolated, capture_output=True, text=True,
-                                 env={**os.environ, 'CLACK_USE_CURL': '0', 'PYTHONPATH': ''}, timeout=30)
+        prefix = ('Next command (PowerShell): ' if sys.platform == 'win32'
+                  else 'Next command (POSIX shell): ')
+        emitted = next(line.removeprefix(prefix) for line in redemption.stdout.splitlines()
+                       if line.startswith(prefix))
+        if sys.platform == 'win32':
+            powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+            self.assertIsNotNone(powershell)
+            accepted = subprocess.run(
+                [powershell, '-NoProfile', '-NonInteractive', '-Command', emitted],
+                cwd=self.isolated, capture_output=True, text=True,
+                env={**os.environ, 'CLACK_USE_CURL': '0', 'PYTHONPATH': ''}, timeout=30)
+        else:
+            command = shlex.split(emitted)
+            self.assertEqual(command, [sys.executable, str(self.downloaded), '--config', self.path,
+                                       'accept-handshake', '--enc-v', '1', '--', hs['handshake_id']])
+            accepted = subprocess.run(command, cwd=self.isolated, capture_output=True, text=True,
+                                     env={**os.environ, 'CLACK_USE_CURL': '0', 'PYTHONPATH': ''}, timeout=30)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         with patch.dict(os.environ, {"CLACK_USE_CURL": "0"}):
             _, active = cli.req(saved, "GET", "/v1/handshakes", base=self.fixture.base)
@@ -521,7 +548,7 @@ class InvitationHTTP(unittest.TestCase):
                 invitation = self.mint()
                 path = str(Path(self.fixture.temp.name) / ('fresh-' + gate + '.json'))
                 self.cli_process(['redeem', invitation['link'], '--name', 'fresh-' + gate,
-                                  '--yes', '--expect-inviter', self.fixture.pub['alice']], path)
+                                  '--yes', '--expect-inviter=' + self.fixture.pub['alice']], path)
                 saved = cli.load_config(path)
                 self.assertEqual(saved['peer_name'], 'fresh-' + gate)
                 self.assertEqual(self.fixture.state(), (3 + index, index, index))

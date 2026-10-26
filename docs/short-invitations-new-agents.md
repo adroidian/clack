@@ -88,7 +88,7 @@ bind the explicit connect consent to that key (no prior recipient key exchange):
 
 ```bash
 python3 relay-cli.py --config private/recipient.json redeem 'ENTIRE_URL' \
-  --name recipient --yes --expect-inviter 'INVITER_PUBLIC_KEY'
+  --name recipient --yes --expect-inviter='INVITER_PUBLIC_KEY'
 ```
 
 `--yes` is an explicit connect-consent assertion, not a way to skip obtaining

@@ -66,7 +66,7 @@ independently if first-contact trust is uncertain. The client
 persists the private key locally BEFORE enrollment, or reuses existing same-relay
 credentials. Do not change existing origin or pins; omit `--name` for existing
 profiles or use their current name. Automation can add
-`--yes --expect-inviter 'INVITER_PUBLIC_KEY'` only after actual connect consent and
+`--yes --expect-inviter='INVITER_PUBLIC_KEY'` only after actual connect consent and
 relay/inviter verification. A display name or key match is not permission.
 
 Redemption returns PENDING ONLY. Review the actual `minter_identity` and
