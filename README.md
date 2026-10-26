@@ -36,13 +36,21 @@ On Linux, `relay-cli.py` private credential publication continues to require
 `fcntl.flock`, `os.geteuid`, abstract `AF_UNIX` sockets and libc `renameat2`,
 with `RENAME_EXCHANGE`, `RENAME_NOREPLACE` and file/directory `fsync`. There is
 no weaker publication fallback. Native Windows onboarding needs no WSL or
-Linux bridge: `CreateFileW` handles protect non-inherited owner-only DACLs,
-`FlushFileBuffers` durably flushes them, `MoveFileExW` performs no-replace
-publication, `ReplaceFileW` preserves replacement backups, and a named mutex
-excludes concurrent key registration. Config and private-key reads verify the
-current owner SID, stable file identity, single-link regular-file state and
-absence of reparse points. `tests/test_cli_windows_native.py` exercises these
-operations on actual Windows; it is not a production deployment qualification.
+Linux bridge: `CreateFileW` handles give new stages explicit current-token
+ownership and non-inherited owner-only DACLs before secret bytes arrive.
+`FlushFileBuffers` flushes file data; `MoveFileExW` and `ReplaceFileW` use their
+native write-through flags. Replacement tightens the retained destination DACL
+before exposing new bytes, includes exact owner/DACL state in drift checks, and
+preserves uncertain backups rather than blindly restoring over operator edits.
+A `Global\` named mutex binds the current SID and canonical logical path across
+Windows sessions, including case aliases for existing files and absent files
+with existing parents; distinct hardlink names are not equivalent. Curl header
+and body files use the same owner-only staging and are removed after the request.
+Config and private-key reads verify the current owner SID, stable file identity,
+single-link regular-file state and absence of reparse points.
+`tests/test_cli_windows_native.py` exercises these operations on actual Windows;
+independent second-session evidence is reported separately, and this is not a
+production deployment qualification.
 
 macOS remains fail closed with `ENOSYS`. CLI import and `--help` remain
 available elsewhere; unrelated operations with already-provisioned, pinned

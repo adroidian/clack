@@ -244,8 +244,16 @@ class PublicationPlatformTests(unittest.TestCase):
             (["accept-handshake", "--enc-v", "1", "--", request_id],
              "POST", "/v1/handshakes/accept"),
         )
+        raw = json.dumps(self.cfg).encode("utf-8")
+        key_raw = (self.cli.b64u_encode(SEED) + "\n").encode("ascii")
+        def windows_read(path, with_snapshot=False):
+            # Coherent native-reader results for config and key on both actual
+            # Windows and Linux dispatch tests; native security is tested separately.
+            data = key_raw if os.path.normcase(path) == os.path.normcase(str(self.key)) else raw
+            return (data, {"fixture": "windows-native"}) if with_snapshot else data
         with mock.patch.object(sys, "platform", "win32"), mock.patch.object(self.cli, "fcntl", None), \
-                mock.patch.object(self.cli, "_RENAMEAT2", None):
+                mock.patch.object(self.cli, "_RENAMEAT2", None), \
+                mock.patch.object(self.cli, "_read_windows_private_config", side_effect=windows_read):
             for argv, method, path in commands:
                 with self.subTest(command=argv[0]):
                     before = snapshot(self.root)

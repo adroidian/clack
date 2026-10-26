@@ -69,10 +69,22 @@ class CurlTransportCustody(unittest.TestCase):
     def private_files(self, argv):
         paths = [Path(arg[1:]) for arg in argv if arg.startswith("@")]
         self.assertEqual(len(paths), 2, "body and headers must use private files")
-        # Windows st_mode does not encode its discretionary ACL; custody and
-        # cleanup still apply on every platform.
-        self.assertTrue(os.name == "nt" or all(
-            path.stat().st_mode & 0o777 == 0o600 for path in paths))
+        if os.name == "nt":
+            kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = cli._windows_config_api()
+            sid = cli._windows_current_sid()
+            for path in paths:
+                handle = kernel.CreateFileW(str(path), 0x00020000, 7, None, 3, 0x00200000, None)
+                self.assertNotIn(handle, (None, cli.ctypes.c_void_p(-1).value))
+                try:
+                    descriptor = cli._windows_security_sddl(handle)
+                finally:
+                    kernel.CloseHandle(handle)
+                self.assertIn(descriptor, (
+                    "O:%sD:P(A;;FA;;;%s)" % (sid, sid),
+                    "O:%sD:PAI(A;;FA;;;%s)" % (sid, sid),
+                ), "transport file must have exact current-token owner and protected caller-only DACL")
+        else:
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in paths))
         self.assertFalse(any(self.f.tokens["bob"] in arg for arg in argv),
                          "bearer authority appeared in child argv")
         self.assertFalse(any("X-Clack-Sig:" in arg for arg in argv),
@@ -150,6 +162,47 @@ class CurlTransportCustody(unittest.TestCase):
         self.assertEqual(observed, [(False, False, False)])
 
     def test_private_file_setup_failure_cleans_up_before_launch(self):
+        if os.name == "nt":
+            modules = {"cli": cli, "sdk": transport, "signed": signed}
+            for kind, module in modules.items():
+                for failure in ("create", "write", "close"):
+                    for fail_at in (1, 2):
+                        calls = []
+                        real_stage = module._windows_open_private_stage
+                        real_fdopen = os.fdopen
+
+                        def fail_create(path):
+                            fd = real_stage(path)
+                            calls.append(True)
+                            if len(calls) == fail_at:
+                                os.close(fd)
+                                raise OSError("test native protected-stage setup failure")
+                            return fd
+
+                        @contextlib.contextmanager
+                        def fail_access(fd, mode):
+                            with real_fdopen(fd, mode) as stream:
+                                calls.append(True)
+                                if failure == "write" and len(calls) == fail_at:
+                                    class FailingWriter:
+                                        def write(self, data):
+                                            raise OSError("test native protected-file write failure")
+                                    yield FailingWriter()
+                                else:
+                                    yield stream
+                                if failure == "close" and len(calls) == fail_at:
+                                    raise OSError("test native protected-file close failure")
+
+                        protection = (patch.object(module, "_windows_open_private_stage", side_effect=fail_create)
+                                      if failure == "create" else patch.object(os, "fdopen", side_effect=fail_access))
+                        with self.subTest(kind=kind, failure=failure, fail_at=fail_at), \
+                             patch.object(tempfile, "tempdir", str(self.files)), protection, \
+                             patch.object(subprocess, "run") as run, self.assertRaises(OSError):
+                            self.invoke(kind)
+                        run.assert_not_called()
+                        self.assertEqual(list(self.files.iterdir()), [])
+            return
+
         chmod = os.chmod
         for kind in ("cli", "sdk", "signed"):
             for fail_at in (1, 2):

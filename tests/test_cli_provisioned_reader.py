@@ -316,7 +316,7 @@ class ProvisionedReaderTests(unittest.TestCase):
 
     def test_linux_reader_keeps_original_single_link_owner_validation(self):
         with mock.patch.object(sys, 'platform', 'linux'), \
-                mock.patch.object(os, 'geteuid', return_value=0, create=True), \
+                mock.patch.object(os, 'geteuid', return_value=self.config.stat().st_uid, create=True), \
                 mock.patch.object(self.cli,'_read_windows_private_config',side_effect=AssertionError('Windows path on Linux')):
             self.assertEqual(self.cli.load_config(str(self.config)),self.cfg)
             os.link(self.config,self.root/'alias')

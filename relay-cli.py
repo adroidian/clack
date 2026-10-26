@@ -824,6 +824,7 @@ def _read_windows_private_config(path, with_snapshot=False):
     try:
         before = information(handle)
         owner = owned_by_caller(handle)
+        security_sddl = _windows_security_sddl(handle) if with_snapshot else None
         chunks = []
         while True:
             buffer, count = ctypes.create_string_buffer(65536), DWORD()
@@ -838,11 +839,17 @@ def _read_windows_private_config(path, with_snapshot=False):
         if information(handle) != before or len(data) != (before[3] << 32 | before[4]):
             raise ValueError("config file changed while it was read")
         owned_by_caller(handle)
+        if with_snapshot and _windows_security_sddl(handle) != security_sddl:
+            raise ValueError("config security changed while it was read")
         _windows_config_components(absolute)
         visible = open_existing()
         try:
             if information(visible) != before:
                 raise ValueError("config path changed while it was read")
+            if with_snapshot:
+                owned_by_caller(visible)
+                if _windows_security_sddl(visible) != security_sddl:
+                    raise ValueError("config path security changed while it was read")
         finally:
             kernel.CloseHandle(visible)
         if with_snapshot:
@@ -850,6 +857,7 @@ def _read_windows_private_config(path, with_snapshot=False):
                 "dev": before[0], "ino": (before[1] << 32) | before[2],
                 "mode": before[9], "uid": owner, "nlink": before[10],
                 "size": (before[3] << 32) | before[4], "data": data,
+                "security": security_sddl,
             }
             return data, snapshot
         return data
@@ -889,8 +897,35 @@ def _windows_current_sid(kernel=None, security=None):
             kernel.CloseHandle(token)
 
 
-def _windows_restrict_handle_acl(handle):
-    """Apply a protected DACL granting full control only to the caller."""
+def _windows_security_sddl(handle):
+    """Return native owner and DACL for exact snapshot/drift attestation."""
+    kernel, security, DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    HANDLE = ctypes.c_void_p
+    security.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        HANDLE, DWORD, DWORD, ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(DWORD)]
+    security.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = ctypes.c_int32
+    descriptor, owner, text = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_wchar_p()
+    try:
+        # SE_FILE_OBJECT; OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
+        code = security.GetSecurityInfo(
+            ctypes.c_void_p(handle), 1, 5, ctypes.byref(owner), None, None, None,
+            ctypes.byref(descriptor))
+        if code or not descriptor.value:
+            raise OSError(code or errno.EACCES, "cannot read Windows owner and DACL")
+        if not security.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor, 1, 5, ctypes.byref(text), None):
+            raise OSError(ctypes.get_last_error(),
+                          "cannot serialize Windows owner and DACL")
+        return text.value
+    finally:
+        if text.value:
+            kernel.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        if descriptor.value:
+            kernel.LocalFree(descriptor)
+
+
+def _windows_restrict_handle_acl(handle, establish_owner=False):
+    """Apply a protected caller-only DACL; new stages also get explicit ownership."""
     kernel, security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
     DWORD, BOOL, HANDLE = ctypes.c_uint32, ctypes.c_int32, ctypes.c_void_p
     for name, arguments, result in (
@@ -898,6 +933,8 @@ def _windows_restrict_handle_acl(handle):
              [ctypes.c_wchar_p, DWORD, ctypes.POINTER(HANDLE), ctypes.POINTER(DWORD)], BOOL),
             ("GetSecurityDescriptorDacl",
              [HANDLE, ctypes.POINTER(BOOL), ctypes.POINTER(HANDLE), ctypes.POINTER(BOOL)], BOOL),
+            ("GetSecurityDescriptorOwner",
+             [HANDLE, ctypes.POINTER(HANDLE), ctypes.POINTER(BOOL)], BOOL),
             ("SetSecurityInfo",
              [HANDLE, DWORD, DWORD, HANDLE, HANDLE, HANDLE, HANDLE], DWORD)):
         function = getattr(security, name)
@@ -905,19 +942,28 @@ def _windows_restrict_handle_acl(handle):
     sid = _windows_current_sid(kernel, security)
     descriptor = ctypes.c_void_p()
     try:
-        sddl = "D:P(A;;FA;;;%s)" % sid
+        sddl = ("O:%s" % sid if establish_owner else "") + "D:P(A;;FA;;;%s)" % sid
         if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl, 1, ctypes.byref(descriptor), None):
-            raise OSError(ctypes.get_last_error(), "cannot construct Windows private DACL")
+            raise OSError(ctypes.get_last_error(), "cannot construct Windows private security descriptor")
         present, defaulted, dacl = BOOL(), BOOL(), ctypes.c_void_p()
         if not security.GetSecurityDescriptorDacl(
                 descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)):
             raise OSError(ctypes.get_last_error(), "cannot read Windows private DACL")
         if not present.value or not dacl.value:
             raise ValueError("Windows private DACL is absent")
-        # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION.
+        owner, owner_defaulted = ctypes.c_void_p(), BOOL()
+        if establish_owner:
+            if not security.GetSecurityDescriptorOwner(
+                    descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)):
+                raise OSError(ctypes.get_last_error(), "cannot read Windows private owner")
+            if not owner.value:
+                raise ValueError("Windows private owner is absent")
+        # OWNER (new stages only) | DACL | PROTECTED_DACL; never seize an
+        # existing operator file's owner during ordinary ACL correction.
+        flags = 0x80000004 | (1 if establish_owner else 0)
         code = security.SetSecurityInfo(
-            ctypes.c_void_p(handle), 1, 0x80000004, None, None, dacl, None)
+            ctypes.c_void_p(handle), 1, flags, owner, None, dacl, None)
         if code:
             raise OSError(code, "cannot protect Windows private artifact")
     finally:
@@ -943,7 +989,7 @@ def _windows_restrict_path_acl(path):
 
 
 def _windows_open_private_stage(path):
-    """Create a non-shared stage with WRITE_DAC before secret bytes arrive."""
+    """Create a non-shared stage with explicit caller ownership and DACL."""
     if msvcrt is None:
         raise OSError(errno.ENOSYS, "native Windows file handles are unavailable")
     kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
@@ -953,7 +999,7 @@ def _windows_open_private_stage(path):
     if handle in (None, invalid):
         raise OSError(ctypes.get_last_error(), "cannot create Windows private stage", path)
     try:
-        _windows_restrict_handle_acl(handle)
+        _windows_restrict_handle_acl(handle, establish_owner=True)
         return msvcrt.open_osfhandle(handle, os.O_WRONLY)
     except Exception:
         kernel.CloseHandle(handle)
@@ -984,7 +1030,8 @@ def _windows_replace(destination, source, backup):
     function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
                          ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p]
     function.restype = ctypes.c_int32
-    if not function(destination, source, backup, 0, None, None):
+    # REPLACEFILE_WRITE_THROUGH requests durable replacement semantics.
+    if not function(destination, source, backup, 1, None, None):
         raise OSError(ctypes.get_last_error(), "ReplaceFileW failed", destination)
 
 
@@ -995,7 +1042,9 @@ def _windows_mutex_acquire(name):
             ("WaitForSingleObject", [ctypes.c_void_p, ctypes.c_uint32], ctypes.c_uint32)):
         function = getattr(kernel, function_name)
         function.argtypes, function.restype = arguments, result
-    handle = kernel.CreateMutexW(None, False, "Local\\" + name)
+    # Global namespace binds the operation across Windows sessions, not only
+    # processes in the caller's session. No account/service privilege changes.
+    handle = kernel.CreateMutexW(None, False, "Global\\" + name)
     invalid = ctypes.c_void_p(-1).value
     if handle in (None, invalid):
         raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
@@ -1450,6 +1499,53 @@ def _private_abs(path):
     return os.path.abspath(path)
 
 
+def _windows_logical_private_path(path):
+    """Canonical native identity for a file, including an absent final component."""
+    absolute = _private_abs(path)
+    kernel, _security, _DWORD, _FILE_INFO, _TOKEN_USER = _windows_config_api()
+    function = kernel.GetFinalPathNameByHandleW
+    function.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                         ctypes.c_uint32, ctypes.c_uint32]
+    function.restype = ctypes.c_uint32
+    existing = os.path.lexists(absolute)
+    target = absolute if existing else (os.path.dirname(absolute) or ".")
+    if not existing and not os.path.isdir(target):
+        raise ValueError("private artifact parent must already be a directory: %s" % target)
+    # A zero-desired-access handle can query identity without reading data.
+    # Open the directory itself for absent files; reparse points remain rejected.
+    flags = 0x00200000 | (0 if existing else 0x02000000)
+    handle = kernel.CreateFileW(target, 0, 7, None, 3, flags, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(),
+                      "cannot resolve Windows logical private path", target)
+    try:
+        size = 1024
+        while True:
+            buffer = ctypes.create_unicode_buffer(size)
+            result = function(handle, buffer, size, 0x2)  # VOLUME_NAME_DOS
+            if not result:
+                raise OSError(ctypes.get_last_error(),
+                              "GetFinalPathNameByHandleW failed", target)
+            if result < size:
+                resolved = buffer.value
+                break
+            size = result + 1
+            if size > 1024 * 1024:
+                raise ValueError("Windows logical private path is too long")
+    finally:
+        kernel.CloseHandle(handle)
+    if resolved.startswith("\\\\?\\UNC\\"):
+        resolved = "\\\\" + resolved[8:]
+    elif resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    if not existing:
+        resolved = os.path.join(resolved, os.path.basename(absolute))
+    # Existing paths use their actual native spelling. Case folding also binds
+    # spelling variants of an as-yet absent final component to one mutex.
+    return os.path.normcase(os.path.normpath(resolved)).casefold()
+
+
 def _renameat2(source, destination, flags):
     """Linux atomic namespace transition used for CAS-style publication."""
     if _RENAMEAT2 is None:
@@ -1567,12 +1663,13 @@ def _same_file_snapshot(first, second):
         and first["nlink"] == second["nlink"]
         and first["size"] == second["size"]
         and first["data"] == second["data"]
+        and first.get("security") == second.get("security")
     )
 
 
 def _fsync_parent(path, label):
     if sys.platform == "win32":
-        # MoveFileExW(MOVEFILE_WRITE_THROUGH) persists namespace transitions;
+        # Native MoveFileExW/ReplaceFileW use their WRITE_THROUGH flags;
         # Windows does not provide POSIX directory fsync semantics.
         _local_publication_event(label + ":before_dir_fsync")
         return
@@ -1681,11 +1778,18 @@ def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
     if not isinstance(data, (bytes, bytearray)):
         raise TypeError("private artifact data must be bytes")
     absolute, parent, current_st = _validate_private_destination(path)
-    if expected_snapshot is None and current_st is not None:
-        _old_data, expected_snapshot = _read_private_regular_snapshot(
-            absolute, correct_mode=True)
-    elif expected_snapshot is not None:
-        _require_snapshot(absolute, expected_snapshot, label + " destination")
+    if current_st is not None:
+        if expected_snapshot is not None:
+            # Detect caller-visible ACL drift before repairing the destination.
+            _require_snapshot(absolute, expected_snapshot, label + " destination")
+        # ReplaceFileW retains destination security metadata. Make the target
+        # exactly caller-only before any new secret bytes can become visible.
+        _windows_restrict_path_acl(absolute)
+        if expected_snapshot is None:
+            _old_data, expected_snapshot = _read_private_regular_snapshot(
+                absolute, correct_mode=True)
+        else:
+            _require_snapshot(absolute, expected_snapshot, label + " destination")
     expected_absent = expected_snapshot is None
     token = _secrets.token_hex(8)
     tmp = os.path.join(parent, ".%s.%s-%s.tmp" % (os.path.basename(absolute), label, token))
@@ -1724,9 +1828,12 @@ def _windows_atomic_publish_private(path, data, label, expected_snapshot=None):
             displaced_snapshot = _snapshot_at_path(backup)
             if (not _same_file_snapshot(candidate_now, stage_snapshot)
                     or not _same_file_snapshot(displaced_snapshot, expected_snapshot)):
-                _LOCAL_WINDOWS_MOVE(backup, absolute, replace=True)
+                # Never overwrite a changed destination or delete uncertain
+                # recovery evidence. Both names are retained for the operator.
                 raise ValueError("%s destination changed during publication" % label)
         _local_publication_event(label + ":after_replace")
+        # Re-attest without mutating a possibly newer operator file. The exact
+        # snapshot already proves the retained/replacement DACL is private.
         actual = _snapshot_at_path(absolute, correct_mode=True)
         if not _same_file_snapshot(actual, stage_snapshot):
             raise OSError("published %s file ID/bytes do not match staged bytes" % label)
@@ -1869,10 +1976,14 @@ class _RegisterKeyOperationLock:
         _require_private_publication_platform()
         self.config_path = _private_abs(config_path)
         self.lock_path = self.config_path + ".register-key.lock"
-        owner = (_windows_current_sid() if sys.platform == "win32"
-                 else str(os.geteuid()))
+        if sys.platform == "win32":
+            owner = _windows_current_sid()
+            logical_path = _windows_logical_private_path(self.config_path)
+        else:
+            owner = str(os.geteuid())
+            logical_path = self.config_path
         digest = hashlib.sha256(
-            (owner + "\0" + self.config_path).encode("utf-8")).hexdigest()
+            (owner + "\0" + logical_path).encode("utf-8")).hexdigest()
         self.socket_name = "\0clack-register-key-v1-" + digest
         self.mutex_name = "clack-register-key-v1-" + digest
         self._socket = None
@@ -2237,6 +2348,34 @@ def _ensure_origin_verified(origin, cfg):
     return "tofu"
 
 
+def _write_curl_private_temp(data, suffix):
+    """Write transport secrets to an owner-only file on every supported OS."""
+    import tempfile
+    path = None
+    try:
+        if sys.platform == "win32":
+            path = os.path.join(tempfile.gettempdir(),
+                                ".clack-curl-%s%s" % (_secrets.token_hex(8), suffix))
+            fd = _windows_open_private_stage(path)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+        else:
+            with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=suffix) as stream:
+                path = stream.name
+                os.chmod(path, 0o600)
+                stream.write(data)
+        return path
+    except Exception:
+        # Own the pathname from creation through protection, write and close.
+        # A failure before return must not strand bearer/signature material.
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+
+
 def _curl_req(cfg, method, url, headers, data, timeout):
     """Execute an HTTP request via curl subprocess.
 
@@ -2252,22 +2391,16 @@ def _curl_req(cfg, method, url, headers, data, timeout):
     body_file = None
     try:
         # Neither bearer/signature headers nor claim bodies belong in argv.
-        # Track each path before writing so every exit cleans up private data.
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.headers') as f:
-            header_file = f.name
-            os.chmod(header_file, 0o600)
-            for k, v in headers.items():
-                f.write("%s: %s\n" % (k, v))
+        # Windows stages have explicit owner/DACL before secret bytes arrive.
+        header_bytes = "".join("%s: %s\n" % (k, v) for k, v in headers.items()).encode("utf-8")
+        header_file = _write_curl_private_temp(header_bytes, ".headers")
         # -q MUST be first: ambient curlrc must not enable redirects or alter
         # the pinned-origin request. NO_PROXY remains honored by curl.
         cmd = ["curl", "-q", "-s", "-m", str(timeout), "-X", method,
                "--header", "@" + header_file, "--max-redirs", "0",
                "-D", "-", "-o", "-", url]
         if data is not None:
-            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
-                body_file = f.name
-                os.chmod(body_file, 0o600)
-                f.write(data)
+            body_file = _write_curl_private_temp(data, ".json")
             cmd += ["--data-binary", "@" + body_file]
         result = subprocess.run(cmd, capture_output=True, timeout=timeout + 10)
         if result.returncode != 0:
